@@ -201,28 +201,38 @@ class VTSConnection:
         既不会让日志刷屏，又能在 VTS 重新打开后较快接上。
         """
 
-        # 重连退避：成功一次清零；失败一次乘 1.5（封顶 60s）。
-        backoff_seconds = 5.0
-        max_backoff = 60.0
+        # 立即重连：本地场景下 VTS 通常和 bot 在同一台机器，断连基本只发生在
+        # VTS 软件被关掉、模型被切换等场景；连得上就秒上，连不上才退避。
+        # 第一次失败直接 sleep 0.5s 重试；连续失败 5 次后再切到指数退避，避免
+        # 长时间无 VTS 时把日志刷爆。
         consecutive_failures = 0
+        max_backoff = 30.0
+
+        def _backoff_for(failures: int) -> float:
+            """前 5 次连续失败保持 0.5s，超过 5 次按 2^(n-5) 增长，封顶 30s。"""
+            if failures < 5:
+                return 0.5
+            return min(0.5 * (2 ** (failures - 4)), max_backoff)
 
         while True:
             try:
-                # 断连状态：进入重连分支（不固定 sleep 10s，避免重连等太久）。
+                # 断连状态：进入重连分支。第一次进来不 sleep，立即尝试。
                 if not self.is_connected or self.vts is None:
-                    logger.info(
-                        f"VTS 未连接，{backoff_seconds:.0f}s 后尝试重连…"
-                        f"（连续失败 {consecutive_failures} 次）"
-                    )
-                    await asyncio.sleep(backoff_seconds)
+                    if consecutive_failures > 0:
+                        wait = _backoff_for(consecutive_failures)
+                        logger.info(
+                            f"VTS 未连接，{wait:.1f}s 后尝试重连…"
+                            f"（连续失败 {consecutive_failures} 次）"
+                        )
+                        await asyncio.sleep(wait)
+                    else:
+                        logger.info("VTS 未连接，立即尝试重连…")
                     ok = await self.connect()
                     if ok:
                         logger.info("✅ VTS 自动重连成功")
                         consecutive_failures = 0
-                        backoff_seconds = 5.0
                     else:
                         consecutive_failures += 1
-                        backoff_seconds = min(backoff_seconds * 1.5, max_backoff)
                     continue
 
                 # 正常心跳
@@ -311,7 +321,12 @@ class VTSConnection:
                             list(snapshot.keys()),
                             list(snapshot.values()),
                         )
-                        await self.vts.request(msg)
+                        # 关键：必须拿 _request_lock，否则会和心跳 / trigger_hotkey
+                        # 同时调用 vts.request，触发 websockets 库
+                        # "cannot call recv while another coroutine is already
+                        # running recv" 错误，导致心跳误判断连。
+                        async with self._request_lock:
+                            await self.vts.request(msg)
                     except Exception:
                         # 单次发送失败不致命，等下次循环。
                         pass
