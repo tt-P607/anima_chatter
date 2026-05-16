@@ -112,7 +112,14 @@ class VTSPerformer:
                 token_path=build_default_token_path(),
             )
             self.auto_animator = AutoAnimator()
-            self.speech_animator = SpeechAnimator()
+            # 把 audio_player 的 envelope_tracker 注入 SpeechAnimator，
+            # 让说话期间的头部 / 身体微动跟着 TTS 音频包络起伏，做出"语调律动"。
+            # 配置 audio_drive 段控制具体增益与开关；为 None 时 SpeechAnimator
+            # 会自动退化回原来的固定 sin 波动逻辑。
+            self.speech_animator = SpeechAnimator(
+                envelope_tracker=self.audio_player.envelope_tracker,
+                audio_drive_config=getattr(self.plugin_config, "audio_drive", None),
+            )
             self.connection.animators = [self.auto_animator, self.speech_animator]
 
             ok = await self.connection.connect()

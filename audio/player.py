@@ -29,8 +29,15 @@ import soundfile as sf  # type: ignore
 
 from src.kernel.logger import get_logger
 
+from .envelope import EnvelopeTracker, compute_envelope
+
 
 logger = get_logger("voice_chatter.audio_player")
+
+
+# envelope 计算 / 消费的步长，与 VTSConnection._animation_loop 的 30Hz 对齐。
+# 改这个值需要同时改 SpeechAnimator 那边的查询节奏。
+_ENVELOPE_HOP_SECONDS = 1.0 / 30.0
 
 
 class AudioPlayer:
@@ -50,6 +57,12 @@ class AudioPlayer:
         # 避免每条音频都浪费 ~1 秒走重试链路。
         self._prefer_fallback: bool = False
         self._fallback_device_id: int | None = None
+
+        # 音频包络追踪器。播放期间由动画器（SpeechAnimator）按 30Hz 查询，
+        # 用来驱动头部 / 身体的"语调微动"，让 VTB 看起来"跟着声音动"。
+        # 与 sounddevice 的 sd.play 异步，但有共享线程锁；查询安全。
+        self.envelope_tracker = EnvelopeTracker()
+
         self._resolve_device()
 
     def update_output_device(self, output_device: str) -> None:
@@ -143,15 +156,32 @@ class AudioPlayer:
                 if data.dtype != np.float32:
                     data = data.astype(np.float32)
 
+                # 在 sd.play 之前先算好 envelope。这是一段已经在内存里的 PCM，
+                # 离线计算很快（10s 音频大概 1ms 量级）。这样 SpeechAnimator
+                # 一启动就能跟上，不用等"流式回调"。
+                envelope = compute_envelope(
+                    data,
+                    samplerate,
+                    hop_seconds=_ENVELOPE_HOP_SECONDS,
+                )
+                self.envelope_tracker.begin(envelope, _ENVELOPE_HOP_SECONDS)
+
                 logger.info(
                     f"开始播放音频：{len(data)} samples @ {samplerate}Hz "
-                    f"(device_id={self.output_device_id})"
+                    f"(device_id={self.output_device_id}) envelope_frames={len(envelope)}"
                 )
 
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self._play_sync, data, samplerate)
+                try:
+                    await loop.run_in_executor(None, self._play_sync, data, samplerate)
+                finally:
+                    # 不论播放成功失败，都把 tracker 清空，避免 SpeechAnimator
+                    # 卡在最后一帧的包络值上。
+                    self.envelope_tracker.end()
                 logger.info("音频播放完成。")
             except Exception as exc:
+                # 异常路径下也要确保 tracker 清干净。
+                self.envelope_tracker.end()
                 logger.error(f"播放音频时发生错误: {exc}")
 
     def _play_sync(self, data: Any, samplerate: int) -> None:

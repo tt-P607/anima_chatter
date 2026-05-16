@@ -5,24 +5,58 @@
 
 与 AutoAnimator 配合时，本动画器输出 *基准/叠加偏移*，AutoAnimator 输出
 *生命感扰动*，两者由 connection 层求和。
+
+可选：传入 ``envelope_tracker``（来自 :class:`AudioPlayer`），开启"音频驱动
+头部 / 身体律动"——根据 TTS 实时音量包络让头部前后倾、左右摆、身体律动，
+让 VTB 看起来"跟着声音动"。这部分由 ``audio_drive_config`` 控制开关与增益。
 """
 
 from __future__ import annotations
 
 import math
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from .base import BaseAnimator
+
+if TYPE_CHECKING:
+    from ...audio import EnvelopeTracker
 
 
 class SpeechAnimator(BaseAnimator):
     """说话联动 + 情绪渐变模块。"""
 
-    def __init__(self, config: dict[str, Any] | None = None) -> None:
-        """初始化说话动画器，载入意图/情感映射表与平滑参数。"""
+    def __init__(
+        self,
+        config: dict[str, Any] | None = None,
+        *,
+        envelope_tracker: "EnvelopeTracker | None" = None,
+        audio_drive_config: Any = None,
+    ) -> None:
+        """初始化说话动画器，载入意图/情感映射表与平滑参数。
+
+        Args:
+            config: 兼容 BaseAnimator 的旧配置 dict（保留）。
+            envelope_tracker: 可选的音频包络追踪器；不传则关闭音频驱动律动。
+            audio_drive_config: ``SherpaOnnxVoiceChatterConfig.audio_drive``
+                section（含 enabled / head_y_gain 等）；不传走默认值。
+        """
 
         super().__init__(config)
+
+        # ── 音频驱动律动 ────────────────────────────────
+        self._envelope_tracker: "Optional[EnvelopeTracker]" = envelope_tracker
+        # 从 audio_drive_config 抽取增益，找不到字段就用经验默认值。
+        # 这样 SpeechAnimator 既能在测试里裸跑（不传 config），也能在生产里
+        # 走配置覆盖。
+        cfg = audio_drive_config
+        self._audio_drive_enabled: bool = bool(getattr(cfg, "enabled", True))
+        self._head_y_gain: float = float(getattr(cfg, "head_y_gain", 8.0))
+        self._head_x_gain: float = float(getattr(cfg, "head_x_gain", 3.0))
+        self._body_y_gain: float = float(getattr(cfg, "body_y_gain", 30.0))
+        self._neutral_attenuation: float = float(
+            getattr(cfg, "neutral_attenuation", 0.5)
+        )
 
         # 当前状态
         self.intent: str = "IDLE"
@@ -176,10 +210,11 @@ class SpeechAnimator(BaseAnimator):
             self.target_params["v_eye_x"] += math.sin(elapsed * math.pi * 0.5) * 0.1
             self.target_params["v_eye_y"] += math.cos(elapsed * math.pi * 0.4) * 0.1
 
-        # 说话时的动态偏移
+        # 说话时的动态偏移：原始固定 sin 波动 + emotion=3 时的强化抖动
         dynamic_y = 0.0
         dynamic_x = 0.0
         dynamic_z = 0.0
+        dynamic_body_y = 0.0
         if self.is_speaking:
             speaking_elapsed = time.time() - self.speaking_start_time
             dynamic_y = math.sin(speaking_elapsed * math.pi * 1.2) * 3.0 - 1.5
@@ -190,6 +225,33 @@ class SpeechAnimator(BaseAnimator):
                 elif self.emotion_type == "angry":
                     dynamic_x = math.sin(speaking_elapsed * math.pi * 4.0) * 1.2
                     dynamic_z = math.sin(speaking_elapsed * math.pi * 5.0) * 1.2
+
+        # ── 音频驱动律动叠加 ────────────────────────────────
+        # 把当前 TTS 音频包络读出来，按"音量 → 头部前倾 / 横向摆 / 身体律动"
+        # 三路注入。三路用同一个 envelope 不同 gain，让说话节奏在身体上也有
+        # 投影。emotion=neutral 时按 _neutral_attenuation 衰减，避免平静叙述
+        # 时显得"乱抖"。
+        if (
+            self._audio_drive_enabled
+            and self._envelope_tracker is not None
+            and self.is_speaking
+        ):
+            frame = self._envelope_tracker.current()
+            if frame.rms > 0.0:
+                attenuation = (
+                    self._neutral_attenuation
+                    if self.emotion_type == "neutral"
+                    else 1.0
+                )
+                # 主频带：rms 直接驱动头部前后倾。声音大时头微抬，自然感。
+                dynamic_y += frame.rms * self._head_y_gain * attenuation
+                # 横向轻微摆头：用一个慢振荡 + rms 振幅，让侧脸也有动作。
+                dynamic_x += (
+                    math.sin(time.time() * 4.0) * frame.rms
+                    * self._head_x_gain * attenuation
+                )
+                # 身体律动：用 velocity（变化率）驱动。突变量大 = 节奏感强。
+                dynamic_body_y += frame.velocity * self._body_y_gain * attenuation
 
         # 平滑 + 速率限制
         output: dict[str, float] = {}
@@ -216,6 +278,11 @@ class SpeechAnimator(BaseAnimator):
             elif key == "v_head_z":
                 final_value += dynamic_z
             output[key] = final_value
+
+        # 身体律动单独走 v_body_y（不在 target_params 里，绕过情绪基准的 lerp）。
+        # 直接输出叠加值，由 connection 层与 AutoAnimator 的 body_y 求和。
+        if dynamic_body_y != 0.0:
+            output["v_body_y"] = dynamic_body_y
 
         return output
 

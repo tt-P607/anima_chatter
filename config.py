@@ -130,6 +130,42 @@ class SherpaOnnxVoiceChatterConfig(BaseConfig):
             ),
         )
 
+    @config_section("audio_drive", title="音频驱动律动")
+    class AudioDriveSection(SectionBase):
+        """vtb 模式下"音频驱动头部 / 身体律动"配置（让 VTB 跟着音量动）。
+
+        实时计算 TTS 音频包络（RMS + 变化率），按下面的增益叠加到 SpeechAnimator
+        的输出参数上。原理：声音大时头部微抬、激动；声音突变时身体一震；让程序
+        化动画看起来像跟着语调起伏。
+
+        所有增益都是经验值，第一次跑出来八成会"太激进"或"太迟钝"，根据自己模型
+        看着调即可。
+        """
+
+        enabled: bool = Field(
+            default=True,
+            description="是否启用音频驱动律动；关闭后退回固定 sin 波动逻辑",
+        )
+        head_y_gain: float = Field(
+            default=8.0,
+            description="头部前后倾灵敏度（rms × gain → v_head_y 度数）",
+        )
+        head_x_gain: float = Field(
+            default=3.0,
+            description="头部横向摆动幅度（rms × gain × sin → v_head_x 度数）",
+        )
+        body_y_gain: float = Field(
+            default=30.0,
+            description="身体律动灵敏度（velocity × gain → v_body_y 度数）",
+        )
+        neutral_attenuation: float = Field(
+            default=0.5,
+            description=(
+                "emotion=neutral 时整体增益乘数。0.5 表示平静叙述时律动减半，"
+                "避免显得乱抖；调到 0.0 等于平静时完全不动。"
+            ),
+        )
+
     @config_section("motion", title="VTube Studio 动作映射（可选热键）")
     class MotionSection(SectionBase):
         """可选：把 emotion / intent 映射到 VTS 已配置的 Hotkey ID。
@@ -160,6 +196,7 @@ class SherpaOnnxVoiceChatterConfig(BaseConfig):
     vts: VTSSection = Field(default_factory=VTSSection)
     audio: AudioSection = Field(default_factory=AudioSection)
     sub_agent: SubAgentSection = Field(default_factory=SubAgentSection)
+    audio_drive: AudioDriveSection = Field(default_factory=AudioDriveSection)
     motion: MotionSection = Field(default_factory=MotionSection)
 
 
