@@ -1,13 +1,19 @@
-"""sherpa-onnx ASR 实时语音通话专用 Chatter。"""
+"""voice_chatter 插件入口。
+
+支持两种运行模式：
+
+- voice 模式（``platform == "local_asr"``）：与 ASR 适配器配合，
+  用 ``SayAction`` 把 TTS 音频回传给适配器播放。
+- vtb 模式（其他平台，由 ``/vtb on`` 显式接管）：用 ``SayAndPerformAction``
+  在本地播放 TTS 到 VB-Cable，并驱动 VTube Studio 虚拟形象。
+"""
 
 from __future__ import annotations
 
-import asyncio
-from typing import Annotated, Any, AsyncGenerator
+from typing import Any, AsyncGenerator
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base import BaseChatter, BasePlugin, Failure, Success, Wait, WaitResumeEvent
-from src.core.components.base.action import BaseAction
 from src.core.components.loader import register_plugin
 from src.core.components.types import ChatType
 from src.core.config import get_core_config
@@ -16,111 +22,43 @@ from src.core.prompt import get_prompt_manager
 from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry
 from src.kernel.llm.payload.tooling import LLMUsable
 
+from .actions import SayAction, SayAndPerformAction, VoicePassAndWaitAction
+from .audio import AudioPlayer
+from .commands import VTBCommand
 from .config import SherpaOnnxVoiceChatterConfig
-from .markers import parse_speech_segments
-from .prompt_builder import SYSTEM_PROMPT, USER_PROMPT, VoiceChatterPromptBuilder
+from .prompt_builder import (
+    SYSTEM_PROMPT,
+    USER_PROMPT_VOICE,
+    USER_PROMPT_VTB,
+    ChatterMode,
+    VoiceChatterPromptBuilder,
+)
 from .runner import run_voice_conversation
-from .tts import build_tts_backend, synthesize_segments
+from .sub_agent import VOICE_CHATTER_SUB_AGENT_PROMPT_TEMPLATE
+from .vts import VTSPerformer
 
 
 logger = get_logger("voice_chatter")
 
 _PASS_AND_WAIT = "action-pass_and_wait"
 
-
-class SayAction(BaseAction):
-    """把要说的话发送到 TTS 后端并交给适配器播放。"""
-
-    action_name = "say"
-    action_description = (
-        "在实时语音通话中说出一段话。content 会进入 TTS 后端并由适配器播放。"
-        "支持 [wait:1] 控制下一段播放前等待 1 秒，支持 [emotion:happy]...[/emotion] 标记情绪。"
-        "[wait] 只影响语音片段播放间隔，不会让聊天流等待；说完等待用户时请另外调用 pass_and_wait。"
-    )
-    chatter_allow = ["voice_chatter"]
-    associated_platforms = ["local_asr"]
-    dependencies = ["asr_adapter:adapter:asr_adapter"]
-
-    async def execute(
-        self,
-        content: Annotated[str, "要通过 TTS 说出的内容，可包含 [wait:n] 和 [emotion:name] 标记"],
-    ) -> tuple[bool, str]:
-        """执行语音播放动作。"""
-
-        plugin_config = getattr(self.plugin, "config", None)
-        split_enabled = True
-        max_parallel = 4
-        empty_audio_retry_count = 1
-        if isinstance(plugin_config, SherpaOnnxVoiceChatterConfig):
-            split_enabled = bool(plugin_config.tts.sentence_split_enabled)
-            max_parallel = int(plugin_config.tts.max_parallel_segments)
-            empty_audio_retry_count = int(plugin_config.tts.empty_audio_retry_count)
-
-        segments = parse_speech_segments(content or "", split_sentences=split_enabled)
-        if not segments:
-            return True, "没有可播放的语音内容"
-
-        backend = build_tts_backend(plugin_config, logger)
-        artifacts = await synthesize_segments(
-            backend=backend,
-            stream_id=self.chat_stream.stream_id,
-            segments=segments,
-            max_parallel=max_parallel,
-            empty_audio_retry_count=empty_audio_retry_count,
-        )
-
-        success_count = 0
-        failed_reasons: list[str] = []
-        for segment, artifact in zip(segments, artifacts, strict=False):
-            error = artifact.metadata.get("error") if isinstance(artifact.metadata, dict) else None
-            if error:
-                failed_reasons.append(str(error))
-                logger.error(f"TTS 合成失败，跳过播放: {segment.text} ({error})")
-                continue
-            if not artifact.audio:
-                failed_reasons.append("TTS 后端未返回音频数据")
-                logger.error(f"TTS 后端未返回音频数据，跳过播放: {segment.text}")
-                continue
-            if segment.wait_before > 0:
-                await asyncio.sleep(segment.wait_before)
-            if await backend.emit(artifact, self.chat_stream):
-                success_count += 1
-
-        if success_count == 0 and failed_reasons:
-            return False, f"TTS 合成失败: {failed_reasons[0]}"
-        return True, f"已提交 {success_count}/{len(segments)} 段语音到适配器播放"
-
-
-class VoicePassAndWaitAction(BaseAction):
-    """等待用户继续语音输入或等待指定秒数后主动恢复。"""
-
-    action_name = "pass_and_wait"
-    action_description = (
-        "为实时语音通话登记等待点。说完话后调用它等待用户继续说话；"
-        "seconds 为空时等待新语音输入，传入秒数时到时主动恢复。"
-    )
-    chatter_allow = ["voice_chatter"]
-    associated_platforms = ["local_asr"]
-
-    async def execute(
-        self,
-        seconds: Annotated[float | None, "等待秒数；为空则等待新的用户语音输入"] = None,
-    ) -> tuple[bool, str]:
-        """登记等待状态。"""
-
-        if seconds is None:
-            return True, "已登记等待新的用户语音输入"
-        return True, f"已登记等待 {seconds} 秒后继续语音通话"
+# 接管 / 释放命令使用的 chatter 签名常量。
+_CHATTER_SIGNATURE = "voice_chatter:chatter:voice_chatter"
 
 
 class SherpaOnnxVoiceChatter(BaseChatter):
-    """sherpa-onnx ASR 实时语音通话专用 Chatter。"""
+    """voice_chatter：语音通话 / VTube Studio 虚拟形象通用 Chatter。"""
 
     chatter_name = "voice_chatter"
-    chatter_description = "sherpa-onnx ASR 实时语音通话专用 Chatter"
+    chatter_description = (
+        "语音通话与 VTube Studio 虚拟形象互动通用 Chatter。"
+        "platform=local_asr 时为实时通话模式；其他平台需通过 /vtb on 显式接管。"
+    )
     associated_platforms = ["local_asr"]
-    chat_type = ChatType.PRIVATE
+    chat_type = ChatType.ALL
     dependencies = ["asr_adapter:adapter:asr_adapter"]
+
+    # 默认值；apply_stream_runtime_options 会按 platform 动态覆写。
     stream_tick_interval = 0.1
     allow_message_buffer = False
 
@@ -130,21 +68,38 @@ class SherpaOnnxVoiceChatter(BaseChatter):
         config = getattr(self.plugin, "config", None)
         return config if isinstance(config, SherpaOnnxVoiceChatterConfig) else None
 
+    def _resolve_mode(self, chat_stream: ChatStream | None = None) -> ChatterMode:
+        """根据当前流的 platform 决定运行模式。"""
+
+        platform = ""
+        if chat_stream is not None:
+            platform = chat_stream.platform or ""
+        return "voice" if platform == "local_asr" else "vtb"
+
     def apply_stream_runtime_options(self, chat_stream: Any) -> None:
-        """把语音通话的流运行时配置写入当前 stream。"""
+        """根据 platform 动态决定 tick 间隔与消息缓冲策略。
+
+        - voice 模式（local_asr）：固定 tick=0.1，禁用 buffer，沿用现状。
+        - vtb 模式（其他平台）：使用 plugin section 中的配置（默认 1.0 / True）。
+        """
 
         plugin_config = self._get_plugin_config()
-        if plugin_config is not None:
+        platform = getattr(chat_stream, "platform", "") or ""
+        if platform == "local_asr":
+            self.stream_tick_interval = 0.1
+            self.allow_message_buffer = False
+        elif plugin_config is not None:
             self.stream_tick_interval = float(plugin_config.plugin.tick_interval)
             self.allow_message_buffer = bool(plugin_config.plugin.allow_message_buffer)
         super().apply_stream_runtime_options(chat_stream)
 
     async def _build_system_prompt(self, chat_stream: ChatStream) -> str:
-        """构建语音通话系统提示词。"""
+        """根据 platform 自动选择 voice / vtb 场景的系统提示词。"""
 
         return await VoiceChatterPromptBuilder.build_system_prompt(
             self._get_plugin_config(),
             chat_stream,
+            mode=self._resolve_mode(chat_stream),
         )
 
     def _build_history_text(self, chat_stream: ChatStream) -> str:
@@ -159,13 +114,14 @@ class SherpaOnnxVoiceChatter(BaseChatter):
         unread_lines: str,
         extra: str = "",
     ) -> str:
-        """构建语音通话用户提示词。"""
+        """构建用户提示词（按模式选择不同模板）。"""
 
         return await VoiceChatterPromptBuilder.build_user_prompt(
             chat_stream,
             history_text,
             unread_lines,
             extra,
+            mode=self._resolve_mode(chat_stream),
         )
 
     @staticmethod
@@ -187,9 +143,13 @@ class SherpaOnnxVoiceChatter(BaseChatter):
         response.add_payload(LLMPayload(ROLE.USER, Text(text)))
 
     async def inject_usables(self, request: Any) -> ToolRegistry:
-        """注入语音 Chatter 可用工具，排除 stop/send_text/sub-agent 管理工具。"""
+        """注入 Chatter 可用工具，排除 stop/send_text/sub-agent 管理工具。
 
-        usables = await self.get_llm_usables()
+        say / say_and_perform 的互斥可见由各自 ``go_activate`` 决定，
+        此处不再单独过滤。
+        """
+
+        usables: list[type[LLMUsable]] = await self.get_llm_usables()
         usables = await self.modify_llm_usables(usables)
         blocked_names = {
             "action-send_text",
@@ -212,7 +172,7 @@ class SherpaOnnxVoiceChatter(BaseChatter):
         return registry
 
     async def execute(self) -> AsyncGenerator[Wait | Success | Failure, WaitResumeEvent | None]:
-        """执行语音 Chatter 主循环。"""
+        """执行主循环。"""
 
         from src.core.managers.stream_manager import get_stream_manager
 
@@ -246,16 +206,22 @@ class SherpaOnnxVoiceChatter(BaseChatter):
 
 @register_plugin
 class SherpaOnnxVoiceChatterPlugin(BasePlugin):
-    """sherpa-onnx ASR 实时语音 Chatter 插件。"""
+    """voice_chatter 插件：通话 + VTB 虚拟形象通用 chatter。"""
 
     plugin_name = "voice_chatter"
-    plugin_version = "1.0.0"
-    plugin_description = "sherpa-onnx ASR 实时语音通话专用 Chatter"
+    plugin_version = "1.1.0"
+    plugin_description = (
+        "voice_chatter：sherpa-onnx ASR 实时语音通话 + VTube Studio 虚拟形象互动 通用 Chatter"
+    )
     configs = [SherpaOnnxVoiceChatterConfig]
     dependent_components = ["asr_adapter:adapter:asr_adapter"]
 
+    # vtb 模式运行时资源；on_plugin_loaded 中按配置初始化。
+    audio_player: AudioPlayer | None = None
+    vts_performer: VTSPerformer | None = None
+
     async def on_plugin_loaded(self) -> None:
-        """注册语音 Chatter 提示词模板。"""
+        """注册提示词模板，并按配置初始化 VTB 资源（AudioPlayer + VTS）。"""
 
         from src.core.prompt import min_len, optional, wrap
 
@@ -275,12 +241,14 @@ class SherpaOnnxVoiceChatterPlugin(BasePlugin):
                 .then(wrap("# 背景故事\n", "\n")),
                 "safety_guidelines": optional("\n".join(personality.safety_guidelines)),
                 "negative_behaviors": optional("\n".join(personality.negative_behaviors)),
-                "voice_guide": optional(""),
+                "scene_guide": optional(""),
             },
         )
+
+        # voice 模式专用 user prompt（保持原模板名以兼容现有 ASR 行为）。
         get_prompt_manager().get_or_create(
             name="voice_chatter_user_prompt",
-            template=USER_PROMPT,
+            template=USER_PROMPT_VOICE,
             policies={
                 "stream_name": optional("未知通话"),
                 "current_time": optional("未知时间"),
@@ -291,15 +259,90 @@ class SherpaOnnxVoiceChatterPlugin(BasePlugin):
             },
         )
 
+        # vtb 模式 user prompt（Q聊/私聊等普通平台）。
+        get_prompt_manager().get_or_create(
+            name="voice_chatter_vtb_user_prompt",
+            template=USER_PROMPT_VTB,
+            policies={
+                "stream_name": optional("未知聊天"),
+                "current_time": optional("未知时间"),
+                "platform": optional(""),
+                "history": optional("").then(min_len(2)).then(wrap("# 历史对话\n", "\n")),
+                "unreads": optional("").then(min_len(2)).then(wrap("# 新收到的消息\n", "\n")),
+                "extra": optional("").then(min_len(2)).then(wrap("# 额外提醒\n", "\n")),
+            },
+        )
+
+        # vtb 模式 sub-agent（"是否要回复"决策器）prompt。
+        get_prompt_manager().get_or_create(
+            name="voice_chatter_sub_agent_prompt",
+            template=VOICE_CHATTER_SUB_AGENT_PROMPT_TEMPLATE,
+            policies={
+                "nickname": optional(personality.nickname),
+                "bot_id": optional(""),
+                "bot_id_section": optional(""),
+                "personality_core_section": optional(personality.personality_core)
+                .then(wrap("它的核心人格是：", "\n")),
+                "personality_side_section": optional(personality.personality_side)
+                .then(wrap("它的人格侧面是：", "\n")),
+            },
+        )
+
+        # ── VTB 资源初始化 ───────────────────────────
+        config = self.config if isinstance(self.config, SherpaOnnxVoiceChatterConfig) else None
+        if config is None:
+            logger.warning(
+                "插件配置加载异常，VTB 模式将无法播放音频或驱动 VTS。"
+            )
+            return
+
+        self.audio_player = AudioPlayer(output_device=config.audio.output_device)
+
+        if config.vts.enabled:
+            self.vts_performer = VTSPerformer(
+                plugin_config=config,
+                audio_player=self.audio_player,
+            )
+            ok = await self.vts_performer.initialize()
+            if ok:
+                logger.info(
+                    "VTSPerformer 已就绪，vtb 模式回复将驱动 VTube Studio 嘴型/动作。"
+                )
+            else:
+                logger.warning(
+                    "VTSPerformer 初始化未连接 VTS，vtb 模式将仅播放 TTS 音频。"
+                )
+        else:
+            logger.info("配置中 vts.enabled=false，跳过 VTS 初始化（vtb 模式仅播音频）。")
+
+    async def on_plugin_unloaded(self) -> None:
+        """卸载时关闭 VTS 连接。"""
+
+        if self.vts_performer is not None:
+            try:
+                await self.vts_performer.shutdown()
+            except Exception as exc:
+                logger.warning(f"关闭 VTSPerformer 失败: {exc}")
+        self.vts_performer = None
+        self.audio_player = None
+
     def get_components(self) -> list[type]:
         """返回插件组件。"""
 
-        return [SherpaOnnxVoiceChatter, SayAction, VoicePassAndWaitAction]
+        return [
+            SherpaOnnxVoiceChatter,
+            SayAction,
+            SayAndPerformAction,
+            VoicePassAndWaitAction,
+            VTBCommand,
+        ]
 
 
 __all__ = [
     "SayAction",
+    "SayAndPerformAction",
     "SherpaOnnxVoiceChatter",
     "SherpaOnnxVoiceChatterPlugin",
+    "VTBCommand",
     "VoicePassAndWaitAction",
 ]

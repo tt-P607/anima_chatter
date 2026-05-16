@@ -52,7 +52,9 @@ def parse_speech_segments(content: str, *, split_sentences: bool = True) -> list
         )
         cursor = match.end()
 
+    # 清理尾部残留的标签
     tail = _EMOTION_OPEN_RE.sub("", content[cursor:])
+    tail = tail.replace("[/emotion]", "").replace("[/EMOTION]", "")
     _append_plain_segments(
         segments,
         tail,

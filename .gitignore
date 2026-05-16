@@ -1,0 +1,36 @@
+# Python 缓存与编译产物
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Python 测试 / 静态检查工具缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# 打包产物
+*.egg-info/
+*.egg
+build/
+dist/
+
+# 编辑器 / IDE 配置
+.vscode/
+.idea/
+*.swp
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 运行时数据（如 VTS token、本地缓存音频）
+data/
+*.log
+
+# 本地环境变量
+.env
+.env.*

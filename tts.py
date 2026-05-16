@@ -73,19 +73,21 @@ class HttpTTSBackend:
 
         import httpx
 
+        options: dict[str, Any] = {
+            "mime_type": self.mime_type,
+            "provider": self.provider,
+        }
+        if not self.provider:
+            options.pop("provider", None)
+
         payload = {
             "protocol": TTS_PROTOCOL_VERSION,
             "stream_id": request.stream_id,
             "text": request.text,
             "emotion": request.emotion,
             "markers": request.markers,
-            "options": {
-                "mime_type": self.mime_type,
-                "provider": self.provider,
-            },
+            "options": options,
         }
-        if not self.provider:
-            payload["options"].pop("provider", None)
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(self.endpoint, json=payload)
             try:

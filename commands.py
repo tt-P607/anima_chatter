@@ -1,0 +1,154 @@
+"""voice_chatter 的 VTB 模式控制命令。
+
+提供 ``/vtb on`` / ``/vtb off`` / ``/vtb status`` 三个子命令，让用户可以在
+任意聊天流中显式接管或释放 voice_chatter（VTB 模式）。
+
+接管原理：
+- 调用 :func:`chat_api.unregister_active_chatter` 释放当前 stream 的活跃 chatter。
+- 调用 :func:`chat_api.register_active_chatter` 显式绑定 voice_chatter 实例。
+- 释放后下一轮自动绑定回 default_chatter（或其他评分更高的 chatter）。
+
+注意：
+- 该命令仅控制 *当前 stream*，不支持跨 stream 接管。
+- ASR 实时通话流（platform=local_asr）会自动绑定 voice_chatter，无需用本命令。
+"""
+
+from __future__ import annotations
+
+from src.app.plugin_system.api import chat_api
+from src.app.plugin_system.api.log_api import get_logger
+from src.app.plugin_system.api.send_api import send_text
+from src.app.plugin_system.base import BaseCommand, cmd_route
+from src.app.plugin_system.types import PermissionLevel
+# StreamLoopManager 没有公开的插件 API；切换 chatter 实例后需要重启
+# 流循环以销毁缓存的 chatter 生成器，否则旧 chatter 的 execute() 仍会被调用。
+# default_chatter / kokoro_flow_chatter 也直接 import 这个模块。
+from src.core.transport.distribution.stream_loop_manager import get_stream_loop_manager
+
+
+logger = get_logger("voice_chatter.commands.vtb")
+
+
+_CHATTER_SIGNATURE = "voice_chatter:chatter:voice_chatter"
+
+
+class VTBCommand(BaseCommand):
+    """``/vtb`` 命令组：在当前聊天流上手动启用/关闭 voice_chatter 的 VTB 模式。"""
+
+    command_name: str = "vtb"
+    command_description: str = (
+        "VTube Studio 虚拟形象模式控制：on=接管当前聊天流；"
+        "off=释放接管；status=查看当前接管状态。"
+    )
+    permission_level: PermissionLevel = PermissionLevel.OWNER
+
+    async def _reply(self, text: str) -> None:
+        """向当前聊天流发送一条命令回执文本。"""
+
+        await send_text(text, stream_id=self.stream_id)
+
+    async def _force_restart_loop(self) -> None:
+        """重启当前流的循环，丢弃缓存的旧 chatter 生成器。
+
+        StreamLoopManager 会缓存 ``chatter.execute()`` 返回的异步生成器到
+        ``_chatter_genes`` 字典里。如果不重启循环，仅替换 chatter 实例无法
+        让下一 tick 用上新 chatter；旧生成器仍会被 ``asend`` 推进，导致
+        命令 "失效"。
+        """
+
+        try:
+            await get_stream_loop_manager().restart_stream_loop(self.stream_id)
+        except Exception as exc:
+            logger.warning(
+                f"重启流循环失败 stream={self.stream_id}: {exc}",
+                exc_info=True,
+            )
+
+    @cmd_route("on")
+    async def handle_on(self) -> tuple[bool, str]:
+        """在当前聊天流接管为 voice_chatter（VTB 模式）。"""
+
+        chatter_cls = chat_api.get_chatter_class(_CHATTER_SIGNATURE)
+        if chatter_cls is None:
+            await self._reply("未找到 voice_chatter 组件，无法接管。请检查插件是否启用。")
+            return False, "voice_chatter 未注册"
+
+        existing = chat_api.get_chatter_by_stream(self.stream_id)
+        if existing is not None and existing.__class__ is chatter_cls:
+            await self._reply("当前聊天流已经处于 VTB 模式。")
+            return True, "already active"
+
+        # 释放原有 chatter，立即注册 voice_chatter。
+        if existing is not None:
+            chat_api.unregister_active_chatter(self.stream_id)
+
+        instance = chatter_cls(stream_id=self.stream_id, plugin=self.plugin)
+        chat_api.register_active_chatter(self.stream_id, instance)
+        # 重启流循环：销毁旧 chatter 生成器，下一 tick 会用 voice_chatter 重建。
+        await self._force_restart_loop()
+
+        await self._reply(
+            "✓ 已切换到 VTB 模式：本聊天流现在由 voice_chatter 接管，"
+            "回复将经 TTS+VTube Studio 表演。"
+        )
+        logger.info(f"VTB 接管 stream={self.stream_id}")
+        return True, "vtb on"
+
+    @cmd_route("off")
+    async def handle_off(self) -> tuple[bool, str]:
+        """释放 voice_chatter 接管，恢复默认 chatter。"""
+
+        existing = chat_api.get_chatter_by_stream(self.stream_id)
+        if existing is None:
+            await self._reply("当前聊天流没有活跃 chatter，无需释放。")
+            return True, "noop"
+
+        if existing.__class__.get_signature() != _CHATTER_SIGNATURE:
+            await self._reply(
+                "当前聊天流目前由其他 chatter 接管（"
+                f"{existing.chatter_name}），未做更改。"
+                "如需切换，请使用对应的接管命令。"
+            )
+            return True, "not vtb"
+
+        chat_api.unregister_active_chatter(self.stream_id)
+        # 重启流循环：销毁旧 voice_chatter 生成器，下一 tick 会按
+        # ChatType / platform 自动绑回 default_chatter。
+        await self._force_restart_loop()
+
+        await self._reply(
+            "✓ VTB 模式已关闭，下一轮将自动绑回默认聊天器。"
+        )
+        logger.info(f"VTB 释放 stream={self.stream_id}")
+        return True, "vtb off"
+
+    @cmd_route("status")
+    async def handle_status(self) -> tuple[bool, str]:
+        """查看当前聊天流的 chatter 接管情况。"""
+
+        existing = chat_api.get_chatter_by_stream(self.stream_id)
+        if existing is None:
+            await self._reply(
+                "当前聊天流暂未绑定 chatter（即使发消息也尚未启动循环）。"
+            )
+            return True, "no chatter"
+
+        signature = existing.__class__.get_signature() or "<unknown>"
+        is_vtb = signature == _CHATTER_SIGNATURE
+        platform = ""
+        try:
+            if self._message is not None:
+                platform = self._message.platform or ""
+        except Exception:
+            platform = ""
+
+        lines = [
+            f"当前 chatter：{existing.chatter_name} ({signature})",
+            f"是否 VTB 接管：{'是' if is_vtb else '否'}",
+            f"当前平台：{platform or '(未知)'}",
+        ]
+        await self._reply("\n".join(lines))
+        return True, "status reported"
+
+
+__all__ = ["VTBCommand"]

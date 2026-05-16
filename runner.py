@@ -1,4 +1,11 @@
-"""sherpa-onnx 语音 Chatter 执行流程。"""
+"""voice_chatter 主对话循环。
+
+包含两套 chatter 行为：
+
+- voice 模式（``platform == "local_asr"``）：直通调用 LLM，不做注意力过滤。
+- vtb 模式（其他平台）：在 LLM 调用前先跑 :mod:`.sub_agent`（概率门 + sub_actor
+  决策），群聊里能丢弃绝大多数无关消息。
+"""
 
 from __future__ import annotations
 
@@ -12,13 +19,27 @@ from src.core.models.stream import ChatStream
 from src.kernel.llm import LLMPayload, ROLE, Text, ToolCall, ToolRegistry, ToolResult
 from src.kernel.logger import Logger
 
+from . import sub_agent as voice_sub_agent
 
-_PLAIN_TEXT_REMINDER = (
+
+_PLAIN_TEXT_REMINDER_VOICE = (
     "系统提醒：当前是实时语音通话 Chatter。你必须调用 say action 输出要说的话，"
     "纯文本不会被播放。说完等待用户时，请调用 pass_and_wait。"
 )
 
-_VOICE_SUSPEND_TEXT = "（语音回合已挂起，等待用户继续说话。）"
+_PLAIN_TEXT_REMINDER_VTB = (
+    "系统提醒：当前是 VTube Studio 虚拟形象互动 Chatter。你必须调用 say_and_perform action "
+    "输出要说的话，纯文本不会被发送也不会被朗读。说完等待用户时，请调用 pass_and_wait。"
+)
+
+_VOICE_SUSPEND_TEXT = "（本回合已挂起，等待用户继续说话。）"
+
+
+def _resolve_plain_text_reminder(chat_stream: Any) -> str:
+    """根据流的 platform 选择对应模式的纯文本提醒文案。"""
+
+    platform = getattr(chat_stream, "platform", "") or ""
+    return _PLAIN_TEXT_REMINDER_VOICE if platform == "local_asr" else _PLAIN_TEXT_REMINDER_VTB
 
 
 def _append_suspend_payload_if_tool_result_tail(response: Any, logger: Logger) -> None:
@@ -124,12 +145,26 @@ async def run_voice_conversation(
 
     system_prompt_text = await chatter._build_system_prompt(chat_stream)
     request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt_text)))
-    history_text = chatter._build_history_text(chat_stream)
     usable_map = await chatter.inject_usables(request)
 
     plain_text_retries = 0
     pending_wait_seconds: float | None = None
     resume_event: WaitResumeEvent | None = None
+
+    is_vtb_mode = chat_stream.platform != "local_asr"
+
+    # 从 chatter 读取 sub-agent 配置；缺省时使用模块默认（与 dfc 行为对齐）。
+    sub_agent_cfg = None
+    if is_vtb_mode:
+        plugin_config = getattr(getattr(chatter, "plugin", None), "config", None)
+        sub_agent_section = getattr(plugin_config, "sub_agent", None) if plugin_config else None
+        if sub_agent_section is not None:
+            sub_agent_cfg = voice_sub_agent.SubAgentConfig(
+                enabled=bool(sub_agent_section.enabled),
+                enable_programmatic_controller=bool(
+                    sub_agent_section.enable_programmatic_controller
+                ),
+            )
 
     while True:
         _ = resume_event
@@ -139,6 +174,34 @@ async def run_voice_conversation(
             continue
 
         unread_lines = "\n".join(chatter.format_message_line(msg) for msg in unread_msgs)
+
+        # vtb 模式：在调 LLM 之前先做注意力过滤（私聊直通 / 概率门 / sub_actor 判定）。
+        # voice 模式（local_asr）：跳过过滤，沿用一对一通话直通行为。
+        if is_vtb_mode:
+            decision = await voice_sub_agent.should_respond(
+                chatter=chatter,
+                logger=logger,
+                unreads_text=unread_lines,
+                unread_msgs=unread_msgs,
+                chat_stream=chat_stream,
+                config=sub_agent_cfg,
+            )
+            if not decision["should_respond"]:
+                logger.info(
+                    f"sub-agent 跳过响应 stream={chat_stream.stream_id} reason={decision['reason']}"
+                )
+                # 不响应：把未读移入历史（避免下一 tick 重复判定），等待下一批消息。
+                await chatter.flush_unreads(unread_msgs)
+                resume_event = yield Wait()
+                continue
+            logger.debug(f"sub-agent 决定响应 reason={decision['reason']}")
+
+        # 每轮都重新构建 history_text：上一轮 bot 自己的回复、被处理过的未读
+        # 都已经写进 chat_stream.context.history_messages，模型必须能看到
+        # 这部分变化才能保持上下文连续。把构建放在循环外只跑一次会导致
+        # 第二轮起每次注入都拿过期快照。
+        history_text = chatter._build_history_text(chat_stream)
+
         user_prompt = await chatter._build_user_prompt(
             chat_stream,
             history_text=history_text,
@@ -166,8 +229,12 @@ async def run_voice_conversation(
                 message = response.message.strip() if response.message else ""
                 if message and plain_text_retries < plain_text_retry_limit:
                     plain_text_retries += 1
-                    logger.warning(f"语音 Chatter 收到纯文本输出，提醒模型改用 say: {message[:100]}")
-                    request.add_payload(LLMPayload(ROLE.USER, Text(_PLAIN_TEXT_REMINDER)))
+                    logger.warning(
+                        f"voice_chatter 收到纯文本输出，提醒模型改用 say/say_and_perform: {message[:100]}"
+                    )
+                    request.add_payload(
+                        LLMPayload(ROLE.USER, Text(_resolve_plain_text_reminder(chat_stream)))
+                    )
                     continue
                 pending_wait_seconds = None
                 break
