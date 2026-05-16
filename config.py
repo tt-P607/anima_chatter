@@ -166,6 +166,75 @@ class SherpaOnnxVoiceChatterConfig(BaseConfig):
             ),
         )
 
+    @config_section("idle_animation", title="待机动画频率 / 幅度")
+    class IdleAnimationSection(SectionBase):
+        """vtb 模式下"待机自动化"动画的频率与幅度。
+
+        AutoAnimator 负责眨眼 / 呼吸 / 眼神扫视 / 被动摆动 / 宏观大动作。
+        默认值已经比原版激进——让 VTB 待机时看起来"活"一些。所有数值都
+        可以按你的模型调整：动得太狂就调小，呆就调大。
+
+        不调时这些字段全部走默认值；调一两个旋钮就能整体调风格，不需要
+        改 auto.py 源码。
+        """
+
+        # 眨眼间隔（秒）。真人 2-4 秒一次，1.8-4.0 让 VTB 更显灵动
+        blink_min_interval: float = Field(default=1.8, description="眨眼最小间隔（秒）")
+        blink_max_interval: float = Field(default=4.0, description="眨眼最大间隔（秒）")
+
+        # 呼吸频率（Hz）+ 振幅。0.28Hz ≈ 17 次/分，正常人呼吸节奏
+        breath_freq: float = Field(default=0.28, description="呼吸频率 Hz")
+        breath_amplitude: float = Field(default=0.9, description="呼吸 head_z 振幅（度）")
+
+        # 眼神扫视：真人微眼动 0.2-0.6 秒/次，0.5-1.8 让眼神持续微动不显呆
+        saccade_min_interval: float = Field(default=0.5, description="扫视最小间隔（秒）")
+        saccade_max_interval: float = Field(default=1.8, description="扫视最大间隔（秒）")
+        saccade_big_probability: float = Field(
+            default=0.35,
+            description="大幅扫视概率（其余为小幅微动）；0~1",
+        )
+        saccade_small_amplitude_x: float = Field(
+            default=0.22, description="小扫视水平幅度（0~1）"
+        )
+        saccade_small_amplitude_y: float = Field(
+            default=0.15, description="小扫视垂直幅度（0~1）"
+        )
+        saccade_big_amplitude_x: float = Field(
+            default=0.7, description="大扫视水平幅度（0~1）"
+        )
+        saccade_big_amplitude_y: float = Field(
+            default=0.4, description="大扫视垂直幅度（0~1）"
+        )
+
+        # 头部 / 身体微动总幅度倍率。1.0 是原版，1.5 比原版动得明显
+        head_micro_scale: float = Field(
+            default=1.5, description="头部微动幅度倍率，1.0 为原版基准"
+        )
+
+        # 被动慢摆触发频率（秒）。原版 40-80 秒太罕见
+        passive_sway_min_interval: float = Field(
+            default=8.0, description="被动慢摆最小间隔（秒）"
+        )
+        passive_sway_max_interval: float = Field(
+            default=25.0, description="被动慢摆最大间隔（秒）"
+        )
+
+        # 宏观动作（重心斜 / 好奇歪头 / 害羞回避等）触发频率（秒）。
+        # 原版 20-45 秒触发一次太罕见；改成 6-15 秒，对话期间能多看几个不同动作
+        macro_min_interval: float = Field(
+            default=6.0, description="宏观动作最小间隔（秒）"
+        )
+        macro_max_interval: float = Field(
+            default=15.0, description="宏观动作最大间隔（秒）"
+        )
+
+        # 宏观动作执行速度倍率。原版 move 2 秒 / hold 几秒 看着像慢动作；
+        # 默认 2.0 让 move 压缩到 ~1 秒（接近真人头部转向速度）。
+        # 调高 = 动作更快更利落；调低 = 慢镜头风。
+        motion_speed_scale: float = Field(
+            default=2.0, description="宏观动作执行速度倍率（>1 加快，<1 放慢）"
+        )
+
     @config_section("motion", title="VTube Studio 动作映射（可选热键）")
     class MotionSection(SectionBase):
         """可选：把 emotion / intent 映射到 VTS 已配置的 Hotkey ID。
@@ -197,6 +266,7 @@ class SherpaOnnxVoiceChatterConfig(BaseConfig):
     audio: AudioSection = Field(default_factory=AudioSection)
     sub_agent: SubAgentSection = Field(default_factory=SubAgentSection)
     audio_drive: AudioDriveSection = Field(default_factory=AudioDriveSection)
+    idle_animation: IdleAnimationSection = Field(default_factory=IdleAnimationSection)
     motion: MotionSection = Field(default_factory=MotionSection)
 
 

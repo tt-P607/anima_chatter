@@ -32,17 +32,38 @@ logger = get_logger("voice_chatter.vts.auto_animator")
 class AutoAnimator(BaseAnimator):
     """生命感自动化模块（整合版）。"""
 
-    def __init__(self, config: dict[str, Any] | None = None) -> None:
-        """初始化所有子状态机：眨眼/呼吸/眼神/宏观动作/安全平滑。"""
+    def __init__(
+        self,
+        config: dict[str, Any] | None = None,
+        *,
+        idle_animation_config: Any = None,
+    ) -> None:
+        """初始化所有子状态机：眨眼/呼吸/眼神/宏观动作/安全平滑。
+
+        Args:
+            config: 兼容 BaseAnimator 的旧 dict 配置（保留）。
+            idle_animation_config: ``SherpaOnnxVoiceChatterConfig.idle_animation`` section；
+                控制各类频率 / 幅度。不传就用激进版默认值，让模型看着活一些。
+        """
 
         super().__init__(config)
         self.start_time: float = time.time()
         self.is_performing: bool = False
 
+        # 把 idle_animation_config 上的字段拿出来，找不到就用激进默认值。
+        # 这些数字之前都是写死的；现在统一暴露到配置，便于按模型微调。
+        cfg = idle_animation_config
+
         # ── 眨眼状态 ────────────────────────────────────
         self.blink_state: int = 0  # 0 睁, 1 闭中, 2 闭停, 3 开中
         self.blink_timer: float = 0.0
-        self.next_blink_time: float = random.uniform(2.0, 6.0)
+        # 眨眼间隔（秒）。真人平均 4 秒一次，但 VTB 看起来活泼一点更好；
+        # 给 1.8-4.0 秒，VTS 物理引擎也会让眨眼显得自然。
+        self._blink_min_interval: float = float(getattr(cfg, "blink_min_interval", 1.8))
+        self._blink_max_interval: float = float(getattr(cfg, "blink_max_interval", 4.0))
+        self.next_blink_time: float = random.uniform(
+            self._blink_min_interval, self._blink_max_interval
+        )
 
         self.base_close_duration: float = 0.12
         self.base_stay_duration: float = 0.05
@@ -55,8 +76,8 @@ class AutoAnimator(BaseAnimator):
         self.current_eye_open: float = 1.0
 
         # ── 呼吸 ──────────────────────────────────────
-        self.breath_freq: float = 0.25
-        self.breath_amplitude: float = 0.7
+        self.breath_freq: float = float(getattr(cfg, "breath_freq", 0.28))
+        self.breath_amplitude: float = float(getattr(cfg, "breath_amplitude", 0.9))
 
         # ── 眼神漫游 ──────────────────────────────────
         self.eye_x: float = 0.0
@@ -64,12 +85,45 @@ class AutoAnimator(BaseAnimator):
         self.eye_wander_x: float = 0.0
         self.eye_wander_y: float = 0.0
         self.next_saccade_time: float = 0.0
+        # 扫视间隔（秒）。真人微眼动 0.2-0.6 秒一次，但全做太疲劳；
+        # 给 0.5-1.8 秒一次，让眼神持续微动不显呆。
+        self._saccade_min_interval: float = float(getattr(cfg, "saccade_min_interval", 0.5))
+        self._saccade_max_interval: float = float(getattr(cfg, "saccade_max_interval", 1.8))
+        # 大扫视概率：从 0.2 提到 0.35，多看四周不老盯前方。
+        self._saccade_big_probability: float = float(
+            getattr(cfg, "saccade_big_probability", 0.35)
+        )
+        # 小 / 大扫视幅度（默认略放大原值）。
+        self._saccade_small_amplitude_x: float = float(
+            getattr(cfg, "saccade_small_amplitude_x", 0.22)
+        )
+        self._saccade_small_amplitude_y: float = float(
+            getattr(cfg, "saccade_small_amplitude_y", 0.15)
+        )
+        self._saccade_big_amplitude_x: float = float(
+            getattr(cfg, "saccade_big_amplitude_x", 0.7)
+        )
+        self._saccade_big_amplitude_y: float = float(
+            getattr(cfg, "saccade_big_amplitude_y", 0.4)
+        )
+
+        # ── 头部微动幅度倍率（1.5x = 比原版动得明显） ──
+        self._head_micro_scale: float = float(getattr(cfg, "head_micro_scale", 1.5))
 
         # ── 身体随机晃动相位 ──────────────────────────
         self.sway_offsets: list[float] = [random.uniform(0, 100) for _ in range(4)]
 
         # ── 被动慢速摆动 ──────────────────────────────
-        self.next_passive_sway_time: float = time.time() + random.uniform(20.0, 40.0)
+        # 之前 20-80 秒触发一次，整段对话基本看不到。改成 8-25 秒。
+        self._passive_sway_min_interval: float = float(
+            getattr(cfg, "passive_sway_min_interval", 8.0)
+        )
+        self._passive_sway_max_interval: float = float(
+            getattr(cfg, "passive_sway_max_interval", 25.0)
+        )
+        self.next_passive_sway_time: float = time.time() + random.uniform(
+            self._passive_sway_min_interval, self._passive_sway_max_interval
+        )
         self.passive_sway_timer: float = 0.0
         self.passive_sway_active: bool = False
         self.passive_sway_val: float = 0.0
@@ -77,9 +131,18 @@ class AutoAnimator(BaseAnimator):
         self.passive_sway_cycles: int = 1
 
         # ── 宏观动作（idle 偶尔触发的大动作） ─────────
+        # 之前 20-45 秒。改成 6-15 秒，更频繁切大动作。
+        self._macro_min_interval: float = float(getattr(cfg, "macro_min_interval", 6.0))
+        self._macro_max_interval: float = float(getattr(cfg, "macro_max_interval", 15.0))
+        # 宏观动作整体速度倍率：>1 = 加快（动作时长压缩），<1 = 放慢。
+        # 默认 2.0 让"慢吞吞像慢放"的问题立刻解决——move 1s 缩到 0.5s，
+        # 真人头部转向也就这速度。hold 时长按 0.5x 也压缩，避免摆好造型停太久。
+        self._motion_speed_scale: float = float(getattr(cfg, "motion_speed_scale", 2.0))
         self.macro_state: str = "IDLE"  # IDLE / MOVING / HOLDING / RETURNING
         self.macro_timer: float = 0.0
-        self.next_macro_trigger_time: float = time.time() + random.uniform(20.0, 40.0)
+        self.next_macro_trigger_time: float = time.time() + random.uniform(
+            self._macro_min_interval, self._macro_max_interval
+        )
 
         self.macro_history: list[str] = []
         self.macro_demo_queue: list[dict[str, Any]] = []
@@ -116,19 +179,26 @@ class AutoAnimator(BaseAnimator):
         self.macro_osc_freq: float = 0.8
         self.macro_custom_blink_durations: dict[str, float] | None = None
 
-        # 动作库（权重抽样）
+        # 动作库（权重抽样 + 可选动作链）
+        # 每个动作可加 chain_to: {下一动作名: 概率}，让 RETURNING 完成后有概率
+        # 立即衔接到指定动作而不是等下次随机周期，做出"动作有因果"的连贯感。
+        # 例如：歪头 → 思考 → 失神发呆，看着像"她正在想什么"。
+        # 链式衔接最多发生 _max_chain_count 次（默认 2），防止无限连。
         self.macro_library: list[dict[str, Any]] = [
             {
                 "name": "重心左斜",
                 "params": {"v_head_z": -15.0, "v_head_x": -5.0},
                 "weight": 20,
                 "hold": 8.0,
+                # 重心斜常常承接侧身偷瞄、好奇歪头
+                "chain_to": {"侧身偷瞄": 0.3, "好奇歪头": 0.2},
             },
             {
                 "name": "重心右斜",
                 "params": {"v_head_z": 11.0, "v_head_x": 4.0},
                 "weight": 20,
                 "hold": 8.0,
+                "chain_to": {"侧身偷瞄": 0.3, "好奇歪头": 0.2},
             },
             {
                 "name": "左侧扫视",
@@ -137,6 +207,8 @@ class AutoAnimator(BaseAnimator):
                 "hold": 3.0,
                 "move_speed": 1.5,
                 "trigger_blink_on_return": True,
+                # 扫视后常常停在分心远眺或回过神去思考
+                "chain_to": {"分心远眺": 0.4, "深度思考": 0.2},
             },
             {
                 "name": "右侧扫视",
@@ -145,6 +217,7 @@ class AutoAnimator(BaseAnimator):
                 "hold": 3.0,
                 "move_speed": 1.5,
                 "trigger_blink_on_return": True,
+                "chain_to": {"分心远眺": 0.4, "深度思考": 0.2},
             },
             {
                 "name": "失神发呆",
@@ -153,6 +226,8 @@ class AutoAnimator(BaseAnimator):
                 "hold": 6.0,
                 "move_speed": 4.0,
                 "custom_blink": {"close": 1.2, "stay": 0.8, "open": 1.5},
+                # 发呆完了往往是缓缓深呼吸"回神"
+                "chain_to": {"深呼吸": 0.4},
             },
             {
                 "name": "侧身偷瞄",
@@ -160,6 +235,8 @@ class AutoAnimator(BaseAnimator):
                 "weight": 20,
                 "hold": 3.0,
                 "move_speed": 1.8,
+                # 偷瞄后常常害羞回避（被发现了的感觉）
+                "chain_to": {"害羞回避": 0.3, "分心远眺": 0.2},
             },
             {
                 "name": "分心远眺",
@@ -167,6 +244,8 @@ class AutoAnimator(BaseAnimator):
                 "weight": 20,
                 "hold": 4.0,
                 "trigger_blink_on_return": True,
+                # 远眺过后多是思考或继续发呆
+                "chain_to": {"深度思考": 0.3, "失神发呆": 0.2},
             },
             {
                 "name": "好奇歪头",
@@ -179,6 +258,8 @@ class AutoAnimator(BaseAnimator):
                 },
                 "weight": 20,
                 "hold": 4.0,
+                # 歪头思考很自然过渡到深度思考
+                "chain_to": {"深度思考": 0.4, "向下检查": 0.2},
             },
             {
                 "name": "深呼吸",
@@ -188,6 +269,7 @@ class AutoAnimator(BaseAnimator):
                 "move_speed": 2.0,
                 "blink_at_t": 0.4,
                 "custom_blink": {"close": 1.0, "stay": 1.5, "open": 0.8},
+                # 深呼吸是"段落终止符"，不再衔接任何动作
             },
             {
                 "name": "向下检查",
@@ -195,6 +277,7 @@ class AutoAnimator(BaseAnimator):
                 "weight": 10,
                 "hold": 2.5,
                 "move_speed": 1.5,
+                "chain_to": {"好奇歪头": 0.25},
             },
             {
                 "name": "害羞回避",
@@ -208,6 +291,8 @@ class AutoAnimator(BaseAnimator):
                 },
                 "weight": 10,
                 "hold": 5.0,
+                # 害羞过后通常是深呼吸缓和情绪
+                "chain_to": {"深呼吸": 0.5},
             },
             {
                 "name": "深度思考",
@@ -217,8 +302,20 @@ class AutoAnimator(BaseAnimator):
                 "weight": 10,
                 "hold": 5.0,
                 "move_speed": 2.0,
+                # 思考完了恍然大悟 → 失神发呆 / 终止
+                "chain_to": {"失神发呆": 0.3},
             },
         ]
+
+        # 动作链上下文
+        # _pending_chain_action：下次 IDLE → 触发时强制选这个动作（绕过权重抽样）。
+        # _chain_count：累计已发生的链式衔接次数，>= _max_chain_count 时强制断链。
+        # _current_chain_to：当前正在执行的动作的 chain_to 表，RETURNING 完成时
+        # 抽签用。每次进入新动作时由 IDLE 分支写入。
+        self._pending_chain_action: str | None = None
+        self._chain_count: int = 0
+        self._max_chain_count: int = 2  # 最多连续衔接 2 次，避免一直在动
+        self._current_chain_to: dict[str, float] = {}
 
         # 参数 ID
         self.param_eye_l = "v_eye_left"
@@ -280,10 +377,13 @@ class AutoAnimator(BaseAnimator):
                 self.current_eye_open = 1.0
                 self.blink_state = 0
                 self.blink_timer = 0
+                # 10% 概率短间隔双连眨（人类常有的"再眨一下"），其余按主区间。
                 if random.random() < 0.10:
                     self.next_blink_time = random.uniform(0.4, 0.6)
                 else:
-                    self.next_blink_time = random.uniform(2.5, 6.5)
+                    self.next_blink_time = random.uniform(
+                        self._blink_min_interval, self._blink_max_interval
+                    )
 
         macro_eye_l = self.macro_current_params.get("v_eye_l", 0.0)
         macro_eye_r = self.macro_current_params.get("v_eye_r", 0.0)
@@ -300,13 +400,25 @@ class AutoAnimator(BaseAnimator):
         self.eye_wander_y = math.cos(elapsed * 0.25) * 0.04 + math.cos(elapsed * 0.13) * 0.02
 
         if elapsed >= self.next_saccade_time:
-            if random.random() < 0.8:
-                self.eye_x = random.uniform(-0.16, 0.16)
-                self.eye_y = random.uniform(-0.11, 0.11)
+            if random.random() >= self._saccade_big_probability:
+                # 小幅扫视：眼神微微偏移，用于"还在看你"的状态
+                self.eye_x = random.uniform(
+                    -self._saccade_small_amplitude_x, self._saccade_small_amplitude_x
+                )
+                self.eye_y = random.uniform(
+                    -self._saccade_small_amplitude_y, self._saccade_small_amplitude_y
+                )
             else:
-                self.eye_x = random.uniform(-0.6, 0.6)
-                self.eye_y = random.uniform(-0.33, 0.33)
-            self.next_saccade_time = elapsed + random.uniform(1.2, 3.5)
+                # 大幅扫视：左顾右盼，让 VTB 看四周不显呆
+                self.eye_x = random.uniform(
+                    -self._saccade_big_amplitude_x, self._saccade_big_amplitude_x
+                )
+                self.eye_y = random.uniform(
+                    -self._saccade_big_amplitude_y, self._saccade_big_amplitude_y
+                )
+            self.next_saccade_time = elapsed + random.uniform(
+                self._saccade_min_interval, self._saccade_max_interval
+            )
 
         # 4) 被动慢摆
         now = time.time()
@@ -316,7 +428,10 @@ class AutoAnimator(BaseAnimator):
                 self.passive_sway_timer = 0.0
                 self.passive_sway_cycles = random.randint(1, 2)
                 self.passive_sway_duration = self.passive_sway_cycles * 3.0
-                self.next_passive_sway_time = now + random.uniform(40.0, 80.0)
+                self.next_passive_sway_time = now + random.uniform(
+                    self._passive_sway_min_interval,
+                    self._passive_sway_max_interval,
+                )
         else:
             self.passive_sway_timer += logic_delta
             t_ratio = self.passive_sway_timer / self.passive_sway_duration
@@ -331,18 +446,19 @@ class AutoAnimator(BaseAnimator):
         # 5) 宏观动作状态机
         self._update_macro_actions(logic_delta)
 
-        # 6) 头部/身体随机微动
+        # 6) 头部/身体随机微动（_head_micro_scale 控制总幅度，1.0 为原版）
+        scale = self._head_micro_scale
         head_micro_x = (
-            math.sin(elapsed * 0.12 + self.sway_offsets[0]) * 2.5
-            + math.sin(elapsed * 0.05 + self.sway_offsets[1]) * 1.5
+            math.sin(elapsed * 0.12 + self.sway_offsets[0]) * 2.5 * scale
+            + math.sin(elapsed * 0.05 + self.sway_offsets[1]) * 1.5 * scale
         )
         head_micro_y = (
-            math.cos(elapsed * 0.1 + self.sway_offsets[2]) * 2.0
-            + math.cos(elapsed * 0.07 + self.sway_offsets[3]) * 1.0
+            math.cos(elapsed * 0.1 + self.sway_offsets[2]) * 2.0 * scale
+            + math.cos(elapsed * 0.07 + self.sway_offsets[3]) * 1.0 * scale
         )
         body_sway_z = (
-            math.sin(elapsed * 0.07 + self.sway_offsets[1]) * 1.8
-            + math.sin(elapsed * 0.03 + self.sway_offsets[3]) * 1.2
+            math.sin(elapsed * 0.07 + self.sway_offsets[1]) * 1.8 * scale
+            + math.sin(elapsed * 0.03 + self.sway_offsets[3]) * 1.2 * scale
         )
 
         # 7) 状态过渡：is_performing 时让自动化淡出
@@ -388,16 +504,19 @@ class AutoAnimator(BaseAnimator):
         raw_output["v_blush"] = self.macro_current_params.get("v_blush", 0.0)
 
         # 8) 安全平滑层（阻尼 + 速率限制）
-        damp_factor = 0.25
+        # damp_factor 影响整体平滑（越小越跟手）；max_speeds 限制单帧最大变化
+        # 速率（度/秒）。原版 60°/s 对头部转向偏慢，现在按真人快速转头能到
+        # 180°/s 设置——配合 motion_speed_scale=2.0，宏观动作能在 0.5s 内到位。
+        damp_factor = 0.18
         max_speeds = {
-            self.param_head_x: 60.0,
-            self.param_head_y: 60.0,
-            self.param_head_z: 60.0,
-            "v_body_x": 40.0,
-            "v_body_y": 40.0,
-            "v_body_z": 40.0,
-            self.param_eye_x: 4.0,
-            self.param_eye_y: 4.0,
+            self.param_head_x: 180.0,
+            self.param_head_y: 180.0,
+            self.param_head_z: 180.0,
+            "v_body_x": 100.0,
+            "v_body_y": 100.0,
+            "v_body_z": 100.0,
+            self.param_eye_x: 8.0,
+            self.param_eye_y: 8.0,
         }
 
         for key, target_val in raw_output.items():
@@ -440,6 +559,28 @@ class AutoAnimator(BaseAnimator):
                 self.current_stay_duration = self.base_stay_duration
                 self.current_open_duration = self.base_open_duration
 
+    def _maybe_pick_chain_action(self) -> str | None:
+        """根据 _current_chain_to 表抽签决定下一个衔接动作。
+
+        - 演示模式 / 已达 _max_chain_count → 直接 None（断链）
+        - chain_to 表为空 → None
+        - 否则按概率字典依次掷骰子，命中即返回该动作名；都没命中也返回 None
+        """
+
+        if self.macro_demo_queue:
+            return None
+        if self._chain_count >= self._max_chain_count:
+            return None
+        if not self._current_chain_to:
+            return None
+
+        # 按字典里的"动作名 → 概率"顺序掷骰子；任意一个命中就用它。
+        # 总概率不必等于 1：剩下的概率就是"不衔接，断链"。
+        for name, probability in self._current_chain_to.items():
+            if random.random() < float(probability):
+                return name
+        return None
+
     def start_demo(self) -> None:
         """按动作库顺序触发所有宏观动作（用于演示）。"""
 
@@ -457,20 +598,53 @@ class AutoAnimator(BaseAnimator):
 
         if self.macro_state == "IDLE":
             if self.is_performing:
-                self.next_macro_trigger_time = now + random.uniform(20.0, 45.0)
+                # 表演中暂停宏观动作触发；下次重排在表演结束之后。
+                self.next_macro_trigger_time = now + random.uniform(
+                    self._macro_min_interval, self._macro_max_interval
+                )
+                # 表演时清空动作链上下文，避免说话结束后还接着上次的链。
+                self._pending_chain_action = None
+                self._chain_count = 0
+                self._current_chain_to = {}
                 return
 
             if now < self.next_macro_trigger_time:
                 return
 
-            if self.macro_demo_queue:
-                action = self.macro_demo_queue.pop(0)
-                logger.info(f"[演示] 播放: {action['name']} (剩余: {len(self.macro_demo_queue)})")
+            # 1) 优先消费动作链衔接：上一个动作的 chain_to 抽签命中时直接用，
+            # 不走加权随机；上次衔接缓冲已用过，立即清空。
+            action = None
+            if self._pending_chain_action is not None:
+                chain_name = self._pending_chain_action
+                self._pending_chain_action = None
+                hit = next(
+                    (a for a in self.macro_library if a["name"] == chain_name),
+                    None,
+                )
+                if hit is not None:
+                    self._chain_count += 1
+                    logger.info(
+                        f"链式衔接: -> {chain_name}（已连 {self._chain_count} 次）"
+                    )
+                    action = hit
+                else:
+                    self._chain_count = 0  # 找不到目标动作，断链
             else:
-                available = [a for a in self.macro_library if a["name"] not in self.macro_history]
-                if not available:
-                    available = self.macro_library
-                action = random.choices(available, weights=[a["weight"] for a in available])[0]
+                self._chain_count = 0
+
+            # 2) 没有链式衔接 → 演示队列 / 加权随机
+            if action is None:
+                if self.macro_demo_queue:
+                    action = self.macro_demo_queue.pop(0)
+                    logger.info(f"[演示] 播放: {action['name']} (剩余: {len(self.macro_demo_queue)})")
+                else:
+                    available = [a for a in self.macro_library if a["name"] not in self.macro_history]
+                    if not available:
+                        available = self.macro_library
+                    action = random.choices(available, weights=[a["weight"] for a in available])[0]
+
+            # 记下当前动作的 chain_to 表，等 RETURNING 完成时按它抽签下个衔接动作
+            self._current_chain_to = dict(action.get("chain_to", {}) or {})
 
             self.macro_sequence = action.get("sequence", []).copy()
             if not self.macro_sequence:
@@ -535,17 +709,38 @@ class AutoAnimator(BaseAnimator):
                     self.macro_current_params[key] = 0.0
                 self.macro_state = "IDLE"
                 self.macro_timer = 0.0
-                if self.macro_demo_queue:
+
+                # 动作链衔接：本次动作刚收完，按 chain_to 抽签下一个动作。
+                # 命中 → 立即触发（next_macro_trigger_time = now，IDLE 分支
+                # 下一次进来就处理）；没命中 → 走原本的 6-15s 等待。
+                # 演示模式 / 已达最大连接数 → 跳过抽签，避免动作不断。
+                next_in_chain = self._maybe_pick_chain_action()
+                if next_in_chain is not None:
+                    self._pending_chain_action = next_in_chain
+                    self.next_macro_trigger_time = now  # 立即进入下一个
+                elif self.macro_demo_queue:
+                    # 演示模式：动作之间留 2 秒间隙就够了。
                     self.next_macro_trigger_time = now + 2.0
                 else:
-                    self.next_macro_trigger_time = now + random.uniform(20.0, 40.0)
+                    self.next_macro_trigger_time = now + random.uniform(
+                        self._macro_min_interval, self._macro_max_interval
+                    )
+                # 当前动作执行完，链表清空（下一个动作进 IDLE 分支时会重新写入）
+                self._current_chain_to = {}
 
     def _apply_macro_step(self, step: dict[str, Any], action_name: str = "") -> None:
-        """切换到一个新的动作步：写入目标参数 + 时长 + 振荡参数。"""
+        """切换到一个新的动作步：写入目标参数 + 时长 + 振荡参数。
+
+        所有时长（move / hold / return）都按 :attr:`_motion_speed_scale` 压缩——
+        默认 2.0 让动作执行速度翻倍，避免"慢吞吞像慢放"。
+        """
 
         self.macro_target_params = step["params"]
-        self.macro_duration_hold = step.get("hold", 5.0)
-        move_speed = step.get("move_speed", 2.0)
+        scale = max(0.1, self._motion_speed_scale)  # 防 0 / 负数
+        # hold 时长按 sqrt(scale) 压缩，比 move 时长压缩得温和点：
+        # 因为造型 hold 时间太短会显得"刚摆好就跑"，过度压缩反而违和。
+        self.macro_duration_hold = step.get("hold", 5.0) / (scale ** 0.5)
+        move_speed = step.get("move_speed", 2.0) / scale
         self.macro_duration_move = move_speed
         self.macro_duration_return = move_speed * 1.5
         self.macro_trigger_blink = step.get("trigger_blink_on_return", False)

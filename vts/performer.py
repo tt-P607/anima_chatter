@@ -111,7 +111,11 @@ class VTSPerformer:
                 port=vts_cfg.port,
                 token_path=build_default_token_path(),
             )
-            self.auto_animator = AutoAnimator()
+            # AutoAnimator 接收 idle_animation 配置，把眨眼/扫视/被动摆动/
+            # 宏观动作触发等频率与幅度暴露成可调旋钮（默认值已经比原版激进）。
+            self.auto_animator = AutoAnimator(
+                idle_animation_config=getattr(self.plugin_config, "idle_animation", None),
+            )
             # 把 audio_player 的 envelope_tracker 注入 SpeechAnimator，
             # 让说话期间的头部 / 身体微动跟着 TTS 音频包络起伏，做出"语调律动"。
             # 配置 audio_drive 段控制具体增益与开关；为 None 时 SpeechAnimator
