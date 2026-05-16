@@ -1,10 +1,14 @@
 {
     "name": "voice_chatter",
+    "display_name": "语音通话与 VTube Studio 互动聊天器",
     "version": "1.1.0",
     "description": "ASR 实时语音通话 + VTube Studio 虚拟形象 通用 Chatter",
     "author": "MoFox Team",
     "dependencies": {
-        "plugins": ["asr_adapter", "tts_http_server"],
+        "plugins": [
+            "asr_adapter",
+            "tts_http_server"
+        ],
         "components": []
     },
     "python_dependencies": [
@@ -14,12 +18,16 @@
         {
             "component_type": "chatter",
             "component_name": "voice_chatter",
-            "dependencies": ["asr_adapter:adapter:asr_adapter"]
+            "dependencies": [
+                "asr_adapter:adapter:asr_adapter"
+            ]
         },
         {
             "component_type": "action",
             "component_name": "say",
-            "dependencies": ["asr_adapter:adapter:asr_adapter"]
+            "dependencies": [
+                "asr_adapter:adapter:asr_adapter"
+            ]
         },
         {
             "component_type": "action",
@@ -38,6 +46,15 @@
         }
     ],
     "entry_point": "plugin.py",
-    "min_core_version": "1.0.0",
-    "dependencies_required": true
+    "min_core_version": "1.2.0-alpha",
+    "categories": [
+        "chat"
+    ],
+    "tags": [
+        "voice",
+        "chatter",
+        "real-time",
+        "company",
+        "vtb"
+    ]
 }
