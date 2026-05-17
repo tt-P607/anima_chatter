@@ -75,8 +75,9 @@ class VTSPerformer:
         # 可选 hotkey_map：把 emotion 主类型或 intent 名字映射到 VTS Hotkey ID。
         # 例如 {"happy": "SmileHotkey", "THINKING": "ThinkHotkey"}。
         # 没配置就不触发热键，全靠参数注入实现表演。
-        motion_section = getattr(plugin_config, "motion", None)
-        hotkey_map = getattr(motion_section, "hotkey_map", None) or {}
+        # 配置位置已合并到 [vts] section（参见 :class:`SherpaOnnxVoiceChatterConfig`）。
+        vts_section = getattr(plugin_config, "vts", None)
+        hotkey_map = getattr(vts_section, "hotkey_map", None) or {}
         self._hotkey_map: dict[str, str] = {
             str(k).lower(): str(v) for k, v in hotkey_map.items() if v
         }

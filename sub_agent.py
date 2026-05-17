@@ -3,6 +3,19 @@
 复刻自 :mod:`plugins.default_chatter.decision_agent` + DefaultChatter 主类
 里的 sub-agent 概率门逻辑，专门用于 vtb 模式（``platform != "local_asr"``）。
 
+.. warning::
+
+   **本模块与 default_chatter 是手动同步关系**，没有共享代码。
+
+   如果你修改了 dfc 的 ``decision_agent`` 中：
+
+   - 概率门权重（``_BASE_BYPASS_PROBABILITY`` / ``_NAME_MENTION_BONUS`` 等）
+   - sub_actor LLM 调用流程
+   - "上一回合刚回复 → 下一 tick 加成" 这条心理机制
+
+   请**同步**回这个文件；否则 voice_chatter（vtb / vtb_live 模式）的
+   注意力过滤行为会与 dfc 漂移。
+
 两层过滤：
 
 1. **概率门（本地 / 不调用 LLM）**：基础概率 + @名字 / 别名 / 未读条数加成。

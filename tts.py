@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 from uuid import uuid4
 
 from src.core.models.message import Message, MessageType
 from src.core.models.stream import ChatStream
-from src.kernel.concurrency import get_task_manager
 from src.kernel.logger import Logger
 
-from .markers import SpeechSegment
+if TYPE_CHECKING:
+    from .markers import SpeechSegment
 
 
 TTS_PROTOCOL_VERSION = "mfx-tts-http-v1"
@@ -204,64 +204,18 @@ def build_tts_backend(config: Any, logger: Logger) -> TTSBackend:
     return HttpTTSBackend(endpoint=endpoint, timeout=timeout, mime_type=mime_type, provider=provider)
 
 
-async def synthesize_segments(
-    *,
-    backend: TTSBackend,
-    stream_id: str,
-    segments: list[SpeechSegment],
-    max_parallel: int,
-    empty_audio_retry_count: int = 0,
-) -> list[TTSArtifact]:
-    """并行合成语音片段，并保持返回顺序与输入一致。"""
-
-    if not segments:
-        return []
-
-    limit = max(1, int(max_parallel or 1))
-    artifacts: list[TTSArtifact] = []
-    tm = get_task_manager()
-
-    for start in range(0, len(segments), limit):
-        batch = segments[start:start + limit]
-        batch_results = await tm.gather(
-            *[
-                backend.synthesize(
-                    TTSRequest(
-                        stream_id=stream_id,
-                        text=segment.text,
-                        emotion=segment.emotion,
-                        markers=segment.markers,
-                    )
-                )
-                for segment in batch
-            ],
-            return_exceptions=True,
-        )
-        for segment, result in zip(batch, batch_results, strict=False):
-            if isinstance(result, Exception):
-                artifacts.append(TTSArtifact(text=segment.text, metadata={"error": str(result)}))
-            else:
-                artifacts.append(
-                    await _retry_empty_audio(
-                        backend=backend,
-                        stream_id=stream_id,
-                        segment=segment,
-                        artifact=result,
-                        retry_count=empty_audio_retry_count,
-                    )
-                )
-    return artifacts
-
-
 async def _retry_empty_audio(
     *,
     backend: TTSBackend,
     stream_id: str,
-    segment: SpeechSegment,
+    segment: "SpeechSegment",
     artifact: TTSArtifact,
     retry_count: int,
 ) -> TTSArtifact:
-    """TTS 返回空音频时重试，避免单个分段静默丢失。"""
+    """TTS 返回空音频时重试，避免单个分段静默丢失。
+
+    本函数被 :class:`SayAction` / :class:`SayAndPerformAction` 直接调用。
+    """
 
     current = artifact
     for _ in range(max(0, int(retry_count or 0))):
@@ -289,5 +243,4 @@ __all__ = [
     "TTS_PROTOCOL_VERSION",
     "TTSRequest",
     "build_tts_backend",
-    "synthesize_segments",
 ]

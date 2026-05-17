@@ -1,17 +1,24 @@
 """voice_chatter 插件配置。
 
-支持两种运行模式：
+支持三种运行模式（详见 :mod:`plugins.voice_chatter.modes`）：
 
-- voice 模式：``platform == "local_asr"``，沿用原有的 ASR 实时通话行为。
-- vtb 模式：被 ``/vtb on`` 接管的其他平台流（如 QQ 群/私聊），通过 TTS+VTS
-  驱动 VTube Studio 虚拟形象。
+- ``voice``：``platform == "local_asr"``，沿用原有 ASR 实时通话行为。
+- ``vtb``：被 ``/vtb on`` 接管的普通群聊 / 私聊（VTube Studio 表演但不直播）。
+- ``vtb_live``：直播平台（如 ``bilibili_live``），观众是直播间弹幕。
 
-配置区段：
+配置区段（共 6 个）：
 
-- ``[plugin]``：通用 chatter 行为（tick / buffer / 重试 / 挂起开关）。
-- ``[tts]``：TTS HTTP 后端（两种模式共用）。
-- ``[vts]``：VTube Studio 连接（仅 vtb 模式）。
-- ``[audio]``：本地音频输出设备（仅 vtb 模式）。
+============================ ===================================================
+section                       适用模式 / 用途
+============================ ===================================================
+``[plugin]``                  通用 chatter 行为（tick / buffer / 重试 / 挂起开关）
+``[tts]``                     TTS HTTP 后端（三种模式共用）
+``[vts]``                     VTube Studio 连接 + 本地音频输出 + Hotkey 映射
+                              （仅 vtb / vtb_live 生效）
+``[vtb_attention]``           vtb / vtb_live 模式的"是否回复"过滤器
+``[audio_drive]``             音频驱动律动（vtb / vtb_live 表演时让形象跟着声音动）
+``[idle_animation]``          待机动画频率与幅度（vtb / vtb_live 共用）
+============================ ===================================================
 """
 
 from __future__ import annotations
@@ -25,36 +32,44 @@ class SherpaOnnxVoiceChatterConfig(BaseConfig):
     """voice_chatter 插件配置。"""
 
     config_name: ClassVar[str] = "config"
-    config_description: ClassVar[str] = "voice_chatter 插件配置（语音通话 + VTB 虚拟形象）"
+    config_description: ClassVar[str] = (
+        "voice_chatter 插件配置（语音通话 + VTB 表演 + 直播弹幕，三种模式共用）"
+    )
 
     @config_section("plugin", title="插件设置", tag="plugin")
     class PluginSection(SectionBase):  # noqa: D401
-        """插件基础配置。"""
+        """插件基础配置（三模式共享）。"""
 
         enabled: bool = Field(default=True, description="是否启用本 chatter")
         tick_interval: float = Field(
             default=1.0,
-            description="非 ASR（即 vtb）模式下的 tick 间隔；voice 模式始终强制为 0.1",
+            description=(
+                "vtb / vtb_live 模式下的 tick 间隔（秒）。"
+                "voice 模式始终强制为 0.1，无法被此项影响。"
+            ),
         )
         allow_message_buffer: bool = Field(
             default=True,
-            description="非 ASR 模式下是否允许消息缓冲；voice 模式始终强制为 False",
+            description=(
+                "vtb / vtb_live 模式下是否允许消息缓冲。"
+                "voice 模式始终强制为 False。"
+            ),
         )
         plain_text_retry_limit: int = Field(
             default=1,
-            description="模型返回纯文本时的提醒重试次数",
+            description="模型返回纯文本（未调用 say / say_and_perform）时的提醒重试次数",
         )
         enable_action_suspend: bool = Field(
             default=True,
             description=(
-                "是否启用纯 Action 回合的挂起机制。关闭后，纯 Action 结果会像常规工具结果一样"
-                "继续 follow-up，而不是立即等待用户。"
+                "是否启用纯 Action 回合的挂起机制。关闭后，纯 Action 结果会"
+                "像常规工具结果一样继续 follow-up，而不是立即等待用户。"
             ),
         )
 
     @config_section("tts", title="TTS 设置")
     class TTSSection(SectionBase):
-        """TTS 后端配置。"""
+        """TTS HTTP 后端配置（三模式共享）。"""
 
         endpoint: str = Field(
             default="http://127.0.0.1:8000/router/tts_http_server/api/tts/v1/synthesize",
@@ -77,13 +92,18 @@ class SherpaOnnxVoiceChatterConfig(BaseConfig):
             default=False, description="TTS 失败时是否回退发送文本"
         )
 
-    @config_section("vts", title="VTube Studio 配置")
+    @config_section("vts", title="VTube Studio 接入")
     class VTSSection(SectionBase):
-        """VTube Studio 连接与运行配置（仅 vtb 模式生效）。"""
+        """VTube Studio 连接 + 音频输出 + Hotkey 映射（仅 vtb / vtb_live 生效）。
 
+        在 vtb 系模式下集中表达"虚拟形象那一边的所有接入参数"——以前散在
+        ``[vts]`` / ``[audio]`` / ``[motion]`` 三个 section，全部合并到这里。
+        """
+
+        # ── 长连接 ─────────────────────────────────
         enabled: bool = Field(
             default=False,
-            description="是否启用 VTS（关闭后 vtb 模式仅播 TTS，不驱动虚拟形象）",
+            description="是否启用 VTS（关闭后 vtb 系模式仅播 TTS，不驱动虚拟形象）",
         )
         host: str = Field(default="127.0.0.1", description="VTS 主机地址")
         port: int = Field(default=8001, description="VTS WebSocket 端口")
@@ -95,31 +115,43 @@ class SherpaOnnxVoiceChatterConfig(BaseConfig):
             ),
         )
 
-    @config_section("audio", title="音频输出（VTB 模式）")
-    class AudioSection(SectionBase):
-        """vtb 模式下本地音频输出设备配置。"""
-
-        output_device: str = Field(
+        # ── 音频输出（原 [audio].output_device） ────
+        audio_output_device: str = Field(
             default="CABLE Input@WASAPI",
             description=(
-                "用于 vtb 模式 TTS 播放的输出设备，格式为 '设备名@驱动名'。"
-                "通常指向 VB-Cable Input，使虚拟形象与直播软件能听到同一份音频。"
+                "vtb / vtb_live 模式下用于本地播放 TTS 的输出设备，"
+                "格式为 '设备名@驱动名'。通常指向 VB-Cable Input，"
+                "使虚拟形象与直播软件能听到同一份音频。"
             ),
         )
 
-    @config_section("sub_agent", title="VTB 注意力过滤")
-    class SubAgentSection(SectionBase):
-        """vtb 模式下"是否回复"过滤器，与 dfc 行为一致。
+        # ── Hotkey 映射（原 [motion].hotkey_map） ───
+        hotkey_map: dict[str, str] = Field(
+            default_factory=dict,
+            description=(
+                "可选：把 emotion / intent 映射到 VTS 已配置的 Hotkey ID。"
+                "在 VTube Studio 的 Hotkeys 面板里给每个动画起一个 Hotkey ID"
+                "（不是显示名），然后在这里映射，例如 "
+                '{"THINKING": "ThinkAnim", "happy": "SmileExpr"}。'
+                "默认为空，所有表演由 emotion + intent 参数注入完成。"
+                "匹配规则：先按 intent（``THINKING / EXCITED / SURPRISED ...``）查，"
+                "没命中再按 emotion 主类型（``happy / sad / angry / surprised``）查。"
+            ),
+        )
 
-        权重数值（基础概率 / 各类加成）保持与 dfc 同款硬编码，避免插件之间
-        行为漂移。这里只暴露和 dfc 平行的两个总控开关。
+    @config_section("vtb_attention", title="VTB 注意力过滤")
+    class VTBAttentionSection(SectionBase):
+        """vtb / vtb_live 模式下"是否回复"过滤器（原 ``[sub_agent]``）。
+
+        与 dfc 行为一致——权重数值（基础概率 / 各类加成）保持与 dfc 同款硬编码，
+        避免插件之间行为漂移。这里只暴露和 dfc 平行的两个总控开关。
         """
 
         enabled: bool = Field(
             default=True,
             description=(
                 "是否启用 VTB 注意力过滤。关闭后每条未读消息都会直接触发 LLM 回复，"
-                "适合一对一私聊或低流量群聊；多人群聊建议保持启用。"
+                "适合一对一私聊或低流量群聊；多人群聊 / 直播间建议保持启用。"
             ),
         )
         enable_programmatic_controller: bool = Field(
@@ -132,7 +164,7 @@ class SherpaOnnxVoiceChatterConfig(BaseConfig):
 
     @config_section("audio_drive", title="音频驱动律动")
     class AudioDriveSection(SectionBase):
-        """vtb 模式下"音频驱动头部 / 身体律动"配置（让 VTB 跟着音量动）。
+        """vtb / vtb_live 模式下"音频驱动头部 / 身体律动"配置。
 
         实时计算 TTS 音频包络（RMS + 变化率），按下面的增益叠加到 SpeechAnimator
         的输出参数上。原理：声音大时头部微抬、激动；声音突变时身体一震；让程序
@@ -168,7 +200,7 @@ class SherpaOnnxVoiceChatterConfig(BaseConfig):
 
     @config_section("idle_animation", title="待机动画频率 / 幅度")
     class IdleAnimationSection(SectionBase):
-        """vtb 模式下"待机自动化"动画的频率与幅度。
+        """vtb / vtb_live 模式下"待机自动化"动画的频率与幅度。
 
         AutoAnimator 负责眨眼 / 呼吸 / 眼神扫视 / 被动摆动 / 宏观大动作。
         默认值已经比原版激进——让 VTB 待机时看起来"活"一些。所有数值都
@@ -235,39 +267,12 @@ class SherpaOnnxVoiceChatterConfig(BaseConfig):
             default=2.0, description="宏观动作执行速度倍率（>1 加快，<1 放慢）"
         )
 
-    @config_section("motion", title="VTube Studio 动作映射（可选热键）")
-    class MotionSection(SectionBase):
-        """可选：把 emotion / intent 映射到 VTS 已配置的 Hotkey ID。
-
-        默认情况下 ``say_and_perform`` 通过 emotion + intent 两个参数完成
-        所有表演（嘴型基准、头部姿态、眼神方向、身体晃动），**不需要**任何
-        VTS 热键。如果想让某些 emotion / intent 额外触发"点头/挥手/特定表情"
-        这种 VTS 已经做好的预设动画，就在这里映射。
-
-        匹配规则：先按 intent 名（``THINKING / EXCITED / SURPRISED ...``）查，
-        没命中再按 emotion 主类型（``happy / sad / angry / surprised``）查。
-        留空（默认）则完全不触发热键。
-        """
-
-        hotkey_map: dict[str, str] = Field(
-            default_factory=dict,
-            description=(
-                "intent / emotion -> VTS Hotkey ID 映射。在 VTube Studio 的"
-                "Hotkeys 面板里给每个动画起一个 Hotkey ID（不是显示名），"
-                "然后在这里映射；例如 "
-                "{\"THINKING\": \"ThinkAnim\", \"happy\": \"SmileExpr\"}。"
-                "默认为空，所有表演由 emotion + intent 参数注入完成。"
-            ),
-        )
-
     plugin: PluginSection = Field(default_factory=PluginSection)
     tts: TTSSection = Field(default_factory=TTSSection)
     vts: VTSSection = Field(default_factory=VTSSection)
-    audio: AudioSection = Field(default_factory=AudioSection)
-    sub_agent: SubAgentSection = Field(default_factory=SubAgentSection)
+    vtb_attention: VTBAttentionSection = Field(default_factory=VTBAttentionSection)
     audio_drive: AudioDriveSection = Field(default_factory=AudioDriveSection)
     idle_animation: IdleAnimationSection = Field(default_factory=IdleAnimationSection)
-    motion: MotionSection = Field(default_factory=MotionSection)
 
 
 __all__ = ["SherpaOnnxVoiceChatterConfig"]

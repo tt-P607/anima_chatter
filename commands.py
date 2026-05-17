@@ -20,9 +20,12 @@ from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.api.send_api import send_text
 from src.app.plugin_system.base import BaseCommand, cmd_route
 from src.app.plugin_system.types import PermissionLevel
-# StreamLoopManager 没有公开的插件 API；切换 chatter 实例后需要重启
-# 流循环以销毁缓存的 chatter 生成器，否则旧 chatter 的 execute() 仍会被调用。
-# default_chatter / kokoro_flow_chatter 也直接 import 这个模块。
+# NOTE: 触碰内部模块（非 src.app.plugin_system.api）。
+# StreamLoopManager 当前没有暴露公开的插件 API，但切换 chatter 实例后必须
+# 重启流循环销毁缓存的 chatter 生成器，否则旧 chatter 的 execute() 仍会被
+# asend 推进，``/vtb on`` / ``/vtb off`` 会"看似执行成功但完全不生效"。
+# default_chatter / kokoro_flow_chatter 同样直接 import 此模块——属于框架历史
+# 缺口。等公开 API（例如 ``stream_api.restart_loop``）补齐后改为公开调用。
 from src.core.transport.distribution.stream_loop_manager import get_stream_loop_manager
 
 

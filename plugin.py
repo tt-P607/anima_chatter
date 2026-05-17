@@ -26,11 +26,12 @@ from .actions import SayAction, SayAndPerformAction, VoicePassAndWaitAction
 from .audio import AudioPlayer
 from .commands import VTBCommand
 from .config import SherpaOnnxVoiceChatterConfig
-from .prompt_builder import (
+from .modes import ChatterMode
+from .prompts import (
     SYSTEM_PROMPT,
     USER_PROMPT_VOICE,
     USER_PROMPT_VTB,
-    ChatterMode,
+    USER_PROMPT_VTB_LIVE,
     VoiceChatterPromptBuilder,
 )
 from .runner import run_voice_conversation
@@ -69,12 +70,18 @@ class SherpaOnnxVoiceChatter(BaseChatter):
         return config if isinstance(config, SherpaOnnxVoiceChatterConfig) else None
 
     def _resolve_mode(self, chat_stream: ChatStream | None = None) -> ChatterMode:
-        """根据当前流的 platform 决定运行模式。"""
+        """根据当前流的 platform 决定运行模式。
 
-        platform = ""
-        if chat_stream is not None:
-            platform = chat_stream.platform or ""
-        return "voice" if platform == "local_asr" else "vtb"
+        与 :meth:`VoiceChatterPromptBuilder.resolve_mode` 保持一致：
+
+        - ``local_asr`` → ``voice``
+        - 直播平台（如 ``bilibili_live``） → ``vtb_live``
+        - 其他 → ``vtb``
+        """
+
+        if chat_stream is None:
+            return "vtb"
+        return VoiceChatterPromptBuilder.resolve_mode(chat_stream)
 
     def apply_stream_runtime_options(self, chat_stream: Any) -> None:
         """根据 platform 动态决定 tick 间隔与消息缓冲策略。
@@ -273,6 +280,22 @@ class SherpaOnnxVoiceChatterPlugin(BasePlugin):
             },
         )
 
+        # vtb_live 模式 user prompt（B 站等直播间弹幕场景）。
+        # 与 vtb 模板平行：占位符一致，但提示语全部改为"直播 / 弹幕 / 直播间"
+        # 措辞，让模型在直播场景下调出更合适的回应风格。
+        get_prompt_manager().get_or_create(
+            name="voice_chatter_vtb_live_user_prompt",
+            template=USER_PROMPT_VTB_LIVE,
+            policies={
+                "stream_name": optional("未知直播间"),
+                "current_time": optional("未知时间"),
+                "platform": optional(""),
+                "history": optional("").then(min_len(2)).then(wrap("# 直播历史弹幕\n", "\n")),
+                "unreads": optional("").then(min_len(2)).then(wrap("# 新到弹幕\n", "\n")),
+                "extra": optional("").then(min_len(2)).then(wrap("# 额外提醒\n", "\n")),
+            },
+        )
+
         # vtb 模式 sub-agent（"是否要回复"决策器）prompt。
         get_prompt_manager().get_or_create(
             name="voice_chatter_sub_agent_prompt",
@@ -296,7 +319,7 @@ class SherpaOnnxVoiceChatterPlugin(BasePlugin):
             )
             return
 
-        self.audio_player = AudioPlayer(output_device=config.audio.output_device)
+        self.audio_player = AudioPlayer(output_device=config.vts.audio_output_device)
 
         if config.vts.enabled:
             self.vts_performer = VTSPerformer(

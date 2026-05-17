@@ -157,12 +157,13 @@ async def run_voice_conversation(
     sub_agent_cfg = None
     if is_vtb_mode:
         plugin_config = getattr(getattr(chatter, "plugin", None), "config", None)
-        sub_agent_section = getattr(plugin_config, "sub_agent", None) if plugin_config else None
-        if sub_agent_section is not None:
+        # 配置 section 名为 ``vtb_attention``（参见 :class:`SherpaOnnxVoiceChatterConfig`）。
+        attention_section = getattr(plugin_config, "vtb_attention", None) if plugin_config else None
+        if attention_section is not None:
             sub_agent_cfg = voice_sub_agent.SubAgentConfig(
-                enabled=bool(sub_agent_section.enabled),
+                enabled=bool(attention_section.enabled),
                 enable_programmatic_controller=bool(
-                    sub_agent_section.enable_programmatic_controller
+                    attention_section.enable_programmatic_controller
                 ),
             )
 
