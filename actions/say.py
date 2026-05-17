@@ -14,6 +14,7 @@ from src.core.components.base import Failure
 from src.core.components.base.action import BaseAction
 from src.kernel.concurrency import get_task_manager
 
+from .. import call_state
 from ..config import SherpaOnnxVoiceChatterConfig
 from ..markers import parse_speech_segments
 from ..tts import TTSRequest, _retry_empty_audio, build_tts_backend
@@ -37,9 +38,21 @@ class SayAction(BaseAction):
     dependencies = ["asr_adapter:adapter:asr_adapter"]
 
     async def go_activate(self) -> bool:
-        """仅在 ``local_asr`` 平台激活，避免与 vtb 模式 action 同时暴露。"""
+        """voice 模式专用 action 的可见性。
 
-        return self.chat_stream.platform == "local_asr"
+        在两种场景激活：
+        1. ``platform == "local_asr"``：本地直接通话；
+        2. **当前 stream 正处于 voice_call 通话中**（platform 可能是 qq 等）：
+           voice_chatter 临时接管原 stream 的语音通话场景。
+
+        关键约束：通话中**只能**让 say 暴露给模型，**不能**让 say_and_perform
+        暴露——后者会发送文本到原平台 + 驱动 VTube Studio，与"打电话"的语义
+        不符（电话只该有声音，不该出现文字 + 形象表演）。
+        """
+
+        if self.chat_stream.platform == "local_asr":
+            return True
+        return await call_state.is_call_active_for_stream(self.chat_stream.stream_id)
 
     async def execute(
         self,
@@ -59,6 +72,26 @@ class SayAction(BaseAction):
         segments = parse_speech_segments(content or "", split_sentences=split_enabled)
         if not segments:
             return True, "没有可播放的语音内容"
+
+        # 通话期间记录 bot 说的话——把所有 segment 的 text 拼起来作为本次发言。
+        # 这样 voice_call.ended 事件 payload 才能完整包含通话中的 user/assistant 对。
+        in_voice_call = await call_state.is_call_active_for_stream(self.chat_stream.stream_id)
+        if in_voice_call:
+            spoken_text = " ".join(seg.text for seg in segments if seg.text).strip()
+            if spoken_text:
+                await call_state.record_assistant_message(
+                    self.chat_stream.stream_id, spoken_text
+                )
+
+        # 通话场景下用插件初始化的 audio_player 本地播放（绕开 message_send 链）。
+        # 本地直接通话（platform=local_asr）保持原行为：用 backend.emit 发 voice
+        # envelope 给 asr_adapter 播放——这条路径已经工作了很久，无须改。
+        audio_player = getattr(self.plugin, "audio_player", None) if in_voice_call else None
+        if in_voice_call and audio_player is None:
+            logger.warning(
+                "通话中 SayAction 找不到 plugin.audio_player（VTB 资源未初始化？），"
+                "本次音频将无法播放。"
+            )
 
         backend = build_tts_backend(plugin_config, logger)
 
@@ -121,10 +154,37 @@ class SayAction(BaseAction):
                     if current_seg.wait_before >= 0.1:
                         await asyncio.sleep(current_seg.wait_before)
 
-                    if await backend.emit(current_art, self.chat_stream):
+                    # 关键路由分流：
+                    # - 本地直接通话（platform=local_asr）：走 backend.emit
+                    #   发 voice envelope → asr_adapter._send_platform_message
+                    #   → 本机扬声器播放。这是 SayAction 的原行为。
+                    # - QQ 等平台被 voice_chatter 接管的"打电话"场景：**不能**
+                    #   走 emit——emit 用 chat_stream.platform 路由，会把 voice
+                    #   envelope 发给 napcat 等真平台适配器，那边要么报错要么
+                    #   把音频转成 QQ 语音消息发出去（违反"打电话只有声音"的
+                    #   语义）。改为直接调插件的 audio_player 本地扬声器播放。
+                    played = False
+                    if (
+                        in_voice_call
+                        and audio_player is not None
+                        and current_art.audio
+                    ):
+                        try:
+                            await audio_player.play_audio(current_art.audio)
+                            played = True
+                        except Exception as exc:
+                            logger.error(
+                                f"通话中本地播放音频失败 段{current_idx}: {exc}",
+                                exc_info=True,
+                            )
+                    elif not in_voice_call:
+                        played = await backend.emit(current_art, self.chat_stream)
+
+                    if played:
                         success_count += 1
                         logger.info(
-                            f"已发送播放段落 {current_idx}: {current_seg.text[:20]}..."
+                            f"已播放段落 {current_idx} ({'本地' if in_voice_call else '通过适配器'}): "
+                            f"{current_seg.text[:20]}..."
                         )
 
                 next_to_play += 1

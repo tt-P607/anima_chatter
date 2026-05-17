@@ -11,6 +11,7 @@ task_manager 与 watchdog 已经能保证主事件循环不被阻塞。
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -45,6 +46,47 @@ _CUSTOM_PARAMETERS: list[dict[str, Any]] = [
     {"name": "v_brow_form_r", "min": -1, "max": 1, "def": 0},
     {"name": "v_blush", "min": 0, "max": 1, "def": 0},
 ]
+
+
+# 名字 → (min, max) 范围表，由 _CUSTOM_PARAMETERS 派生。sender_loop 发送前
+# 用这张表对动画器产出的每个值做截断 + NaN/Inf 过滤——这是防止 VTS 主动断连
+# (received 1002 protocol error) 的关键保护层。
+#
+# VTS 一旦收到包含 NaN / Inf / 超出注册声明 min/max 的 SetMultiParameterValue
+# 帧，会直接发 close(1002) 终止 ws。在 60Hz 高频发送 + 多动画器叠加（音频驱动
+# velocity 求差分、ease_in_out 三角函数等）的链路里，**一帧的脏数据就够断一次**。
+# 所以无论上游怎么犯傻，到了 sender 出去前必须先 sanitize。
+_PARAM_RANGE: dict[str, tuple[float, float]] = {
+    p["name"]: (float(p["min"]), float(p["max"])) for p in _CUSTOM_PARAMETERS
+}
+
+
+def _sanitize_params(params: dict[str, float]) -> dict[str, float]:
+    """对参数批做合法化：丢弃未注册的 key、过滤 NaN/Inf、截断到 min~max。
+
+    返回**可以安全发给 VTS** 的清洗后参数；调用方负责判空。
+    """
+
+    cleaned: dict[str, float] = {}
+    for key, raw_value in params.items():
+        bounds = _PARAM_RANGE.get(key)
+        if bounds is None:
+            # 未声明的参数直接丢，避免 VTS 因不识别参数名报错。
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(value) or math.isinf(value):
+            # NaN / Inf 是 VTS 主动 1002 的最常见原因。
+            continue
+        lo, hi = bounds
+        if value < lo:
+            value = lo
+        elif value > hi:
+            value = hi
+        cleaned[key] = value
+    return cleaned
 
 
 class VTSConnection:
@@ -89,12 +131,17 @@ class VTSConnection:
         async with self._connect_lock:
             if self.is_connected and self.vts is not None:
                 return True
+            # 关掉旧 vts 时必须拿 _request_lock：否则 sender / heartbeat 这些
+            # 持锁的循环可能正在 ``await self.vts.request(...)``，连接被关掉
+            # 后那边会触发 send-on-closed-ws；同时把 self.vts 置 None 也要在
+            # 同一把锁内做完，避免外部循环看到"vts 还在但底层 ws 已断"的中间态。
             if self.vts is not None:
-                try:
-                    await self.vts.close()
-                except Exception:
-                    pass
-                self.vts = None
+                async with self._request_lock:
+                    try:
+                        await self.vts.close()
+                    except Exception:
+                        pass
+                    self.vts = None
 
             logger.info(f"连接 VTube Studio ({self.host}:{self.port}) ...")
             try:
@@ -239,9 +286,15 @@ class VTSConnection:
                 await asyncio.sleep(10)
                 if not self.is_connected or self.vts is None:
                     continue
+                # 关键：必须在锁内重新读 self.vts 拿快照，否则可能 lock 等到时
+                # 旧 vts 已被 connect() 替换，构造的 msg 会送到新 ws 上引发 1002
+                # protocol error。同理 sender_loop / trigger_hotkey 也要这么做。
                 async with self._request_lock:
-                    msg = self.vts.vts_request.BaseRequest("StatisticsRequest")
-                    await self.vts.request(msg)
+                    vts_local = self.vts
+                    if vts_local is None or not self.is_connected:
+                        continue
+                    msg = vts_local.vts_request.BaseRequest("StatisticsRequest")
+                    await vts_local.request(msg)
                 # 心跳成功：清零退避状态。
                 consecutive_failures = 0
                 backoff_seconds = 5.0
@@ -316,17 +369,31 @@ class VTSConnection:
                         self._param_buffer.clear()
 
                 if snapshot:
+                    # sanitize：滤掉 NaN/Inf、丢未声明的 key、截断到 min~max。
+                    # 这是 VTS 不发 1002 protocol error 的最后一道闸——别省。
+                    snapshot = _sanitize_params(snapshot)
+
+                if snapshot:
                     try:
-                        msg = self.vts.vts_request.requestSetMultiParameterValue(
-                            list(snapshot.keys()),
-                            list(snapshot.values()),
-                        )
-                        # 关键：必须拿 _request_lock，否则会和心跳 / trigger_hotkey
-                        # 同时调用 vts.request，触发 websockets 库
-                        # "cannot call recv while another coroutine is already
-                        # running recv" 错误，导致心跳误判断连。
+                        # 关键 1：拿 _request_lock 防止与心跳 / trigger_hotkey 并发
+                        # 触发 "cannot call recv while another coroutine is
+                        # already running recv"。
+                        # 关键 2：在锁内 **重新** 读 self.vts 拿快照，并在锁内
+                        # 构造 msg。这样 connect() 的重连分支拿到锁后把旧 vts
+                        # 替换成新 vts 时，我们这边能感知到——不会用旧 msg 发
+                        # 到新 ws 上引发 1002 protocol error（旧 vts_request
+                        # 序列化的 messageId / 内部状态对新连接是非法帧）。
                         async with self._request_lock:
-                            await self.vts.request(msg)
+                            vts_local = self.vts
+                            if vts_local is None or not self.is_connected:
+                                # 重连进行中，本批参数丢弃即可——下一帧动画循环
+                                # 会重新生成最新值。
+                                continue
+                            msg = vts_local.vts_request.requestSetMultiParameterValue(
+                                list(snapshot.keys()),
+                                list(snapshot.values()),
+                            )
+                            await vts_local.request(msg)
                     except Exception:
                         # 单次发送失败不致命，等下次循环。
                         pass
@@ -348,14 +415,73 @@ class VTSConnection:
             return False
 
         async with self._request_lock:
+            # 与心跳 / sender 同款约定：在锁内重新读 self.vts，避免
+            # 重连切换实例后旧引用发到新 ws。
+            vts_local = self.vts
+            if vts_local is None or not self.is_connected:
+                return False
             try:
-                msg = self.vts.vts_request.requestTriggerHotKey(hotkey_id)
-                response = await self.vts.request(msg)
+                msg = vts_local.vts_request.requestTriggerHotKey(hotkey_id)
+                response = await vts_local.request(msg)
                 if response is None:
                     return False
                 return response.get("data", {}).get("hotkeyID") == hotkey_id
             except Exception as exc:
                 logger.error(f"触发热键失败: {exc}")
+                return False
+
+    async def set_expression(self, expression_file: str, active: bool) -> bool:
+        """直接激活或停用一个 Live2D 表情文件（``.exp3.json``）。
+
+        与 :meth:`trigger_hotkey` 相比，``ExpressionActivationRequest`` 走的是
+        VTS 的"表情通道"而不是"热键通道"：
+
+        - **不需要** 在 VTS 设置里预先配置 hotkey；只要 ``.exp3.json`` 文件
+          存在于模型目录就能调用。
+        - 多个表情**可以同时激活**（hotkey 一次只触发一个）。
+        - ``active=False`` 可以**显式停用**（hotkey 是瞬时触发，停用要靠表情
+          自己的 fade out 或再次 trigger）。
+
+        Args:
+            expression_file: ``.exp3.json`` 文件名（不带路径），例如
+                ``"expression16.exp3.json"``。
+            active: True 激活 / False 停用。
+
+        Returns:
+            VTS 是否报告成功。
+        """
+
+        if not self.is_connected or self.vts is None or not expression_file:
+            return False
+
+        async with self._request_lock:
+            vts_local = self.vts
+            if vts_local is None or not self.is_connected:
+                return False
+            try:
+                # pyvts 提供 BaseRequest 直接构造原生 VTS 请求；
+                # ExpressionActivationRequest 的 data 字段固定是这俩。
+                msg = vts_local.vts_request.BaseRequest(
+                    "ExpressionActivationRequest",
+                    {
+                        "expressionFile": expression_file,
+                        "active": bool(active),
+                    },
+                )
+                response = await vts_local.request(msg)
+                if response is None:
+                    return False
+                # 成功时 data 里没有 errorID；有 errorID 表示失败。
+                data = response.get("data") or {}
+                if "errorID" in data:
+                    logger.warning(
+                        f"VTS 表情激活失败 file={expression_file} active={active} "
+                        f"err={data.get('errorID')} msg={data.get('message')}"
+                    )
+                    return False
+                return True
+            except Exception as exc:
+                logger.error(f"设置表情失败 {expression_file}: {exc}")
                 return False
 
 

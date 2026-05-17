@@ -40,6 +40,25 @@
             "dependencies": []
         },
         {
+            "component_type": "action",
+            "component_name": "start_voice_call",
+            "dependencies": [
+                "asr_adapter:service:asr_redirect"
+            ]
+        },
+        {
+            "component_type": "action",
+            "component_name": "end_voice_call",
+            "dependencies": [
+                "asr_adapter:service:asr_redirect"
+            ]
+        },
+        {
+            "component_type": "command",
+            "component_name": "voice",
+            "dependencies": []
+        },
+        {
             "component_type": "command",
             "component_name": "vtb",
             "dependencies": []

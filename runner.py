@@ -19,7 +19,7 @@ from src.core.models.stream import ChatStream
 from src.kernel.llm import LLMPayload, ROLE, Text, ToolCall, ToolRegistry, ToolResult
 from src.kernel.logger import Logger
 
-from . import sub_agent as voice_sub_agent
+from . import call_state, sub_agent as voice_sub_agent
 
 
 _PLAIN_TEXT_REMINDER_VOICE = (
@@ -77,25 +77,36 @@ def _format_tool_args(args: Any) -> str:
 def _build_voice_decision_panel(chat_stream: ChatStream, response: Any) -> str:
     """构建语音 Chatter 本次决策摘要面板内容。"""
 
-    stream_name = (
+    # rich 把 [xxx] 当作 markup 解析；LLM 输出含 [motion] / [emotion] / [wait]
+    # 等内联标记会触发 ``rich.errors.MarkupError``。统一对面板文本字段做转义，
+    # 让 rich 把方括号当字面字符显示，不再当 markup。
+    from rich.markup import escape
+
+    stream_name = escape(
         getattr(chat_stream, "stream_name", "")
         or getattr(chat_stream, "stream_id", "")
         or "未知语音流"
     )
     thought = (
-        response.reasoning_content.strip()
+        escape(response.reasoning_content.strip())
         if getattr(response, "reasoning_content", None)
         else "（无）"
     )
-    monologue = response.message.strip() if getattr(response, "message", None) else "（无）"
+    monologue = (
+        escape(response.message.strip())
+        if getattr(response, "message", None)
+        else "（无）"
+    )
 
     tool_lines = []
     for call in getattr(response, "call_list", None) or []:
         formatted_args = _format_tool_args(getattr(call, "args", None))
+        # call.name 不含方括号；formatted_args 可能含模型输出的 [motion] 等。
+        safe_name = escape(str(call.name))
         if formatted_args:
-            tool_lines.append(f"    {call.name} ({formatted_args})")
+            tool_lines.append(f"    {safe_name} ({escape(formatted_args)})")
         else:
-            tool_lines.append(f"    {call.name}")
+            tool_lines.append(f"    {safe_name}")
 
     tools_text = "\n".join(tool_lines) if tool_lines else "    （无）"
     return (
@@ -169,10 +180,55 @@ async def run_voice_conversation(
 
     while True:
         _ = resume_event
+
+        # ── 通话超时检查 ───────────────
+        # 仅当本 stream 处于通话中时才检查；超时直接终结通话并退出本次循环。
+        # 通话结束后 chatter 会被释放，下一 tick 自动绑回原 chatter（如 kfc）。
+        if await call_state.is_call_active_for_stream(chat_stream.stream_id):
+            remaining = await call_state.get_remaining_seconds()
+            if remaining is not None and remaining <= 0:
+                logger.info(
+                    f"voice_call 超时挂断 stream={chat_stream.stream_id}"
+                )
+                # 局部导入避免顶层循环依赖（actions/voice_call.py 依赖 call_state）
+                from .actions.voice_call import _finalize_call
+
+                try:
+                    await _finalize_call(
+                        stream_id=chat_stream.stream_id,
+                        platform=chat_stream.platform or "",
+                        farewell="（通话超时挂断）",
+                        end_reason="timeout",
+                        plugin=getattr(chatter, "plugin", None),
+                    )
+                except Exception as exc:
+                    logger.warning(f"超时挂断流程异常: {exc}", exc_info=True)
+                # 通话结束 → voice_chatter 的 execute() 也应该自然退出。
+                # _finalize_call 已经 unregister chatter 并 restart loop，
+                # 这里只需主动 return 让本次 generator 结束即可。
+                return
+
         _, unread_msgs = await chatter.fetch_unreads()
         if not unread_msgs:
             resume_event = yield Wait()
             continue
+
+        # ── 通话期间记录用户输入 ───────
+        # 通话进行中时，未读消息（无论来自 ASR 还是 QQ 文字）都要存进 active_call
+        # 的 messages_in_call，结束事件 payload 会带这些消息给 kfc 等订阅方
+        # 用来补 chain_payloads。
+        if await call_state.is_call_active_for_stream(chat_stream.stream_id):
+            for msg in unread_msgs:
+                text = (
+                    msg.processed_plain_text
+                    or (str(msg.content) if msg.content is not None else "")
+                ).strip()
+                if not text:
+                    continue
+                ts = float(msg.time) if getattr(msg, "time", None) else None
+                await call_state.record_user_message(
+                    chat_stream.stream_id, text, ts=ts
+                )
 
         unread_lines = "\n".join(chatter.format_message_line(msg) for msg in unread_msgs)
 

@@ -84,13 +84,44 @@ class SpeechAnimator(BaseAnimator):
         self.lerp_factor: float = 5.0
         self.recovery_lerp_factor: float = 1.2  # 回归到 neutral 用的更慢系数
 
-        # 意图映射：(head_x, head_y, head_z, eye_x, eye_y)
+        # 意图映射：每个 intent 是一组目标姿态偏移量，由 lerp_factor 平滑过渡。
+        # 字段说明：
+        #   x  → v_head_x：头部左右转向（- 左 / + 右）
+        #   y  → v_head_y：头部上下俯仰（- 低头 / + 抬头）
+        #   z  → v_head_z：头部歪侧（- 左歪 / + 右歪）
+        #   ex → v_eye_x：眼神横向（- 左 / + 右）
+        #   ey → v_eye_y：眼神纵向（- 下 / + 上）
+        # 数值范围：head_xyz ∈ ±30 度，eye_xy ∈ ±1。
+        # 反复动作（点头 / 摇头 / 来回扭动）不在静态 intent 内，应通过行内
+        # 时间点标记或多次切换实现。
         self.intent_map: dict[str, dict[str, float]] = {
+            # ── 基础姿态（4） ───────────────────────────
             "IDLE": {"x": 0, "y": 0, "z": 0, "ex": 0, "ey": 0},
-            "THINKING": {"x": 10, "y": 8, "z": -6, "ex": -0.5, "ey": 0.3},
             "NARRATING": {"x": 0, "y": 0, "z": 0, "ex": 0, "ey": 0},
+            "THINKING": {"x": 10, "y": 8, "z": -6, "ex": -0.5, "ey": 0.3},
             "CONFUSED": {"x": -8, "y": 5, "z": 8, "ex": 0.5, "ey": 0.2},
+
+            # ── 高表现力情绪（2） ───────────────────────
             "EXCITED": {"x": 0, "y": 8, "z": 0, "ex": 0, "ey": 0.4},
+            "SURPRISED": {"x": 0, "y": 12, "z": 0, "ex": 0, "ey": 0.6},
+
+            # ── 眼神类：方向性凝视（5） ─────────────────
+            "PEEK_LEFT": {"x": -15, "y": 0, "z": 0, "ex": -0.7, "ey": 0},
+            "PEEK_RIGHT": {"x": 15, "y": 0, "z": 0, "ex": 0.7, "ey": 0},
+            "LOOKAWAY": {"x": -10, "y": -3, "z": 0, "ex": -0.5, "ey": -0.2},
+            "STARE_DOWN": {"x": 0, "y": -12, "z": 0, "ex": 0, "ey": -0.7},
+            "DREAMY_GAZE": {"x": 8, "y": 5, "z": -3, "ex": 0.4, "ey": 0.5},
+
+            # ── 态度类：情感倾向（4） ───────────────────
+            "PROUD_LIFT": {"x": 0, "y": 12, "z": 0, "ex": 0, "ey": 0.2},
+            "WORRIED_TILT": {"x": 0, "y": -3, "z": 12, "ex": 0, "ey": -0.2},
+            "SHY_DOWN": {"x": 0, "y": -8, "z": 5, "ex": -0.3, "ey": -0.4},
+            "ATTENTIVE": {"x": 0, "y": 3, "z": 0, "ex": 0, "ey": 0.1},
+
+            # ── 调皮 / 紧张（3） ────────────────────────
+            "PLAYFUL_TILT": {"x": 0, "y": 2, "z": 18, "ex": 0.3, "ey": 0.2},
+            "MISCHIEF": {"x": 0, "y": -2, "z": -8, "ex": 0.5, "ey": -0.1},
+            "SCARED_SHRINK": {"x": 0, "y": -8, "z": 0, "ex": 0, "ey": -0.5},
         }
 
         # 情感矩阵：(mouth_min, mouth_max, head_x, head_y, head_z, eye_x, eye_y)

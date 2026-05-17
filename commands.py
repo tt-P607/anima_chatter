@@ -28,8 +28,11 @@ from src.app.plugin_system.types import PermissionLevel
 # 缺口。等公开 API（例如 ``stream_api.restart_loop``）补齐后改为公开调用。
 from src.core.transport.distribution.stream_loop_manager import get_stream_loop_manager
 
+from . import call_state
+from .actions.voice_call import _finalize_call
 
-logger = get_logger("voice_chatter.commands.vtb")
+
+logger = get_logger("voice_chatter.commands")
 
 
 _CHATTER_SIGNATURE = "voice_chatter:chatter:voice_chatter"
@@ -154,4 +157,88 @@ class VTBCommand(BaseCommand):
         return True, "status reported"
 
 
-__all__ = ["VTBCommand"]
+class VoiceCommand(BaseCommand):
+    """``/voice`` 命令组：手动控制语音通话功能。
+
+    主要作为兜底——正常情况下模型会调用 ``end_voice_call`` action 自然挂断。
+    本命令在以下场景使用：
+
+    - 模型卡住没有调用 end_voice_call（例如 LLM 异常 / 推理超时）
+    - 用户想强制挂断
+    - 状态被异常残留（极端情况下需要清理）
+
+    可用子命令：
+
+    - ``/voice off``：在当前 stream 强制挂断当前通话（OWNER 权限）
+    - ``/voice status``：查看当前是否处于通话中
+    """
+
+    command_name: str = "voice"
+    command_description: str = "语音通话兜底控制：off=强制挂断；status=查看通话状态。"
+    permission_level: PermissionLevel = PermissionLevel.OWNER
+
+    async def _reply(self, text: str) -> None:
+        """向当前聊天流发送一条命令回执文本。"""
+
+        await send_text(text, stream_id=self.stream_id)
+
+    @cmd_route("off")
+    async def handle_off(self) -> tuple[bool, str]:
+        """在当前 stream 强制挂断通话。"""
+
+        active = await call_state.get_active_call()
+        if active is None:
+            await self._reply("当前没有进行中的语音通话。")
+            return True, "no active call"
+
+        if active.caller_stream_id != self.stream_id:
+            await self._reply(
+                "当前 stream 不是通话发起方。请到通话发起的 stream 里执行 ``/voice off``，"
+                f"或在那里挂断（通话发起方 stream={active.caller_stream_id}）。"
+            )
+            return False, "stream mismatch"
+
+        # 走 _finalize_call 公共路径，保证副作用顺序与 EndVoiceCallAction 一致。
+        platform = ""
+        try:
+            if self._message is not None:
+                platform = self._message.platform or ""
+        except Exception:
+            platform = ""
+
+        ok, msg = await _finalize_call(
+            stream_id=self.stream_id,
+            platform=platform,
+            farewell="通话已被手动挂断。",
+            end_reason="user",
+            plugin=self.plugin,
+        )
+        if ok:
+            logger.info(f"用户手动挂断通话 stream={self.stream_id}")
+            await self._reply("✓ 通话已挂断。")
+            return True, "voice off"
+        await self._reply(f"挂断失败：{msg}")
+        return False, msg
+
+    @cmd_route("status")
+    async def handle_status(self) -> tuple[bool, str]:
+        """查看当前是否有通话进行中。"""
+
+        active = await call_state.get_active_call()
+        if active is None:
+            await self._reply("当前没有进行中的语音通话。")
+            return True, "no call"
+
+        remaining = await call_state.get_remaining_seconds()
+        remaining_str = f"{remaining:.0f}s" if remaining is not None else "unknown"
+        lines = [
+            f"通话发起 stream：{active.caller_stream_id}",
+            f"已持续：{int(__import__('time').time() - active.started_at)}s",
+            f"剩余超时：{remaining_str}",
+            f"通话期间消息数：{len(active.messages_in_call)}",
+        ]
+        await self._reply("\n".join(lines))
+        return True, "status reported"
+
+
+__all__ = ["VTBCommand", "VoiceCommand"]

@@ -18,6 +18,18 @@ import asyncio
 import re
 from typing import Annotated, Any, cast
 
+
+# 与 :data:`SpeechAnimator.intent_map` 保持一致的 intent 名集合。VTSPerformer
+# 会在内部做一次大写化，所以这里也用大写。
+# 字段含义详见 :class:`SpeechAnimator` 的 intent_map 注释。
+_VALID_INTENTS: tuple[str, ...] = (
+    "IDLE", "NARRATING", "THINKING", "CONFUSED",
+    "EXCITED", "SURPRISED",
+    "PEEK_LEFT", "PEEK_RIGHT", "LOOKAWAY", "STARE_DOWN", "DREAMY_GAZE",
+    "PROUD_LIFT", "WORRIED_TILT", "SHY_DOWN", "ATTENTIVE",
+    "PLAYFUL_TILT", "MISCHIEF", "SCARED_SHRINK",
+)
+
 from src.app.plugin_system.api import send_api
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base import Failure
@@ -29,12 +41,26 @@ from ..sub_agent import mark_reply_success
 from ..tts import TTSRequest, _retry_empty_audio, build_tts_backend
 
 
-# 兜底正则：当 parse_speech_segments 解析不出任何片段时，
-# 直接从原始 content 把 [wait:n] / [emotion:xxx] / [/emotion] 标记剥掉。
+# 兜底正则：从原始 content 把所有内联标记剥掉。
+# 同时用于：(1) parse_speech_segments 没出片段时的兜底；(2) 给群里
+# 发文本时一次性清洗整段（避免 motion 切碎导致每个 segment 单独 send_text）。
 _FALLBACK_WAIT_RE = re.compile(r"\[wait\s*:\s*[0-9.]+\]", re.IGNORECASE)
 _FALLBACK_EMOTION_RE = re.compile(
     r"\[/?emotion(?:\s*:\s*[a-zA-Z0-9_\-]+)?\]", re.IGNORECASE
 )
+_FALLBACK_MOTION_RE = re.compile(
+    r"\[/?motion(?:\s*:\s*[a-zA-Z0-9_\-]+)?\]", re.IGNORECASE
+)
+
+
+def _strip_all_markers(text: str) -> str:
+    """把 ``[wait]`` / ``[emotion]`` / ``[motion]`` 三类内联标记都剥掉，
+    返回适合直接发到聊天界面的干净文本。"""
+
+    cleaned = _FALLBACK_WAIT_RE.sub("", text)
+    cleaned = _FALLBACK_EMOTION_RE.sub("", cleaned)
+    cleaned = _FALLBACK_MOTION_RE.sub("", cleaned)
+    return cleaned.strip()
 
 
 logger = get_logger("voice_chatter.action.say_and_perform")
@@ -54,9 +80,23 @@ class SayAndPerformAction(BaseAction):
     primary_action = True
 
     async def go_activate(self) -> bool:
-        """仅在非 ``local_asr`` 平台激活（即被 ``/vtb on`` 接管的 stream）。"""
+        """vtb 模式专用 action 的可见性。
 
-        return self.chat_stream.platform != "local_asr"
+        激活条件（同时满足）：
+        - ``platform != "local_asr"`` （local_asr 用 :class:`SayAction`）；
+        - **当前 stream 不处于 voice_call 通话中**——通话中应使用 say
+          （只 TTS 不发文本不驱动 VTS），不应让 say_and_perform 暴露，否则
+          会出现"打电话还往群里发字 + 驱动虚拟形象"的不符合电话语义的行为。
+        """
+
+        if self.chat_stream.platform == "local_asr":
+            return False
+        # 通话中：让位给 say，避免双重 action 暴露
+        from .. import call_state as _cs
+
+        if await _cs.is_call_active_for_stream(self.chat_stream.stream_id):
+            return False
+        return True
 
     async def execute(
         self,
@@ -74,7 +114,13 @@ class SayAndPerformAction(BaseAction):
                 "- 适合朗读：短句、自然、口语化，避免 Markdown、列表、(笑)/[动作] 等无法朗读的标记\n"
                 "- 善用标点传递情绪：感叹号惊讶兴奋、问号疑问好奇、省略号犹豫思考\n"
                 "- 灵活使用语气词：诶咦哇呀啊（惊讶）、嗯唔额（思考）、嘛呐嘻（撒娇）\n"
-                "- 同一次调用所有段落共享同一个 emotion / intent，跨情绪时要拆成多次调用"
+                "- 同一次调用所有段落共享同一个 emotion / intent，跨情绪时要拆成多次调用\n"
+                "【行内 motion 标记 — 高级用法】：\n"
+                "- 可以在 content 里用 [motion:NAME]...[/motion] 临时切换 intent 动作，"
+                "让句子中段做不同动作。NAME 取值同 intent（如 EXCITED / SHY_DOWN / PROUD_LIFT）\n"
+                "- 例子：\"哎呀[motion:SHY_DOWN]这真是太突然了[/motion]，[motion:EXCITED]不过我很喜欢！[/motion]\"\n"
+                "- 标记块外 / 标记结束后自动回到顶层 intent\n"
+                "- 不必每段都用——只在一句话里语义明显切换时用，过度切换反而显得机械"
             ),
         ],
         emotion: Annotated[
@@ -85,10 +131,30 @@ class SayAndPerformAction(BaseAction):
         ] = "neutral:1",
         intent: Annotated[
             str,
-            "动作意图，决定头部基准姿态：IDLE（静止）、NARRATING（叙述）、"
-            "THINKING（思考，头微抬+眼神上飘）、CONFUSED（困惑，歪头）、"
-            "EXCITED（兴奋，前倾抬头）、SURPRISED（惊讶）。"
-            "选择最匹配本句话语气的一个；不确定时填 NARRATING。",
+            "动作意图，决定头部姿态 + 眼神方向。从下面 18 个里选一个，不确定时填 NARRATING：\n"
+            "【基础姿态】\n"
+            " - IDLE：静止不动\n"
+            " - NARRATING：正常叙述（默认）\n"
+            " - THINKING：想问题，头微抬眼神上飘\n"
+            " - CONFUSED：困惑，歪头\n"
+            "【高表现力情绪】\n"
+            " - EXCITED：兴奋赞同，前倾抬头眼神发亮\n"
+            " - SURPRISED：惊讶意外，大抬头瞪眼\n"
+            "【眼神方向】\n"
+            " - PEEK_LEFT / PEEK_RIGHT：偷瞄左/右侧\n"
+            " - LOOKAWAY：害羞回避，左下看\n"
+            " - STARE_DOWN：低头盯着 / 沮丧低落\n"
+            " - DREAMY_GAZE：神游远眺\n"
+            "【态度倾向】\n"
+            " - PROUD_LIFT：得意抬头\n"
+            " - WORRIED_TILT：担心歪头\n"
+            " - SHY_DOWN：害羞低头偏侧\n"
+            " - ATTENTIVE：认真专注地听\n"
+            "【调皮 / 紧张】\n"
+            " - PLAYFUL_TILT：调皮明显歪头\n"
+            " - MISCHIEF：坏笑斜眼\n"
+            " - SCARED_SHRINK：害怕收身低头\n"
+            "选最匹配本句话语气的一个，不要硬选——日常叙述就 NARRATING。",
         ] = "NARRATING",
     ) -> tuple[bool, str]:
         """发文本 → TTS 合成 → 本地播放 + VTS 表演。"""
@@ -122,8 +188,7 @@ class SayAndPerformAction(BaseAction):
                 segments.extend(parsed)
             else:
                 # parse 不出片段（例如纯标记内容）：兜底剥掉标记后整段塞回去。
-                fallback_text = _FALLBACK_WAIT_RE.sub("", text)
-                fallback_text = _FALLBACK_EMOTION_RE.sub("", fallback_text).strip()
+                fallback_text = _strip_all_markers(text)
                 if fallback_text:
                     from ..markers import SpeechSegment
 
@@ -133,9 +198,13 @@ class SayAndPerformAction(BaseAction):
             logger.info("VTB 解析后无可播放片段，跳过本次调用。")
             return True, "无可朗读内容"
 
-        # 3) 按句发送干净文本到聊天流（标记已剥掉，群里看到的是干净文本）。
-        for seg in segments:
-            clean = (seg.text or "").strip()
+        # 3) 发送文本到聊天流。
+        # 关键：文本和动作是两条独立轨道——TTS / VTS 按 segment（含 motion 标记
+        # 切片）走，但**文本**只按 content 列表的每个元素发一次（剥离全部标记
+        # 的整段）。这样群里看到的是完整一段话，而不是被 motion 标记切碎的多
+        # 条短消息。
+        for raw_text in content_list:
+            clean = _strip_all_markers(raw_text)
             if not clean:
                 continue
             ok = await send_api.send_text(
@@ -145,7 +214,7 @@ class SayAndPerformAction(BaseAction):
             )
             if not ok:
                 logger.warning(
-                    f"VTB 模式发送分段失败 stream_id={self.chat_stream.stream_id}: {clean[:30]}..."
+                    f"VTB 模式发送文本失败 stream_id={self.chat_stream.stream_id}: {clean[:30]}..."
                 )
 
         # 文本发送成功 → 标记下一 tick 的概率门加成（沿用 dfc 的"刚回复就再回复"心理）。
@@ -192,8 +261,19 @@ class SayAndPerformAction(BaseAction):
 
         tasks = [synthesize_one(seg, i) for i, seg in enumerate(segments)]
 
+        # 取顶层 emotion 主类型（happy / sad / ...），用作行内 motion 切换时
+        # expression 命中的兜底键（intent 不命中 expression_map 时退回 emotion）。
+        emotion_main = (emotion or "neutral").split(":", 1)[0].strip().lower() or "neutral"
+
         async def consume_in_order() -> int:
-            """按 idx 顺序消费合成结果并回调播放。"""
+            """按 idx 顺序消费合成结果并回调播放。
+
+            行内 motion 标记处理：
+            每段播放前根据 ``cur_seg.motion`` 切 intent + expression。
+            - segment.motion 有值：用它切（行内 [motion:X] 标记）。
+            - segment.motion 为 None：切回顶层 intent（标记块外 / 标记结束后）。
+            没有 performer（VTS 未连）时整段静默跳过这一切。
+            """
 
             next_to_play = 0
             completed: dict[int, Any] = {}
@@ -219,16 +299,29 @@ class SayAndPerformAction(BaseAction):
                         if cur_seg.wait_before >= 0.1:
                             await asyncio.sleep(cur_seg.wait_before)
 
-                        # 在 speaking_session 内只调用 play()，避免段间切换说话状态
-                        # 触发 SpeechAnimator 的 emotion 回归，导致姿态被打断。
+                        # 关键时序：首段音频"已经合成完准备播放"时，才真正
+                        # 触发 VTS 动作链（speaking + performing + hotkey + 顶层
+                        # expression）。这样推理过程中 VTB 维持 IDLE，避免出现
+                        # 「动作先动起来，过几秒才发声」的诡异画面。
+                        # start_speech_playback 是幂等的，后续段调用是 no-op。
                         if performer is not None:
+                            await performer.start_speech_playback()
+                            # 行内 motion 切换：每段播放前根据 segment.motion 切 intent。
+                            # segment.motion 为 None 时切回顶层 intent，自然实现"标记块
+                            # 结束就归位"。
+                            seg_intent = cur_seg.motion or intent
+                            await performer.switch_segment_intent(
+                                seg_intent,
+                                emotion_main_for_expression=emotion_main,
+                            )
                             await performer.play(cur_art.audio)
                         elif audio_player is not None:
                             await audio_player.play_audio(cur_art.audio)
                         played += 1
+                        seg_intent_log = cur_seg.motion or intent
                         logger.info(
                             f"已播放段 {cur_idx}: {cur_seg.text[:20]}... "
-                            f"emotion={emotion} intent={intent}"
+                            f"emotion={emotion} intent={seg_intent_log}"
                         )
 
                     next_to_play += 1

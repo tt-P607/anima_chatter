@@ -22,9 +22,15 @@ from src.core.prompt import get_prompt_manager
 from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry
 from src.kernel.llm.payload.tooling import LLMUsable
 
-from .actions import SayAction, SayAndPerformAction, VoicePassAndWaitAction
+from .actions import (
+    EndVoiceCallAction,
+    SayAction,
+    SayAndPerformAction,
+    StartVoiceCallAction,
+    VoicePassAndWaitAction,
+)
 from .audio import AudioPlayer
-from .commands import VTBCommand
+from .commands import VoiceCommand, VTBCommand
 from .config import SherpaOnnxVoiceChatterConfig
 from .modes import ChatterMode
 from .prompts import (
@@ -101,12 +107,29 @@ class SherpaOnnxVoiceChatter(BaseChatter):
         super().apply_stream_runtime_options(chat_stream)
 
     async def _build_system_prompt(self, chat_stream: ChatStream) -> str:
-        """根据 platform 自动选择 voice / vtb 场景的系统提示词。"""
+        """根据 platform 自动选择 voice / vtb 场景的系统提示词。
+
+        如果 plugin 已经初始化 vts_performer，会把它的 expression_hints
+        （配置 expression_map 时附带的动作描述）一并注入场景文案，让模型
+        知道选某些 intent / emotion 会触发什么手部 / 道具表情。
+        """
+
+        # 仅在 plugin 上下文里能拿到 vts_performer；
+        # 没有时返回空 dict，builder 会跳过额外注入逻辑。
+        expression_hints: dict[str, str] = {}
+        performer = getattr(self.plugin, "vts_performer", None)
+        if performer is not None and hasattr(performer, "get_expression_hints"):
+            try:
+                expression_hints = performer.get_expression_hints()
+            except Exception:
+                # 取 hints 失败不致命，让 prompt 走纯静态路径。
+                expression_hints = {}
 
         return await VoiceChatterPromptBuilder.build_system_prompt(
             self._get_plugin_config(),
             chat_stream,
             mode=self._resolve_mode(chat_stream),
+            expression_hints=expression_hints,
         )
 
     def _build_history_text(self, chat_stream: ChatStream) -> str:
@@ -357,15 +380,21 @@ class SherpaOnnxVoiceChatterPlugin(BasePlugin):
             SayAction,
             SayAndPerformAction,
             VoicePassAndWaitAction,
+            StartVoiceCallAction,
+            EndVoiceCallAction,
             VTBCommand,
+            VoiceCommand,
         ]
 
 
 __all__ = [
+    "EndVoiceCallAction",
     "SayAction",
     "SayAndPerformAction",
     "SherpaOnnxVoiceChatter",
     "SherpaOnnxVoiceChatterPlugin",
+    "StartVoiceCallAction",
     "VTBCommand",
+    "VoiceCommand",
     "VoicePassAndWaitAction",
 ]

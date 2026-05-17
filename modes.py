@@ -22,7 +22,8 @@ if TYPE_CHECKING:
 ChatterMode = Literal["voice", "vtb", "vtb_live"]
 """voice_chatter 三态运行模式：
 
-- ``voice``：``platform == "local_asr"``，本地 ASR 实时通话。
+- ``voice``：``platform == "local_asr"``，本地 ASR 实时通话；或在通话进行中
+  接管了原 stream（如 QQ 私聊）的 voice_chatter。
 - ``vtb``：被 ``/vtb on`` 接管的普通群聊 / 私聊，VTube Studio 表演但不在直播。
 - ``vtb_live``：直播平台（``platform`` 在 :data:`LIVE_PLATFORMS` 中），
   观众是陌生弹幕、消息只入不出，要按直播间礼仪行事。
@@ -46,10 +47,28 @@ def resolve_mode(chat_stream: "ChatStream") -> ChatterMode:
 
     判定优先级：
 
-    1. ``platform == "local_asr"`` → :data:`voice`
-    2. ``platform`` 在 :data:`LIVE_PLATFORMS` 中 → :data:`vtb_live`
-    3. 其他 → :data:`vtb`
+    1. **该 stream 当前正处于 voice_call 通话中** → 强制 :data:`voice`
+       （voice_chatter 临时接管原 stream，platform 仍是 qq / discord 等，
+       但行为要按 voice 通话来）
+    2. ``platform == "local_asr"`` → :data:`voice`
+    3. ``platform`` 在 :data:`LIVE_PLATFORMS` 中 → :data:`vtb_live`
+    4. 其他 → :data:`vtb`
+
+    优先级 1 的实现：异步查询 :mod:`.call_state`。本函数是同步的——直接尝试
+    从事件循环里跑 ``asyncio.ensure_future`` 不好控制；改成读模块级变量的
+    "快照视图"。:mod:`.call_state` 内部的 ``_lock`` 只保护写路径，读 ``_active_call``
+    单变量在 CPython 下是原子的，对优先级 1 这种"判定 + 立即用"的场景已经
+    足够稳；没必要为这条同步快路径让整个函数变成 async。
     """
+
+    # ── 优先级 1：通话中的 stream 强制 voice ─────────
+    # 直接读模块级单例，不走锁——voice_chatter 自己的 runner 持续
+    # poll，不会出现"读到旧值导致模式判错一拍"的严重后果。
+    from . import call_state  # 局部导入避免循环依赖（call_state 不依赖 modes）
+
+    active = call_state._active_call  # noqa: SLF001 — 同模块快照读
+    if active is not None and active.caller_stream_id == (chat_stream.stream_id or ""):
+        return "voice"
 
     platform = (chat_stream.platform or "").strip()
     if platform == VOICE_PLATFORM:

@@ -70,20 +70,107 @@ class VoiceChatterPromptBuilder:
         )
 
     @staticmethod
-    def get_scene_guide(mode: ChatterMode) -> str:
-        """根据模式返回 ``<scene_and_protocol>`` 段使用的场景与工具协议。"""
+    def get_scene_guide(
+        mode: ChatterMode,
+        expression_hints: dict[str, str] | None = None,
+        chat_stream: "ChatStream | None" = None,
+    ) -> str:
+        """根据模式返回 ``<scene_and_protocol>`` 段使用的场景与工具协议。
 
-        if mode == "vtb_live":
-            return VTB_LIVE_SCENE_GUIDE
-        if mode == "vtb":
-            return VTB_SCENE_GUIDE
-        return VOICE_SCENE_GUIDE
+        Args:
+            mode: 三态模式之一。
+            expression_hints: 可选的 ``{intent/emotion: 描述}`` 字典，由
+                :meth:`VTSPerformer.get_expression_hints` 提供。如果有值，
+                会在 vtb / vtb_live 场景文案末尾追加一段"额外动作触发"提示，
+                让模型知道选某些 intent / emotion 会触发哪些手部 / 道具表情。
+                voice 模式下永远忽略此参数（voice 不接 VTS）。
+            chat_stream: 当前聊天流。voice 模式下用来检查是否处于通话中——
+                通话中会在场景文案末尾追加"开始时间 + 已持续时长"的状态片段，
+                让模型在 prompt 里直接看到通话语境，不必依赖通话期间产生的
+                history_messages 推断。
+        """
+
+        if mode == "voice":
+            base = VOICE_SCENE_GUIDE
+            if chat_stream is None:
+                return base
+            # 检查 voice_chatter 接管的"主动通话"语境（QQ 等私聊升级到通话）
+            from .. import call_state as _cs
+
+            active = _cs._active_call  # noqa: SLF001 — 同插件读模块级单例
+            if active is None or active.caller_stream_id != (chat_stream.stream_id or ""):
+                return base
+
+            # 注入动态通话状态：开始时间、已持续时长、剩余超时时间。
+            import datetime as _dt
+            import time as _time
+
+            started_human = _dt.datetime.fromtimestamp(active.started_at).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            now = _time.time()
+            total_elapsed = max(0.0, now - active.started_at)
+            elapsed_min = int(total_elapsed // 60)
+            elapsed_sec = int(total_elapsed % 60)
+            elapsed_str = (
+                f"{elapsed_min} 分 {elapsed_sec} 秒"
+                if elapsed_min > 0
+                else f"{elapsed_sec} 秒"
+            )
+            # 静默基线：基于 last_activity_at 而不是 started_at——"对话活跃就续期"
+            idle_for = max(0.0, now - active.last_activity_at)
+            remaining = max(0.0, active.timeout_seconds - idle_for)
+            remaining_str = f"{int(remaining // 60)} 分 {int(remaining % 60)} 秒"
+            timeout_min = int(active.timeout_seconds // 60)
+            timeout_str = f"{timeout_min} 分钟" if timeout_min > 0 else f"{int(active.timeout_seconds)} 秒"
+
+            call_status_block = (
+                "\n\n<call_status>\n"
+                "**【你正在通话中】** 当前 stream 正处于一通本地语音通话——\n"
+                f"- 通话开始于：{started_human}\n"
+                f"- 已持续：{elapsed_str}\n"
+                f"- 距自动挂断还剩：{remaining_str}\n"
+                f"- 挂断规则：双方都安静超过 {timeout_str} 才会自动挂；"
+                "只要持续在聊，通话不会因总时长被中断。\n"
+                "- 通话从原 QQ 私聊升级而来：你的回复经 TTS 通过本机扬声器播放，"
+                "对方的话来自麦克风 ASR（可能有错字），双方都看不到文字。\n"
+                "- 任何时候认为该挂断，调 ``end_voice_call`` 并附一句自然告别即可，"
+                "不必等用户开口提议。\n"
+                "</call_status>"
+            )
+            return base + call_status_block
+
+        base = VTB_LIVE_SCENE_GUIDE if mode == "vtb_live" else VTB_SCENE_GUIDE
+        if not expression_hints:
+            return base
+
+        # 把 hints 拼成 markdown 列表追加到场景文案末尾。
+        # key 大写归一，对应 intent 值；也兼容 emotion 主类型（happy / sad ...）。
+        lines = []
+        for key, desc in expression_hints.items():
+            if not key or not desc:
+                continue
+            lines.append(f"- `{key.upper()}` → {desc}")
+        if not lines:
+            return base
+
+        # 用 <expression_hints> 标签把额外说明圈起来，与 base 文案视觉分离。
+        suffix = (
+            "\n\n<expression_hints>\n"
+            "**额外的手部 / 道具表情触发**：选下面的 intent / emotion 时，"
+            "会同步激活对应的虚拟形象表情或道具动作。在合适的语境里使用，"
+            "可以让虚拟形象的表演更有戏；不适合的场景就不要硬选。\n"
+            + "\n".join(lines)
+            + "\n</expression_hints>"
+        )
+        return base + suffix
 
     @staticmethod
     async def build_system_prompt(
         plugin_config: "SherpaOnnxVoiceChatterConfig | None",
         chat_stream: "ChatStream",
         mode: ChatterMode | None = None,
+        expression_hints: dict[str, str] | None = None,
     ) -> str:
         """构建系统提示词。
 
@@ -91,6 +178,9 @@ class VoiceChatterPromptBuilder:
             plugin_config: 插件配置（可能为空）。
             chat_stream: 当前聊天流。
             mode: 显式指定模式；为空时根据 ``chat_stream.platform`` 自动判定。
+            expression_hints: 可选的"intent / emotion → 动作描述"字典，由
+                :meth:`VTSPerformer.get_expression_hints` 提供，用于在 vtb /
+                vtb_live 场景文案末尾追加额外动作触发说明。
         """
 
         actual_mode: ChatterMode = mode or VoiceChatterPromptBuilder.resolve_mode(chat_stream)
@@ -106,7 +196,12 @@ class VoiceChatterPromptBuilder:
                 ),
             )
             .set("sub_agent_collaboration_extra", "")
-            .set("scene_guide", VoiceChatterPromptBuilder.get_scene_guide(actual_mode))
+            .set(
+                "scene_guide",
+                VoiceChatterPromptBuilder.get_scene_guide(
+                    actual_mode, expression_hints, chat_stream=chat_stream
+                ),
+            )
             .build()
         )
 

@@ -136,6 +136,28 @@ class SherpaOnnxVoiceChatterConfig(BaseConfig):
                 "默认为空，所有表演由 emotion + intent 参数注入完成。"
                 "匹配规则：先按 intent（``THINKING / EXCITED / SURPRISED ...``）查，"
                 "没命中再按 emotion 主类型（``happy / sad / angry / surprised``）查。"
+                "适合**复合 hotkey**（动画 + 道具 + 声音的组合按钮）。"
+                "如果你只是想切换某个 .exp3.json 表情文件，用下面的 expression_map 更直接。"
+            ),
+        )
+
+        # ── 表情文件直激活（不走 hotkey 系统） ──────
+        expression_map: dict[str, dict[str, str]] = Field(
+            default_factory=dict,
+            description=(
+                "可选：把 emotion / intent 映射到 Live2D 表情文件（.exp3.json）。"
+                "走 VTS 的 ExpressionActivationRequest，不需要在 VTS 里预先配 hotkey，"
+                "只要文件物理存在于模型目录即可。"
+                "格式：每个键映射到 {file, desc} 双字段——"
+                "file 是 .exp3.json 文件名（不含路径）；"
+                "desc 是动作描述，会被注入到模型 prompt，让 LLM 知道选哪个 intent "
+                "会触发什么表情（这一段是模型选对率的关键，描述写得越具体生动，"
+                "场景化匹配越准）。"
+                "示例：expression_map = { EXCITED = { file = 'expression17.exp3.json', "
+                "desc = '兴奋时左手高举挥舞' }, PROUD_LIFT = { file = 'expression18.exp3.json', "
+                "desc = '得意时双手比心炫耀' } }。"
+                "匹配规则：先 intent 大写后 emotion 主类型。"
+                "互斥设计——每次说话最多激活一个表情，避免多个手部表情同时显示。"
             ),
         )
 
