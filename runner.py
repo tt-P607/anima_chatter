@@ -1,4 +1,4 @@
-"""voice_chatter 主对话循环。
+"""anima_chatter 主对话循环。
 
 包含两套 chatter 行为：
 
@@ -168,7 +168,7 @@ async def run_voice_conversation(
     sub_agent_cfg = None
     if is_vtb_mode:
         plugin_config = getattr(getattr(chatter, "plugin", None), "config", None)
-        # 配置 section 名为 ``vtb_attention``（参见 :class:`SherpaOnnxVoiceChatterConfig`）。
+        # 配置 section 名为 ``vtb_attention``（参见 :class:`AnimaChatterConfig`）。
         attention_section = getattr(plugin_config, "vtb_attention", None) if plugin_config else None
         if attention_section is not None:
             sub_agent_cfg = voice_sub_agent.SubAgentConfig(
@@ -203,7 +203,7 @@ async def run_voice_conversation(
                     )
                 except Exception as exc:
                     logger.warning(f"超时挂断流程异常: {exc}", exc_info=True)
-                # 通话结束 → voice_chatter 的 execute() 也应该自然退出。
+                # 通话结束 → anima_chatter 的 execute() 也应该自然退出。
                 # _finalize_call 已经 unregister chatter 并 restart loop，
                 # 这里只需主动 return 让本次 generator 结束即可。
                 return
@@ -287,7 +287,7 @@ async def run_voice_conversation(
                 if message and plain_text_retries < plain_text_retry_limit:
                     plain_text_retries += 1
                     logger.warning(
-                        f"voice_chatter 收到纯文本输出，提醒模型改用 say/say_and_perform: {message[:100]}"
+                        f"anima_chatter 收到纯文本输出，提醒模型改用 say/say_and_perform: {message[:100]}"
                     )
                     request.add_payload(
                         LLMPayload(ROLE.USER, Text(_resolve_plain_text_reminder(chat_stream)))

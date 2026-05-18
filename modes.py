@@ -1,4 +1,4 @@
-"""voice_chatter 三态运行模式中枢。
+"""anima_chatter 三态运行模式中枢。
 
 把"什么 platform 进入什么模式"的判定收敛在这一个文件里。除了 :data:`ChatterMode`
 本身和 :func:`resolve_mode`，还导出 :data:`LIVE_PLATFORMS`（直播平台白名单）
@@ -20,10 +20,10 @@ if TYPE_CHECKING:
 
 
 ChatterMode = Literal["voice", "vtb", "vtb_live"]
-"""voice_chatter 三态运行模式：
+"""anima_chatter 三态运行模式：
 
 - ``voice``：``platform == "local_asr"``，本地 ASR 实时通话；或在通话进行中
-  接管了原 stream（如 QQ 私聊）的 voice_chatter。
+  接管了原 stream（如 QQ 私聊）的 anima_chatter。
 - ``vtb``：被 ``/vtb on`` 接管的普通群聊 / 私聊，VTube Studio 表演但不在直播。
 - ``vtb_live``：直播平台（``platform`` 在 :data:`LIVE_PLATFORMS` 中），
   观众是陌生弹幕、消息只入不出，要按直播间礼仪行事。
@@ -48,7 +48,7 @@ def resolve_mode(chat_stream: "ChatStream") -> ChatterMode:
     判定优先级：
 
     1. **该 stream 当前正处于 voice_call 通话中** → 强制 :data:`voice`
-       （voice_chatter 临时接管原 stream，platform 仍是 qq / discord 等，
+       （anima_chatter 临时接管原 stream，platform 仍是 qq / discord 等，
        但行为要按 voice 通话来）
     2. ``platform == "local_asr"`` → :data:`voice`
     3. ``platform`` 在 :data:`LIVE_PLATFORMS` 中 → :data:`vtb_live`
@@ -62,7 +62,7 @@ def resolve_mode(chat_stream: "ChatStream") -> ChatterMode:
     """
 
     # ── 优先级 1：通话中的 stream 强制 voice ─────────
-    # 直接读模块级单例，不走锁——voice_chatter 自己的 runner 持续
+    # 直接读模块级单例，不走锁——anima_chatter 自己的 runner 持续
     # poll，不会出现"读到旧值导致模式判错一拍"的严重后果。
     from . import call_state  # 局部导入避免循环依赖（call_state 不依赖 modes）
 

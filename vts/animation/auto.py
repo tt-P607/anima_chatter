@@ -3,7 +3,7 @@
 完整移植自旧版 ``soul_chatter_plugin`` 的 ``blink_animator.AutoAnimator``，
 仅做以下调整：
 
-- ``logger`` 改为 ``src.kernel.logger.get_logger("voice_chatter.vts.auto_animator")``。
+- ``logger`` 改为 ``src.kernel.logger.get_logger("anima_chatter.vts.auto_animator")``。
 - 移除 ``from src.common.logger import get_logger`` 的旧导入路径。
 
 行为完全保持不变：
@@ -26,7 +26,7 @@ from src.kernel.logger import get_logger
 from .base import BaseAnimator
 
 
-logger = get_logger("voice_chatter.vts.auto_animator")
+logger = get_logger("anima_chatter.vts.auto_animator")
 
 
 class AutoAnimator(BaseAnimator):
@@ -42,7 +42,7 @@ class AutoAnimator(BaseAnimator):
 
         Args:
             config: 兼容 BaseAnimator 的旧 dict 配置（保留）。
-            idle_animation_config: ``SherpaOnnxVoiceChatterConfig.idle_animation`` section；
+            idle_animation_config: ``AnimaChatterConfig.idle_animation`` section；
                 控制各类频率 / 幅度。不传就用激进版默认值，让模型看着活一些。
         """
 

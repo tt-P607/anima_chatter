@@ -1,4 +1,4 @@
-"""voice_chatter 的 VTB 虚拟形象表演动作。
+"""anima_chatter 的 VTB 虚拟形象表演动作。
 
 `SayAndPerformAction` 在非 ``local_asr`` 平台（即 vtb 模式）激活：
 
@@ -35,7 +35,7 @@ from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base import Failure
 from src.core.components.base.action import BaseAction
 
-from ..config import SherpaOnnxVoiceChatterConfig
+from ..config import AnimaChatterConfig
 from ..markers import parse_speech_segments
 from ..sub_agent import mark_reply_success
 from ..tts import TTSRequest, _retry_empty_audio, build_tts_backend
@@ -63,7 +63,7 @@ def _strip_all_markers(text: str) -> str:
     return cleaned.strip()
 
 
-logger = get_logger("voice_chatter.action.say_and_perform")
+logger = get_logger("anima_chatter.action.say_and_perform")
 
 
 class SayAndPerformAction(BaseAction):
@@ -76,7 +76,7 @@ class SayAndPerformAction(BaseAction):
         "支持 [wait:n] 控制下一段播放前等待 n 秒（仅需要长停顿时使用）。"
         "说完等待用户继续说话时，请另外调用 pass_and_wait。"
     )
-    chatter_allow = ["voice_chatter"]
+    chatter_allow = ["anima_chatter"]
     primary_action = True
 
     async def go_activate(self) -> bool:
@@ -169,7 +169,7 @@ class SayAndPerformAction(BaseAction):
             return False, "content 不能为空"
 
         plugin_config = getattr(self.plugin, "config", None)
-        if not isinstance(plugin_config, SherpaOnnxVoiceChatterConfig):
+        if not isinstance(plugin_config, AnimaChatterConfig):
             logger.error("插件配置缺失，无法执行 vtb 表演")
             return False, "插件配置缺失"
 

@@ -1,7 +1,7 @@
-"""voice_chatter 三种运行模式各自的"场景与工具协议"文案。
+"""anima_chatter 三种运行模式各自的"场景与工具协议"文案。
 
-每个常量对应一种 :data:`~plugins.voice_chatter.modes.ChatterMode`，由
-:meth:`prompts.builder.VoiceChatterPromptBuilder.get_scene_guide` 按 mode 选取。
+每个常量对应一种 :data:`~plugins.anima_chatter.modes.ChatterMode`，由
+:meth:`prompts.builder.AnimaChatterPromptBuilder.get_scene_guide` 按 mode 选取。
 
 修改文案就改这里——不要在 `builder.py` 里硬塞场景细节。
 """

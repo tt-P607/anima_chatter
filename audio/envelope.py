@@ -2,7 +2,7 @@
 
 把一段已经解码到 numpy 的 PCM 数据（float32, mono / stereo 都行）按固定步长
 切成 RMS 序列，再用 :class:`EnvelopeTracker` 记录"播放开始时间戳"，让消费方
-（:mod:`voice_chatter.vts.animation.speech`）按当前时刻 ``time.monotonic()``
+（:mod:`anima_chatter.vts.animation.speech`）按当前时刻 ``time.monotonic()``
 查到对应位置的归一化包络值。
 
 这是"伪流式"——音频本身在 ``sounddevice`` 那边一次性丢进去播放，我们靠

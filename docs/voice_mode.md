@@ -7,8 +7,8 @@
 ## 触发条件
 
 `local_asr` 平台的流由 [`asr_adapter`](../../asr_adapter/) 创建。流绑定后框架会
-按 [`SherpaOnnxVoiceChatter.associated_platforms = ["local_asr"]`](../plugin.py)
-评分把 chatter 绑到 voice_chatter，**不需要任何手动接管命令**。
+按 [`AnimaChatter.associated_platforms = ["local_asr"]`](../plugin.py)
+评分把 chatter 绑到 anima_chatter，**不需要任何手动接管命令**。
 
 模式判定见 [`modes.resolve_mode`](../modes.py)：
 
@@ -27,11 +27,11 @@ if platform == "local_asr":
 | Action 暴露 | ``say`` + ``pass_and_wait`` | ``say_and_perform`` 通过 ``go_activate()`` 排除 |
 | 提示词 | [`USER_PROMPT_VOICE`](../prompts/templates.py) + [`VOICE_SCENE_GUIDE`](../prompts/scenes.py) | 强调"ASR 识别可能出错"、"输出适合 TTS 朗读" |
 
-具体覆写逻辑见 [`SherpaOnnxVoiceChatter.apply_stream_runtime_options`](../plugin.py)。
+具体覆写逻辑见 [`AnimaChatter.apply_stream_runtime_options`](../plugin.py)。
 
 ## 核心 Action：`say`
 
-签名：`voice_chatter:action:say`，定义于 [`actions/say.py`](../actions/say.py)。
+签名：`anima_chatter:action:say`，定义于 [`actions/say.py`](../actions/say.py)。
 
 **`go_activate`**：仅 `platform == "local_asr"` 激活，确保 vtb / vtb_live 看不到。
 
@@ -56,7 +56,7 @@ if platform == "local_asr":
 
 ## `pass_and_wait`
 
-签名：`voice_chatter:action:pass_and_wait`，三模式共用。
+签名：`anima_chatter:action:pass_and_wait`，三模式共用。
 
 | 参数 | 含义 |
 |------|------|
@@ -90,6 +90,6 @@ if platform == "local_asr":
 | 现象 | 可能原因 | 处理 |
 |------|------|------|
 | 模型直接输出文本，没调 say | LLM 不熟悉协议，且 `plain_text_retry_limit` 太小 | 调大 `[plugin] plain_text_retry_limit`（默认 1）|
-| TTS 返回空音频，画面安静 | 文本里全是无法朗读的标记 / 标点 | 看 `[tts] empty_audio_retry_count` 是否生效；查 `voice_chatter.tts` 日志的 retry 信息 |
-| ASR 输入丢字 / 错字严重 | sherpa-onnx 模型选小了 | 是 ASR 的事，不是 voice_chatter 的；去 `asr_adapter` 配置换更大模型 |
+| TTS 返回空音频，画面安静 | 文本里全是无法朗读的标记 / 标点 | 看 `[tts] empty_audio_retry_count` 是否生效；查 `anima_chatter.tts` 日志的 retry 信息 |
+| ASR 输入丢字 / 错字严重 | sherpa-onnx 模型选小了 | 是 ASR 的事，不是 anima_chatter 的；去 `asr_adapter` 配置换更大模型 |
 | 回复"听到一半就被截断" | TTS 服务端把长文本切短了 | 调小段拆分（`tts.sentence_split_enabled = true`）让每段单独合成 |

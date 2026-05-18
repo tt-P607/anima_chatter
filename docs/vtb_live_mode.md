@@ -81,7 +81,7 @@ open_id 比 QQ 号长得多（20+ 字符），调记忆工具时严格按弹幕�
 ```
 
 记忆**策略**（什么时候建 person 记忆、怎么打 tag）由记忆插件本身的提示词管，
-voice_chatter 这边只负责把环境描述清楚。
+anima_chatter 这边只负责把环境描述清楚。
 
 ## sub_agent / 注意力过滤
 
@@ -124,7 +124,7 @@ vtb_live 共用 [`sub_agent.py`](../sub_agent.py)，行为和 vtb 一致，但�
 | 现象 | 可能原因 | 处理 |
 |------|------|------|
 | 模式没切到 vtb_live，走了 vtb | `LIVE_PLATFORMS` 没含目标平台 / dispatcher 写错 platform | 检查 [`modes.LIVE_PLATFORMS`](../modes.py) 和 adapter 的 `platform` 类属性是否一致 |
-| 弹幕进来但 chatter 不响应 | 注意力过滤丢了；或 LLM 决策"不必响应" | 看 `voice_chatter.runner` 日志的 `sub-agent 跳过响应 reason=...` |
+| 弹幕进来但 chatter 不响应 | 注意力过滤丢了；或 LLM 决策"不必响应" | 看 `anima_chatter.runner` 日志的 `sub-agent 跳过响应 reason=...` |
 | 模型试图发"@张三 你好"这种弹幕回引用 | 没注意 vtb_live 文本不出 | scene_guide 第三段已经强调"直接复述弹幕内容"，但还可以在 personality 里加一条 |
 | 记忆工具写入但找不回 | 模型把 `open_id` 拼短了 | 检查 booku 记录里的 `person_id` 是否完整 23+ 字符；scene_guide 已强调"一字不差" |
 | 直播开播但收不到弹幕 | B 站 adapter 长连断了 / id_code 过期 | 看 [`bilibili_live_adapter`](../../bilibili_live_adapter/) 的 README 故障排查 |

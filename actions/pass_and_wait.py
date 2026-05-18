@@ -1,4 +1,4 @@
-"""voice_chatter 插件的等待动作。
+"""anima_chatter 插件的等待动作。
 
 `pass_and_wait` 在 voice 与 vtb 两种模式下行为一致——告诉 chatter
 本轮动作完成后挂起，等用户继续说话或等待固定秒数后恢复。
@@ -11,7 +11,7 @@ from typing import Annotated
 from src.core.components.base.action import BaseAction
 
 
-class VoicePassAndWaitAction(BaseAction):
+class AnimaPassAndWaitAction(BaseAction):
     """登记等待用户继续说话或等待指定秒数后主动恢复。"""
 
     action_name = "pass_and_wait"
@@ -20,7 +20,7 @@ class VoicePassAndWaitAction(BaseAction):
         "seconds 为空时等待新输入，传入秒数时到时主动恢复。"
         "本动作只影响 chatter 是否挂起，不影响已经派发的 TTS / VTS 表演。"
     )
-    chatter_allow = ["voice_chatter"]
+    chatter_allow = ["anima_chatter"]
 
     async def execute(
         self,
@@ -33,4 +33,4 @@ class VoicePassAndWaitAction(BaseAction):
         return True, f"已登记等待 {seconds} 秒后继续会话"
 
 
-__all__ = ["VoicePassAndWaitAction"]
+__all__ = ["AnimaPassAndWaitAction"]

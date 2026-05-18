@@ -1,9 +1,9 @@
 # 配置参考
 
-`voice_chatter` 用 6 个 section 表达完整配置。所有字段都有合理默认值，第一次跑
+`anima_chatter` 用 6 个 section 表达完整配置。所有字段都有合理默认值，第一次跑
 只需要按 [README 快速上手](../README.md) 那段填几项关键字段，剩下的等需要时再调。
 
-配置文件路径：``config/plugins/voice_chatter/config.toml``
+配置文件路径：``config/plugins/anima_chatter/config.toml``
 
 ## 整体结构
 
@@ -70,7 +70,7 @@ hotkey_map = {}
 | `enabled` | bool | `false` | 是否启用 VTS；**关闭后 vtb 系仅播 TTS，不驱动虚拟形象** |
 | `host` | str | `127.0.0.1` | VTS 主机地址 |
 | `port` | int | `8001` | VTS WebSocket 端口（VTube Studio 默认） |
-| `auth_token` | str | `""` | 鉴权 token；首次留空，VTS 会弹授权窗，pyvts 自动写入 `data/voice_chatter/vts_token.txt` |
+| `auth_token` | str | `""` | 鉴权 token；首次留空，VTS 会弹授权窗，pyvts 自动写入 `data/anima_chatter/vts_token.txt` |
 | `audio_output_device` | str | `CABLE Input@WASAPI` | 本地播放 TTS 的 sounddevice 输出设备，格式 `设备名@驱动名`。通常指向 VB-Cable Input，让 VTS 与直播软件听到同一份音频 |
 | `hotkey_map` | dict[str, str] | `{}` | 可选：emotion / intent → VTS Hotkey ID 映射 |
 

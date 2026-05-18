@@ -1,4 +1,4 @@
-"""voice_chatter 通话状态中枢。
+"""anima_chatter 通话状态中枢。
 
 维护 **同时只允许一个** 进行中的语音通话状态：
 
@@ -107,7 +107,7 @@ async def get_active_call() -> ActiveCall | None:
 async def is_call_active_for_stream(stream_id: str) -> bool:
     """快速判定某个 stream 是否正处于通话中。
 
-    voice_chatter.modes.resolve_mode 在优先级 1 判定时会调它——
+    anima_chatter.modes.resolve_mode 在优先级 1 判定时会调它——
     通话中的 stream 强制走 voice 模式，无视 platform。
     """
 

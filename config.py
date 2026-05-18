@@ -1,6 +1,6 @@
-"""voice_chatter 插件配置。
+"""anima_chatter 插件配置。
 
-支持三种运行模式（详见 :mod:`plugins.voice_chatter.modes`）：
+支持三种运行模式（详见 :mod:`plugins.anima_chatter.modes`）：
 
 - ``voice``：``platform == "local_asr"``，沿用原有 ASR 实时通话行为。
 - ``vtb``：被 ``/vtb on`` 接管的普通群聊 / 私聊（VTube Studio 表演但不直播）。
@@ -28,12 +28,12 @@ from typing import ClassVar
 from src.core.components.base.config import BaseConfig, Field, SectionBase, config_section
 
 
-class SherpaOnnxVoiceChatterConfig(BaseConfig):
-    """voice_chatter 插件配置。"""
+class AnimaChatterConfig(BaseConfig):
+    """anima_chatter 插件配置。"""
 
     config_name: ClassVar[str] = "config"
     config_description: ClassVar[str] = (
-        "voice_chatter 插件配置（语音通话 + VTB 表演 + 直播弹幕，三种模式共用）"
+        "anima_chatter 插件配置（语音通话 + VTB 表演 + 直播弹幕，三种模式共用）"
     )
 
     @config_section("plugin", title="插件设置", tag="plugin")
@@ -111,7 +111,7 @@ class SherpaOnnxVoiceChatterConfig(BaseConfig):
             default="",
             description=(
                 "VTS 鉴权 token；首次留空，VTS 会弹授权窗，认证后由 pyvts 自动写入 "
-                "data/voice_chatter/vts_token.txt（之后免重复授权）。"
+                "data/anima_chatter/vts_token.txt（之后免重复授权）。"
             ),
         )
 
@@ -297,4 +297,4 @@ class SherpaOnnxVoiceChatterConfig(BaseConfig):
     idle_animation: IdleAnimationSection = Field(default_factory=IdleAnimationSection)
 
 
-__all__ = ["SherpaOnnxVoiceChatterConfig"]
+__all__ = ["AnimaChatterConfig"]

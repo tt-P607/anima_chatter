@@ -1,4 +1,4 @@
-"""voice_chatter 插件入口。
+"""anima_chatter 插件入口。
 
 支持两种运行模式：
 
@@ -27,36 +27,36 @@ from .actions import (
     SayAction,
     SayAndPerformAction,
     StartVoiceCallAction,
-    VoicePassAndWaitAction,
+    AnimaPassAndWaitAction,
 )
 from .audio import AudioPlayer
 from .commands import VoiceCommand, VTBCommand
-from .config import SherpaOnnxVoiceChatterConfig
+from .config import AnimaChatterConfig
 from .modes import ChatterMode
 from .prompts import (
     SYSTEM_PROMPT,
     USER_PROMPT_VOICE,
     USER_PROMPT_VTB,
     USER_PROMPT_VTB_LIVE,
-    VoiceChatterPromptBuilder,
+    AnimaChatterPromptBuilder,
 )
 from .runner import run_voice_conversation
 from .sub_agent import VOICE_CHATTER_SUB_AGENT_PROMPT_TEMPLATE
 from .vts import VTSPerformer
 
 
-logger = get_logger("voice_chatter")
+logger = get_logger("anima_chatter")
 
 _PASS_AND_WAIT = "action-pass_and_wait"
 
 # 接管 / 释放命令使用的 chatter 签名常量。
-_CHATTER_SIGNATURE = "voice_chatter:chatter:voice_chatter"
+_CHATTER_SIGNATURE = "anima_chatter:chatter:anima_chatter"
 
 
-class SherpaOnnxVoiceChatter(BaseChatter):
-    """voice_chatter：语音通话 / VTube Studio 虚拟形象通用 Chatter。"""
+class AnimaChatter(BaseChatter):
+    """anima_chatter：语音通话 / VTube Studio 虚拟形象通用 Chatter。"""
 
-    chatter_name = "voice_chatter"
+    chatter_name = "anima_chatter"
     chatter_description = (
         "语音通话与 VTube Studio 虚拟形象互动通用 Chatter。"
         "platform=local_asr 时为实时通话模式；其他平台需通过 /vtb on 显式接管。"
@@ -69,16 +69,16 @@ class SherpaOnnxVoiceChatter(BaseChatter):
     stream_tick_interval = 0.1
     allow_message_buffer = False
 
-    def _get_plugin_config(self) -> SherpaOnnxVoiceChatterConfig | None:
+    def _get_plugin_config(self) -> AnimaChatterConfig | None:
         """返回插件配置。"""
 
         config = getattr(self.plugin, "config", None)
-        return config if isinstance(config, SherpaOnnxVoiceChatterConfig) else None
+        return config if isinstance(config, AnimaChatterConfig) else None
 
     def _resolve_mode(self, chat_stream: ChatStream | None = None) -> ChatterMode:
         """根据当前流的 platform 决定运行模式。
 
-        与 :meth:`VoiceChatterPromptBuilder.resolve_mode` 保持一致：
+        与 :meth:`AnimaChatterPromptBuilder.resolve_mode` 保持一致：
 
         - ``local_asr`` → ``voice``
         - 直播平台（如 ``bilibili_live``） → ``vtb_live``
@@ -87,7 +87,7 @@ class SherpaOnnxVoiceChatter(BaseChatter):
 
         if chat_stream is None:
             return "vtb"
-        return VoiceChatterPromptBuilder.resolve_mode(chat_stream)
+        return AnimaChatterPromptBuilder.resolve_mode(chat_stream)
 
     def apply_stream_runtime_options(self, chat_stream: Any) -> None:
         """根据 platform 动态决定 tick 间隔与消息缓冲策略。
@@ -125,7 +125,7 @@ class SherpaOnnxVoiceChatter(BaseChatter):
                 # 取 hints 失败不致命，让 prompt 走纯静态路径。
                 expression_hints = {}
 
-        return await VoiceChatterPromptBuilder.build_system_prompt(
+        return await AnimaChatterPromptBuilder.build_system_prompt(
             self._get_plugin_config(),
             chat_stream,
             mode=self._resolve_mode(chat_stream),
@@ -135,7 +135,7 @@ class SherpaOnnxVoiceChatter(BaseChatter):
     def _build_history_text(self, chat_stream: ChatStream) -> str:
         """构建历史消息文本。"""
 
-        return VoiceChatterPromptBuilder.build_history_text(chat_stream, self.format_message_line)
+        return AnimaChatterPromptBuilder.build_history_text(chat_stream, self.format_message_line)
 
     async def _build_user_prompt(
         self,
@@ -146,7 +146,7 @@ class SherpaOnnxVoiceChatter(BaseChatter):
     ) -> str:
         """构建用户提示词（按模式选择不同模板）。"""
 
-        return await VoiceChatterPromptBuilder.build_user_prompt(
+        return await AnimaChatterPromptBuilder.build_user_prompt(
             chat_stream,
             history_text,
             unread_lines,
@@ -158,7 +158,7 @@ class SherpaOnnxVoiceChatter(BaseChatter):
     def _build_negative_behaviors_extra() -> str:
         """构建行为提醒。"""
 
-        return VoiceChatterPromptBuilder.build_negative_behaviors_extra()
+        return AnimaChatterPromptBuilder.build_negative_behaviors_extra()
 
     def _is_action_suspend_enabled(self) -> bool:
         """读取纯 Action 回合的挂起开关。"""
@@ -235,15 +235,15 @@ class SherpaOnnxVoiceChatter(BaseChatter):
 
 
 @register_plugin
-class SherpaOnnxVoiceChatterPlugin(BasePlugin):
-    """voice_chatter 插件：通话 + VTB 虚拟形象通用 chatter。"""
+class AnimaChatterPlugin(BasePlugin):
+    """anima_chatter 插件：通话 + VTB 虚拟形象通用 chatter。"""
 
-    plugin_name = "voice_chatter"
+    plugin_name = "anima_chatter"
     plugin_version = "1.1.0"
     plugin_description = (
-        "voice_chatter：sherpa-onnx ASR 实时语音通话 + VTube Studio 虚拟形象互动 通用 Chatter"
+        "anima_chatter：sherpa-onnx ASR 实时语音通话 + VTube Studio 虚拟形象互动 通用 Chatter"
     )
-    configs = [SherpaOnnxVoiceChatterConfig]
+    configs = [AnimaChatterConfig]
     dependent_components = ["asr_adapter:adapter:asr_adapter"]
 
     # vtb 模式运行时资源；on_plugin_loaded 中按配置初始化。
@@ -257,7 +257,7 @@ class SherpaOnnxVoiceChatterPlugin(BasePlugin):
 
         personality = get_core_config().personality
         get_prompt_manager().get_or_create(
-            name="voice_chatter_system_prompt",
+            name="anima_chatter_system_prompt",
             template=SYSTEM_PROMPT,
             policies={
                 "nickname": optional(personality.nickname),
@@ -277,7 +277,7 @@ class SherpaOnnxVoiceChatterPlugin(BasePlugin):
 
         # voice 模式专用 user prompt（保持原模板名以兼容现有 ASR 行为）。
         get_prompt_manager().get_or_create(
-            name="voice_chatter_user_prompt",
+            name="anima_chatter_user_prompt",
             template=USER_PROMPT_VOICE,
             policies={
                 "stream_name": optional("未知通话"),
@@ -291,7 +291,7 @@ class SherpaOnnxVoiceChatterPlugin(BasePlugin):
 
         # vtb 模式 user prompt（Q聊/私聊等普通平台）。
         get_prompt_manager().get_or_create(
-            name="voice_chatter_vtb_user_prompt",
+            name="anima_chatter_vtb_user_prompt",
             template=USER_PROMPT_VTB,
             policies={
                 "stream_name": optional("未知聊天"),
@@ -307,7 +307,7 @@ class SherpaOnnxVoiceChatterPlugin(BasePlugin):
         # 与 vtb 模板平行：占位符一致，但提示语全部改为"直播 / 弹幕 / 直播间"
         # 措辞，让模型在直播场景下调出更合适的回应风格。
         get_prompt_manager().get_or_create(
-            name="voice_chatter_vtb_live_user_prompt",
+            name="anima_chatter_vtb_live_user_prompt",
             template=USER_PROMPT_VTB_LIVE,
             policies={
                 "stream_name": optional("未知直播间"),
@@ -321,7 +321,7 @@ class SherpaOnnxVoiceChatterPlugin(BasePlugin):
 
         # vtb 模式 sub-agent（"是否要回复"决策器）prompt。
         get_prompt_manager().get_or_create(
-            name="voice_chatter_sub_agent_prompt",
+            name="anima_chatter_sub_agent_prompt",
             template=VOICE_CHATTER_SUB_AGENT_PROMPT_TEMPLATE,
             policies={
                 "nickname": optional(personality.nickname),
@@ -335,7 +335,7 @@ class SherpaOnnxVoiceChatterPlugin(BasePlugin):
         )
 
         # ── VTB 资源初始化 ───────────────────────────
-        config = self.config if isinstance(self.config, SherpaOnnxVoiceChatterConfig) else None
+        config = self.config if isinstance(self.config, AnimaChatterConfig) else None
         if config is None:
             logger.warning(
                 "插件配置加载异常，VTB 模式将无法播放音频或驱动 VTS。"
@@ -376,10 +376,10 @@ class SherpaOnnxVoiceChatterPlugin(BasePlugin):
         """返回插件组件。"""
 
         return [
-            SherpaOnnxVoiceChatter,
+            AnimaChatter,
             SayAction,
             SayAndPerformAction,
-            VoicePassAndWaitAction,
+            AnimaPassAndWaitAction,
             StartVoiceCallAction,
             EndVoiceCallAction,
             VTBCommand,
@@ -391,10 +391,10 @@ __all__ = [
     "EndVoiceCallAction",
     "SayAction",
     "SayAndPerformAction",
-    "SherpaOnnxVoiceChatter",
-    "SherpaOnnxVoiceChatterPlugin",
+    "AnimaChatter",
+    "AnimaChatterPlugin",
     "StartVoiceCallAction",
     "VTBCommand",
     "VoiceCommand",
-    "VoicePassAndWaitAction",
+    "AnimaPassAndWaitAction",
 ]

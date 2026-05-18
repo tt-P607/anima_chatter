@@ -1,17 +1,17 @@
-"""voice_chatter 提示词模块。
+"""anima_chatter 提示词模块。
 
 按职责拆分：
 
 - :mod:`.scenes` — 三种模式各自的 ``<scene_and_protocol>`` 文案。
 - :mod:`.templates` — system prompt + 三个 user prompt 模板字符串。
-- :mod:`.builder` — :class:`VoiceChatterPromptBuilder`，把上面两层组装起来。
+- :mod:`.builder` — :class:`AnimaChatterPromptBuilder`，把上面两层组装起来。
 
-外部模块统一从 ``plugins.voice_chatter.prompts`` 顶层 import 即可。
+外部模块统一从 ``plugins.anima_chatter.prompts`` 顶层 import 即可。
 """
 
 from __future__ import annotations
 
-from .builder import VoiceChatterPromptBuilder
+from .builder import AnimaChatterPromptBuilder
 from .scenes import VOICE_SCENE_GUIDE, VTB_LIVE_SCENE_GUIDE, VTB_SCENE_GUIDE
 from .templates import (
     SYSTEM_PROMPT,
@@ -32,5 +32,5 @@ __all__ = [
     "VTB_LIVE_SCENE_GUIDE",
     "VTB_SCENE_GUIDE",
     # 主入口
-    "VoiceChatterPromptBuilder",
+    "AnimaChatterPromptBuilder",
 ]

@@ -1,9 +1,9 @@
-"""voice_chatter 提示词构建器。
+"""anima_chatter 提示词构建器。
 
 把"模式判定（modes.py）+ 场景文案（scenes.py）+ 模板字符串（templates.py）"
 组装成最终送给 LLM 的 system / user prompt。
 
-其它模块只需要 ``from .prompts import VoiceChatterPromptBuilder`` 即可。
+其它模块只需要 ``from .prompts import AnimaChatterPromptBuilder`` 即可。
 """
 
 from __future__ import annotations
@@ -22,18 +22,18 @@ if TYPE_CHECKING:
     from src.core.models.message import Message
     from src.core.models.stream import ChatStream
 
-    from ..config import SherpaOnnxVoiceChatterConfig
+    from ..config import AnimaChatterConfig
 
 
-class VoiceChatterPromptBuilder:
-    """voice_chatter 提示词构建器。"""
+class AnimaChatterPromptBuilder:
+    """anima_chatter 提示词构建器。"""
 
     @staticmethod
     def resolve_mode(chat_stream: "ChatStream") -> ChatterMode:
         """根据流的 platform 自动判定模式。
 
-        实际逻辑在 :func:`plugins.voice_chatter.modes.resolve_mode`，本方法
-        只做轻包装，方便外部沿用 ``VoiceChatterPromptBuilder.resolve_mode``
+        实际逻辑在 :func:`plugins.anima_chatter.modes.resolve_mode`，本方法
+        只做轻包装，方便外部沿用 ``AnimaChatterPromptBuilder.resolve_mode``
         这个调用习惯。
         """
 
@@ -41,7 +41,7 @@ class VoiceChatterPromptBuilder:
 
     @staticmethod
     def build_action_suspend_guidance(
-        plugin_config: "SherpaOnnxVoiceChatterConfig | None",
+        plugin_config: "AnimaChatterConfig | None",
         mode: ChatterMode = "voice",
     ) -> str:
         """构建 Action-only 回合的提示词说明（按模式描述对应 action 名）。"""
@@ -94,7 +94,7 @@ class VoiceChatterPromptBuilder:
             base = VOICE_SCENE_GUIDE
             if chat_stream is None:
                 return base
-            # 检查 voice_chatter 接管的"主动通话"语境（QQ 等私聊升级到通话）
+            # 检查 anima_chatter 接管的"主动通话"语境（QQ 等私聊升级到通话）
             from .. import call_state as _cs
 
             active = _cs._active_call  # noqa: SLF001 — 同插件读模块级单例
@@ -167,7 +167,7 @@ class VoiceChatterPromptBuilder:
 
     @staticmethod
     async def build_system_prompt(
-        plugin_config: "SherpaOnnxVoiceChatterConfig | None",
+        plugin_config: "AnimaChatterConfig | None",
         chat_stream: "ChatStream",
         mode: ChatterMode | None = None,
         expression_hints: dict[str, str] | None = None,
@@ -183,22 +183,22 @@ class VoiceChatterPromptBuilder:
                 vtb_live 场景文案末尾追加额外动作触发说明。
         """
 
-        actual_mode: ChatterMode = mode or VoiceChatterPromptBuilder.resolve_mode(chat_stream)
-        tmpl = get_prompt_manager().get_template("voice_chatter_system_prompt")
+        actual_mode: ChatterMode = mode or AnimaChatterPromptBuilder.resolve_mode(chat_stream)
+        tmpl = get_prompt_manager().get_template("anima_chatter_system_prompt")
         if not tmpl:
             return ""
         return await (
             tmpl.set("nickname", chat_stream.bot_nickname)
             .set(
                 "action_suspend_guidance",
-                VoiceChatterPromptBuilder.build_action_suspend_guidance(
+                AnimaChatterPromptBuilder.build_action_suspend_guidance(
                     plugin_config, actual_mode
                 ),
             )
             .set("sub_agent_collaboration_extra", "")
             .set(
                 "scene_guide",
-                VoiceChatterPromptBuilder.get_scene_guide(
+                AnimaChatterPromptBuilder.get_scene_guide(
                     actual_mode, expression_hints, chat_stream=chat_stream
                 ),
             )
@@ -215,13 +215,13 @@ class VoiceChatterPromptBuilder:
     ) -> str:
         """构建用户提示词，按模式选择对应模板。"""
 
-        actual_mode: ChatterMode = mode or VoiceChatterPromptBuilder.resolve_mode(chat_stream)
+        actual_mode: ChatterMode = mode or AnimaChatterPromptBuilder.resolve_mode(chat_stream)
         if actual_mode == "vtb_live":
-            template_name = "voice_chatter_vtb_live_user_prompt"
+            template_name = "anima_chatter_vtb_live_user_prompt"
         elif actual_mode == "vtb":
-            template_name = "voice_chatter_vtb_user_prompt"
+            template_name = "anima_chatter_vtb_user_prompt"
         else:
-            template_name = "voice_chatter_user_prompt"
+            template_name = "anima_chatter_user_prompt"
 
         tmpl = get_prompt_manager().get_template(template_name)
         assert tmpl, f"缺少模板 {template_name}"
@@ -255,4 +255,4 @@ class VoiceChatterPromptBuilder:
         return "行为提醒：请严格遵守以下约束：\n" + "\n".join(negative_behaviors)
 
 
-__all__ = ["VoiceChatterPromptBuilder"]
+__all__ = ["AnimaChatterPromptBuilder"]

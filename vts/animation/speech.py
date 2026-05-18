@@ -38,7 +38,7 @@ class SpeechAnimator(BaseAnimator):
         Args:
             config: 兼容 BaseAnimator 的旧配置 dict（保留）。
             envelope_tracker: 可选的音频包络追踪器；不传则关闭音频驱动律动。
-            audio_drive_config: ``SherpaOnnxVoiceChatterConfig.audio_drive``
+            audio_drive_config: ``AnimaChatterConfig.audio_drive``
                 section（含 enabled / head_y_gain 等）；不传走默认值。
         """
 

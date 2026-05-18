@@ -1,4 +1,4 @@
-"""voice_chatter 的本地音频播放器。
+"""anima_chatter 的本地音频播放器。
 
 把 TTS 合成出来的 WAV bytes 输出到指定的 sounddevice 设备（通常是
 VB-Audio Cable Input），让 VTube Studio 的麦克风输入听到声音从而驱动嘴型。
@@ -32,7 +32,7 @@ from src.kernel.logger import get_logger
 from .envelope import EnvelopeTracker, compute_envelope
 
 
-logger = get_logger("voice_chatter.audio_player")
+logger = get_logger("anima_chatter.audio_player")
 
 
 # envelope 计算 / 消费的步长，与 VTSConnection._animation_loop 的 30Hz 对齐。

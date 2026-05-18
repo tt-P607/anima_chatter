@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from .animation.base import BaseAnimator
 
 
-logger = get_logger("voice_chatter.vts.connection")
+logger = get_logger("anima_chatter.vts.connection")
 
 
 # 注入到 VTS 的自定义参数清单。所有动画器输出都通过这些参数生效。
@@ -174,17 +174,17 @@ class VTSConnection:
                 if self._heartbeat_handle is None:
                     self._heartbeat_handle = tm.create_task(
                         self._heartbeat_loop(),
-                        name="voice_chatter.vts.heartbeat",
+                        name="anima_chatter.vts.heartbeat",
                     )
                 if self._animation_handle is None:
                     self._animation_handle = tm.create_task(
                         self._animation_loop(),
-                        name="voice_chatter.vts.animation",
+                        name="anima_chatter.vts.animation",
                     )
                 if self._sender_handle is None:
                     self._sender_handle = tm.create_task(
                         self._param_sender_loop(),
-                        name="voice_chatter.vts.sender",
+                        name="anima_chatter.vts.sender",
                     )
                 return True
             except Exception as exc:
@@ -486,9 +486,9 @@ class VTSConnection:
 
 
 def build_default_token_path() -> str:
-    """返回插件目录下的 token 缓存路径（默认 ``data/voice_chatter/vts_token.txt``）。"""
+    """返回插件目录下的 token 缓存路径（默认 ``data/anima_chatter/vts_token.txt``）。"""
 
-    base_dir = os.path.join(os.getcwd(), "data", "voice_chatter")
+    base_dir = os.path.join(os.getcwd(), "data", "anima_chatter")
     os.makedirs(base_dir, exist_ok=True)
     return os.path.join(base_dir, "vts_token.txt")
 

@@ -30,10 +30,10 @@ from .connection import VTSConnection, build_default_token_path
 
 if TYPE_CHECKING:
     from ..audio import AudioPlayer
-    from ..config import SherpaOnnxVoiceChatterConfig
+    from ..config import AnimaChatterConfig
 
 
-logger = get_logger("voice_chatter.vts.performer")
+logger = get_logger("anima_chatter.vts.performer")
 
 
 # SpeechAnimator 接受的合法 intent 名（其它值会被忽略，不报错）。
@@ -70,7 +70,7 @@ class VTSPerformer:
     def __init__(
         self,
         *,
-        plugin_config: "SherpaOnnxVoiceChatterConfig",
+        plugin_config: "AnimaChatterConfig",
         audio_player: "AudioPlayer",
     ) -> None:
         """根据插件配置构造连接 + 动画器；读取 hotkey_map（可选热键映射）。"""
@@ -87,7 +87,7 @@ class VTSPerformer:
         # 可选 hotkey_map：把 emotion 主类型或 intent 名字映射到 VTS Hotkey ID。
         # 例如 {"happy": "SmileHotkey", "THINKING": "ThinkHotkey"}。
         # 没配置就不触发热键，全靠参数注入实现表演。
-        # 配置位置已合并到 [vts] section（参见 :class:`SherpaOnnxVoiceChatterConfig`）。
+        # 配置位置已合并到 [vts] section（参见 :class:`AnimaChatterConfig`）。
         vts_section = getattr(plugin_config, "vts", None)
         hotkey_map = getattr(vts_section, "hotkey_map", None) or {}
         self._hotkey_map: dict[str, str] = {

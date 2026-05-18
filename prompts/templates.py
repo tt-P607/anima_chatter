@@ -1,4 +1,4 @@
-"""voice_chatter 的提示词模板字符串。
+"""anima_chatter 的提示词模板字符串。
 
 四个常量：
 
@@ -7,7 +7,7 @@
   :mod:`.scenes` 按 mode 注入。
 - :data:`USER_PROMPT_VOICE` / :data:`USER_PROMPT_VTB` / :data:`USER_PROMPT_VTB_LIVE`：
   三种模式各自的 user prompt 模板，由
-  :class:`.builder.VoiceChatterPromptBuilder` 按 mode 选取后填充占位符。
+  :class:`.builder.AnimaChatterPromptBuilder` 按 mode 选取后填充占位符。
 
 模板字段命名约定：
 

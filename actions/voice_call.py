@@ -1,4 +1,4 @@
-"""voice_chatter 的语音通话发起 / 结束动作。
+"""anima_chatter 的语音通话发起 / 结束动作。
 
 提供 ``start_voice_call`` 和 ``end_voice_call`` 两个 action，让模型能够在
 私聊中主动接 / 挂电话：
@@ -29,7 +29,7 @@
 约束（来自设计文档第 9 节）：
 - 仅私聊（chat_type == PRIVATE）才允许调用——群聊不适合一对一通话。
 - 同时只能有一个通话进行（call_state 互斥保证）。
-- 通话期间整条 QQ stream 的 chatter 都被切到 voice_chatter（voice 模式）；
+- 通话期间整条 QQ stream 的 chatter 都被切到 anima_chatter（voice 模式）；
   default_chatter / kfc 不会被触发，天然不需要"静默"处理。
 """
 
@@ -46,11 +46,11 @@ from src.core.components.base.action import BaseAction
 from .. import call_state
 
 
-logger = get_logger("voice_chatter.action.voice_call")
+logger = get_logger("anima_chatter.action.voice_call")
 
 
-# voice_chatter 的 chatter 签名（与 :data:`plugins.voice_chatter.plugin._CHATTER_SIGNATURE` 一致）。
-_VOICE_CHATTER_SIGNATURE = "voice_chatter:chatter:voice_chatter"
+# anima_chatter 的 chatter 签名（与 :data:`plugins.anima_chatter.plugin._CHATTER_SIGNATURE` 一致）。
+_VOICE_CHATTER_SIGNATURE = "anima_chatter:chatter:anima_chatter"
 
 # asr_adapter 的转发服务签名。
 _ASR_REDIRECT_SERVICE = "asr_adapter:service:asr_redirect"
@@ -67,7 +67,7 @@ async def _restart_stream_loop(stream_id: str) -> None:
     StreamLoopManager 当前没有暴露公开 API，等公开后再换公开调用。
     """
 
-    # NOTE: 触碰内部模块——目的同 :class:`plugins.voice_chatter.commands.VTBCommand`。
+    # NOTE: 触碰内部模块——目的同 :class:`plugins.anima_chatter.commands.VTBCommand`。
     from src.core.transport.distribution.stream_loop_manager import (
         get_stream_loop_manager,
     )
@@ -163,9 +163,9 @@ class StartVoiceCallAction(BaseAction):
     模型在 QQ 私聊里"想跟用户语音聊"时调用本动作，会做四件事：
 
     1. 校验：仅私聊 + 当前没有进行中通话。
-    2. 设状态：通过 :mod:`plugins.voice_chatter.call_state` 占用通话槽位。
-    3. 接管 stream：把当前 stream 的活跃 chatter 切成 voice_chatter，
-       重启循环让下一 tick 走 voice_chatter。
+    2. 设状态：通过 :mod:`plugins.anima_chatter.call_state` 占用通话槽位。
+    3. 接管 stream：把当前 stream 的活跃 chatter 切成 anima_chatter，
+       重启循环让下一 tick 走 anima_chatter。
     4. 启动 ASR 转发：让本地麦克风识别出的文本注入到当前 QQ stream。
     5. 给用户发"接通中..."的文本提示 + 广播 ``voice_call.started`` 事件。
     """
@@ -277,10 +277,10 @@ class StartVoiceCallAction(BaseAction):
         # ── 4) 接管 stream ───────────────
         chatter_cls = chat_api.get_chatter_class(_VOICE_CHATTER_SIGNATURE)
         if chatter_cls is None:
-            # 找不到 voice_chatter 组件：把已设置的副作用全部回滚。
+            # 找不到 anima_chatter 组件：把已设置的副作用全部回滚。
             await _end_asr_voice_session()
             await call_state.clear_active_call()
-            return False, "未找到 voice_chatter 组件，无法接管"
+            return False, "未找到 anima_chatter 组件，无法接管"
 
         if existing is not None:
             chat_api.unregister_active_chatter(stream_id)
@@ -335,11 +335,11 @@ class EndVoiceCallAction(BaseAction):
     action_description = (
         "挂断当前语音通话并切回正常聊天。"
         "调用场景：你和用户已经说完想说的话、用户说要挂断、或者你判断没有继续语音的必要了。"
-        "调用后：voice_chatter 释放对当前 stream 的接管，下一轮自动绑回原 chatter "
+        "调用后：anima_chatter 释放对当前 stream 的接管，下一轮自动绑回原 chatter "
         "（default_chatter / kokoro_flow_chatter 等），通话期间产生的消息会通过事件机制"
         "补回原 chatter 的对话历史，保证上下文不丢。"
     )
-    chatter_allow = ["voice_chatter"]
+    chatter_allow = ["anima_chatter"]
     chat_type = ChatType.PRIVATE
     primary_action = False
 
@@ -381,7 +381,7 @@ async def _play_farewell_via_tts(
     """
 
     try:
-        from ..config import SherpaOnnxVoiceChatterConfig
+        from ..config import AnimaChatterConfig
         from ..tts import TTSRequest, build_tts_backend
 
         audio_player = getattr(plugin, "audio_player", None)
@@ -393,7 +393,7 @@ async def _play_farewell_via_tts(
             return
 
         plugin_config = getattr(plugin, "config", None)
-        if not isinstance(plugin_config, SherpaOnnxVoiceChatterConfig):
+        if not isinstance(plugin_config, AnimaChatterConfig):
             logger.warning("挂断告别音频：插件配置不可用，跳过")
             return
 
@@ -426,7 +426,7 @@ async def _finalize_call(
     1. **立即关闭 ASR**：放最前面。后续 TTS 合成 + 播放告别音频会阻塞数秒，
        期间 ASR 不能继续收音注入消息（否则对方说的话会被当成挂断后的新
        消息发到 QQ 流，看起来像"挂断后 ASR 还在工作"）。
-    2. **释放 chatter 接管 + 重启循环**：让 voice_chatter 主循环立刻退出，
+    2. **释放 chatter 接管 + 重启循环**：让 anima_chatter 主循环立刻退出，
        下一 tick 自动绑回原 chatter（kfc / default 等）。
     3. **清状态拿快照**：保留通话期间的 messages_in_call，用于事件 payload。
     4. **TTS 播放告别词**：通话语境里告别就是电话里最后一句话，通过扬声器
@@ -439,7 +439,7 @@ async def _finalize_call(
         platform: stream 的 platform（保留参数，目前不再用 send_text 路径）。
         farewell: 给用户的告别文本；空串则用默认。
         end_reason: ``"model" / "user" / "timeout" / "manual"``。
-        plugin: voice_chatter 插件实例，用于拿 audio_player 播放 TTS 告别音频。
+        plugin: anima_chatter 插件实例，用于拿 audio_player 播放 TTS 告别音频。
             为 None 时跳过 TTS 播放（仅记日志）。
     """
 
@@ -456,8 +456,8 @@ async def _finalize_call(
     # 还能听到对方说话"的错觉。
     await _end_asr_voice_session()
 
-    # ── 2) 释放 chatter 接管，让 voice_chatter 主循环退出 ──
-    # 也要尽早做：voice_chatter 主循环还在跑就可能继续生成消息。
+    # ── 2) 释放 chatter 接管，让 anima_chatter 主循环退出 ──
+    # 也要尽早做：anima_chatter 主循环还在跑就可能继续生成消息。
     existing = chat_api.get_chatter_by_stream(stream_id)
     if existing is not None and existing.__class__.get_signature() == _VOICE_CHATTER_SIGNATURE:
         chat_api.unregister_active_chatter(stream_id)

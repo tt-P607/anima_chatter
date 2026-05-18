@@ -1,4 +1,4 @@
-"""voice_chatter VTB 模式的子代理消息过滤。
+"""anima_chatter VTB 模式的子代理消息过滤。
 
 复刻自 :mod:`plugins.default_chatter.decision_agent` + DefaultChatter 主类
 里的 sub-agent 概率门逻辑，专门用于 vtb 模式（``platform != "local_asr"``）。
@@ -13,7 +13,7 @@
    - sub_actor LLM 调用流程
    - "上一回合刚回复 → 下一 tick 加成" 这条心理机制
 
-   请**同步**回这个文件；否则 voice_chatter（vtb / vtb_live 模式）的
+   请**同步**回这个文件；否则 anima_chatter（vtb / vtb_live 模式）的
    注意力过滤行为会与 dfc 漂移。
 
 两层过滤：
@@ -23,7 +23,7 @@
 2. **决策 LLM（``sub_actor`` task）**：未命中概率门时调用一个轻量模型，
    输出 JSON ``{"should_respond": bool, "reason": str}``。
 
-模块按需 ``await voice_chatter_sub_agent.should_respond(...)``，输入为
+模块按需 ``await anima_chatter_sub_agent.should_respond(...)``，输入为
 未读消息 + chat_stream，返回 :class:`SubAgentDecision`。
 """
 
@@ -55,7 +55,7 @@ _UNREAD_MESSAGE_BONUS = 0.05
 _NEXT_TICK_REPLY_BONUS = 0.5
 
 # 写到 stream context 上的字段名，记录"上次回复后下一 tick 加成"。
-_NEXT_TICK_BONUS_ATTR = "_voice_chatter_next_tick_bonus"
+_NEXT_TICK_BONUS_ATTR = "_anima_chatter_next_tick_bonus"
 
 
 @dataclass
@@ -324,7 +324,7 @@ async def _decide_via_llm(
     try:
         request = chatter.create_request(
             "sub_actor",
-            "voice_chatter_sub_agent",
+            "anima_chatter_sub_agent",
             with_reminder="sub_actor",
         )
     except (ValueError, KeyError):
@@ -334,7 +334,7 @@ async def _decide_via_llm(
     bot_id = chat_stream.bot_id or ""
     bot_id_section = f"它的 QQ 号是 {bot_id}。\n" if bot_id else ""
 
-    tmpl = get_prompt_manager().get_template("voice_chatter_sub_agent_prompt")
+    tmpl = get_prompt_manager().get_template("anima_chatter_sub_agent_prompt")
     if tmpl:
         sub_prompt = (
             await tmpl

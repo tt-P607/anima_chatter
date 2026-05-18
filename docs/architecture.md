@@ -1,13 +1,13 @@
 # 整体架构
 
-`voice_chatter` 把"用 TTS 让 LLM 输出 + 让 VTube Studio 形象同步表演"封装成
+`anima_chatter` 把"用 TTS 让 LLM 输出 + 让 VTube Studio 形象同步表演"封装成
 一个三模式 Chatter，按 ``chat_stream.platform`` 自动分流。本文档解释模块布局、
 模式判定中枢和共享层的关系。
 
 ## 模块布局（rev. 2026-05-17）
 
 ```
-voice_chatter/
+anima_chatter/
 ├── plugin.py                 # 主入口：注册 chatter / actions / command + 初始化 VTS
 ├── modes.py                  # ★模式判定中枢：ChatterMode + LIVE_PLATFORMS + resolve_mode
 ├── config.py                 # 6 个 section 的 BaseConfig 类
@@ -24,7 +24,7 @@ voice_chatter/
 │   ├── __init__.py           #   对外暴露
 │   ├── scenes.py             #   三种模式的 <scene_and_protocol> 文案
 │   ├── templates.py          #   SYSTEM_PROMPT + 三个 USER_PROMPT_* 模板
-│   └── builder.py            #   VoiceChatterPromptBuilder 组装类
+│   └── builder.py            #   AnimaChatterPromptBuilder 组装类
 │
 ├── actions/                  # LLM 工具
 │   ├── say.py                #   voice 独占：文本 → TTS → ASR adapter 播放
@@ -101,7 +101,7 @@ def resolve_mode(chat_stream) -> ChatterMode: ...
 
 ### 1. 流绑定阶段
 
-ChatterManager 看到一条流，按平台 / chat_type 评分挑 chatter；voice_chatter
+ChatterManager 看到一条流，按平台 / chat_type 评分挑 chatter；anima_chatter
 通过 ``associated_platforms = ["local_asr"]`` 的弱声明吸引 ASR 流，其余平台
 默认绑回 default_chatter——直到用户 ``/vtb on``，或这条流来自直播平台
 （platform 命中 ``LIVE_PLATFORMS`` 自动判定为 vtb_live）。

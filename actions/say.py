@@ -1,4 +1,4 @@
-"""voice_chatter 的 ASR 通话语音播放动作。
+"""anima_chatter 的 ASR 通话语音播放动作。
 
 `SayAction` 把模型生成的文本送入 TTS 后端，再让适配器（asr_adapter）
 按顺序播放。仅在 ``platform == "local_asr"`` 的实时通话流中激活。
@@ -15,12 +15,12 @@ from src.core.components.base.action import BaseAction
 from src.kernel.concurrency import get_task_manager
 
 from .. import call_state
-from ..config import SherpaOnnxVoiceChatterConfig
+from ..config import AnimaChatterConfig
 from ..markers import parse_speech_segments
 from ..tts import TTSRequest, _retry_empty_audio, build_tts_backend
 
 
-logger = get_logger("voice_chatter.action.say")
+logger = get_logger("anima_chatter.action.say")
 
 
 class SayAction(BaseAction):
@@ -33,7 +33,7 @@ class SayAction(BaseAction):
         "普通说话请勿使用以保持自然连贯）。"
         "[wait] 只影响语音片段播放间隔，不会让聊天流等待；说完等待用户时请另外调用 pass_and_wait。"
     )
-    chatter_allow = ["voice_chatter"]
+    chatter_allow = ["anima_chatter"]
     associated_platforms = ["local_asr"]
     dependencies = ["asr_adapter:adapter:asr_adapter"]
 
@@ -43,7 +43,7 @@ class SayAction(BaseAction):
         在两种场景激活：
         1. ``platform == "local_asr"``：本地直接通话；
         2. **当前 stream 正处于 voice_call 通话中**（platform 可能是 qq 等）：
-           voice_chatter 临时接管原 stream 的语音通话场景。
+           anima_chatter 临时接管原 stream 的语音通话场景。
 
         关键约束：通话中**只能**让 say 暴露给模型，**不能**让 say_and_perform
         暴露——后者会发送文本到原平台 + 驱动 VTube Studio，与"打电话"的语义
@@ -64,7 +64,7 @@ class SayAction(BaseAction):
         split_enabled = True
         max_parallel = 4
         empty_audio_retry_count = 1
-        if isinstance(plugin_config, SherpaOnnxVoiceChatterConfig):
+        if isinstance(plugin_config, AnimaChatterConfig):
             split_enabled = bool(plugin_config.tts.sentence_split_enabled)
             max_parallel = int(plugin_config.tts.max_parallel_segments)
             empty_audio_retry_count = int(plugin_config.tts.empty_audio_retry_count)
@@ -158,7 +158,7 @@ class SayAction(BaseAction):
                     # - 本地直接通话（platform=local_asr）：走 backend.emit
                     #   发 voice envelope → asr_adapter._send_platform_message
                     #   → 本机扬声器播放。这是 SayAction 的原行为。
-                    # - QQ 等平台被 voice_chatter 接管的"打电话"场景：**不能**
+                    # - QQ 等平台被 anima_chatter 接管的"打电话"场景：**不能**
                     #   走 emit——emit 用 chat_stream.platform 路由，会把 voice
                     #   envelope 发给 napcat 等真平台适配器，那边要么报错要么
                     #   把音频转成 QQ 语音消息发出去（违反"打电话只有声音"的
