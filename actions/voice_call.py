@@ -239,13 +239,31 @@ class StartVoiceCallAction(BaseAction):
         started_human = _datetime.datetime.fromtimestamp(active.started_at).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
-        await call_state.record_system_note(
-            stream_id,
+        note_text = (
             f"[语音通话开始 @ {started_human}] 用户已接通本地语音通话。"
             "从此处到下一条 [语音通话结束] 之间的对话发生在电话里——"
             "你的回复以 TTS 通过本机扬声器播放，用户的话来自麦克风 ASR 识别"
-            "（可能有错字），双方看不到文字。",
+            "（可能有错字），双方看不到文字。"
         )
+        await call_state.record_system_note(stream_id, note_text)
+
+        # ── 2.5) 注入 history_messages 边界（给 DFC 等无状态 chatter 看） ──
+        # 构造一条 system 类型的 Message 注入到框架通用历史中。
+        # 这样 DFC 切回来时能看到明确的通话边界，不必改 DFC 源码。
+        from src.core.models.message import Message, MessageType
+
+        history_msg = Message(
+            message_id=f"call_start_{active.started_at}",
+            content=note_text,
+            processed_plain_text=note_text,
+            message_type=MessageType.NOTICE,
+            platform=platform,
+            stream_id=stream_id,
+            sender_id="system",
+            sender_name="系统通知",
+            time=active.started_at,
+        )
+        self.chat_stream.context.add_history_message(history_msg)
 
         # ── 3) 启动 ASR 通话会话（启动 runtime + 切 always_on + 设 redirect） ──
         if not platform:
@@ -506,6 +524,39 @@ async def _finalize_call(
     snapshot = await call_state.end_call(end_reason)
     if snapshot is None:
         snapshot = active
+
+    # ── 4.5) 注入 history_messages 结束边界（给 DFC 等无状态 chatter 看） ──
+    # 同样构造一条 NOTICE 类型的 Message 注入到框架通用历史。
+    # 这样 DFC 切回来时能看到明确的通话结束点。
+    try:
+        from src.core.models.message import Message, MessageType
+
+        # 找 snapshot 里的最后一条 system note（即刚才 record_system_note 写入的那条）
+        note_text = "📞 语音通话已结束。"
+        for m in reversed(snapshot.messages_in_call):
+            if m.get("role") == "system":
+                note_text = m.get("text", note_text)
+                break
+
+        history_msg = Message(
+            message_id=f"call_end_{ended_now}",
+            content=note_text,
+            processed_plain_text=note_text,
+            message_type=MessageType.NOTICE,
+            platform=active.caller_stream_id.split(":", 1)[0],  # 简单从 stream_id 拆 platform
+            stream_id=stream_id,
+            sender_id="system",
+            sender_name="系统通知",
+            time=ended_now,
+        )
+        # 通过 stream_api 拿 stream 引用并注入
+        from src.app.plugin_system.api import stream_api
+
+        stream = await stream_api.get_stream(stream_id)
+        if stream:
+            stream.context.add_history_message(history_msg)
+    except Exception as exc:
+        logger.warning(f"注入通话结束 history_message 失败: {exc}")
 
     # ── 5) 广播事件 ───────────────
     ended_at = _time.time()
