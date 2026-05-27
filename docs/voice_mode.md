@@ -1,12 +1,12 @@
 # voice 模式：实时 ASR 语音通话
 
-`platform == "local_asr"` 时自动激活；和 [`asr_adapter`](../../asr_adapter/) +
+`platform == "local_asr"` 时自动激活；和 [`asr_adapter_anima`](../../asr_adapter_anima/) +
 [`tts_http_server`](../../tts_http_server/) 配合做"听用户说话 → LLM → TTS 朗读"
 的实时一对一对话。
 
 ## 触发条件
 
-`local_asr` 平台的流由 [`asr_adapter`](../../asr_adapter/) 创建。流绑定后框架会
+`local_asr` 平台的流由 [`asr_adapter_anima`](../../asr_adapter_anima/) 创建。流绑定后框架会
 按 [`AnimaChatter.associated_platforms = ["local_asr"]`](../plugin.py)
 评分把 chatter 绑到 anima_chatter，**不需要任何手动接管命令**。
 
@@ -91,5 +91,5 @@ if platform == "local_asr":
 |------|------|------|
 | 模型直接输出文本，没调 say | LLM 不熟悉协议，且 `plain_text_retry_limit` 太小 | 调大 `[plugin] plain_text_retry_limit`（默认 1）|
 | TTS 返回空音频，画面安静 | 文本里全是无法朗读的标记 / 标点 | 看 `[tts] empty_audio_retry_count` 是否生效；查 `anima_chatter.tts` 日志的 retry 信息 |
-| ASR 输入丢字 / 错字严重 | sherpa-onnx 模型选小了 | 是 ASR 的事，不是 anima_chatter 的；去 `asr_adapter` 配置换更大模型 |
+| ASR 输入丢字 / 错字严重 | sherpa-onnx 模型选小了 | 是 ASR 的事，不是 anima_chatter 的；去 `asr_adapter_anima` 配置换更大模型 |
 | 回复"听到一半就被截断" | TTS 服务端把长文本切短了 | 调小段拆分（`tts.sentence_split_enabled = true`）让每段单独合成 |

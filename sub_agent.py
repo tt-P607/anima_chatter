@@ -149,6 +149,33 @@ def mark_reply_success(chat_stream: ChatStream) -> None:
     _set_next_tick_bonus(chat_stream, _NEXT_TICK_REPLY_BONUS)
 
 
+def _build_history_context(chat_stream: ChatStream, *, limit: int = 10) -> str:
+    """从 chat_stream.context 取最近 ``limit`` 条历史消息，拼成 sub-agent 用的上下文块。
+
+    和主 chatter 的 history 不同——这里目的只是"让 sub-agent 看到话题脉络"，
+    所以只取**发言人 + 文本**的精简形式，不带时间戳 / 消息 ID 等冗余字段。
+    """
+
+    history = list(getattr(chat_stream.context, "history_messages", []) or [])
+    if not history:
+        return ""
+    recent = history[-limit:]
+    lines: list[str] = []
+    for msg in recent:
+        sender = (
+            getattr(msg, "sender_name", "")
+            or getattr(msg, "sender_id", "")
+            or "未知"
+        )
+        text = _message_text(msg).strip()
+        if not text:
+            continue
+        lines.append(f"- {sender}：{text}")
+    if not lines:
+        return ""
+    return "【最近对话上下文（仅供你判断'是否需要回应'参考）】\n" + "\n".join(lines)
+
+
 def _message_text(message: Message) -> str:
     """提取消息文本（用于关键词命中判定）。"""
 
@@ -354,14 +381,23 @@ async def _decide_via_llm(
 
     request.add_payload(LLMPayload(ROLE.SYSTEM, Text(sub_prompt)))
 
+    # 注入最近 10 条历史消息作为上下文 —— 避免 sub-agent 在弹幕场景下因为
+    # "看不到话题前因后果"误判。例如观众连续聊一个梗，每条孤立来看像无关
+    # 闲聊；但配合上下文就能识别出是同一话题在持续。
+    history_block = _build_history_context(chat_stream, limit=10)
+
     fitted = _fit_unreads_to_budget(request, unreads_text)
     if len(fitted) < len(unreads_text):
         logger.info(
             f"sub-agent 输入已截断: {len(unreads_text)} -> {len(fitted)} 字符"
         )
-    request.add_payload(
-        LLMPayload(ROLE.USER, Text(f"【新收到待判定消息】\n{fitted}"))
+
+    user_payload_text = (
+        f"{history_block}\n\n【新收到待判定消息】\n{fitted}"
+        if history_block
+        else f"【新收到待判定消息】\n{fitted}"
     )
+    request.add_payload(LLMPayload(ROLE.USER, Text(user_payload_text)))
 
     try:
         response = await request.send(stream=False)

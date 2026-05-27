@@ -6,7 +6,7 @@
     "author": "MoFox Team",
     "dependencies": {
         "plugins": [
-            "asr_adapter",
+            "asr_adapter_anima",
             "tts_http_server"
         ],
         "components": []
@@ -19,19 +19,24 @@
             "component_type": "chatter",
             "component_name": "anima_chatter",
             "dependencies": [
-                "asr_adapter:adapter:asr_adapter"
+                "asr_adapter_anima:adapter:asr_adapter_anima"
             ]
         },
         {
             "component_type": "action",
             "component_name": "say",
             "dependencies": [
-                "asr_adapter:adapter:asr_adapter"
+                "asr_adapter_anima:adapter:asr_adapter_anima"
             ]
         },
         {
             "component_type": "action",
             "component_name": "say_and_perform",
+            "dependencies": []
+        },
+        {
+            "component_type": "action",
+            "component_name": "sing_song",
             "dependencies": []
         },
         {
@@ -43,14 +48,14 @@
             "component_type": "action",
             "component_name": "start_voice_call",
             "dependencies": [
-                "asr_adapter:service:asr_redirect"
+                "asr_adapter_anima:service:asr_redirect"
             ]
         },
         {
             "component_type": "action",
             "component_name": "end_voice_call",
             "dependencies": [
-                "asr_adapter:service:asr_redirect"
+                "asr_adapter_anima:service:asr_redirect"
             ]
         },
         {

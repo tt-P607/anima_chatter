@@ -16,6 +16,7 @@ from src.kernel.concurrency import get_task_manager
 
 from .. import call_state
 from ..config import AnimaChatterConfig
+from ..heartbeat import feed_watchdog_during
 from ..markers import parse_speech_segments
 from ..tts import TTSRequest, _retry_empty_audio, build_tts_backend
 
@@ -35,7 +36,7 @@ class SayAction(BaseAction):
     )
     chatter_allow = ["anima_chatter"]
     associated_platforms = ["local_asr"]
-    dependencies = ["asr_adapter:adapter:asr_adapter"]
+    dependencies = ["asr_adapter_anima:adapter:asr_adapter_anima"]
 
     async def go_activate(self) -> bool:
         """voice 模式专用 action 的可见性。
@@ -57,6 +58,31 @@ class SayAction(BaseAction):
     async def execute(
         self,
         content: Annotated[str, "要通过 TTS 说出的内容，可包含 [wait:n] 和 [emotion:name] 标记"],
+        style: Annotated[
+            str,
+            "TTS 语音风格。可选：default（默认中性，绝大多数场景用这个）、"
+            "活泼（俏皮明亮，开心调皮时用）、难过（柔软低沉，共情失落时用）。"
+            "切风格只在情绪明显起伏时用，平时保持 default。",
+        ] = "default",
+        language: Annotated[
+            str,
+            "整段 content 的语言代码——决定 TTS 用哪一套语言引擎来朗读。\n"
+            "**选 language 的核心原则**：看你这次 content 实际**要被读成哪种语言**就选哪个，"
+            "和文字写出来是不是汉字无关。比如「係」「嘅」「咩」「喺度」写出来是汉字、"
+            "但要朗读成粤语，应选 yue 而不是 zh；选错了 TTS 会用错引擎，比如粤语句子"
+            "用 zh 朗读会变成普通话生硬念粤字。\n"
+            "**可选值（只填代码本身，不填括号内的说明文字）**：\n"
+            "混合模式（文本中包含多种语言或外来词时选此类）：\n"
+            "  zh — 中文为主（夹杂英文）  en — 英文为主（夹杂其他语言）\n"
+            "  ja — 日文为主（夹杂英文）  yue — 粤语（夹杂英文）\n"
+            "  ko — 韩文（夹杂英文）      auto — 自动识别多语种\n"
+            "  auto_yue — 自动识别（含粤语优先）\n"
+            "纯语言模式（文本仅含单一语言时优先选此类，推理效果更好）：\n"
+            "  all_zh — 纯中文  all_ja — 纯日文  all_yue — 纯粤语  all_ko — 纯韩文\n"
+            "**整段只能是一种语言**——一次 say 调用所有 content 共享同一个 language。"
+            "想先说普通话再说其他语言，请**分两次** say 调用，每次用对应的 language；"
+            "不要把多种语言塞进同一次调用。",
+        ] = "zh",
     ) -> tuple[bool, str]:
         """执行语音播放动作。"""
 
@@ -95,6 +121,14 @@ class SayAction(BaseAction):
 
         backend = build_tts_backend(plugin_config, logger)
 
+        # 把 style / language 透传给 TTS provider：通过 TTSRequest.markers 字段。
+        # 详见 say_and_perform.py 同名注释。
+        def _build_markers_for_seg(seg: Any) -> dict[str, Any]:
+            base = dict(getattr(seg, "markers", None) or {})
+            base.setdefault("style", style)
+            base.setdefault("language", language)
+            return base
+
         async def process_segment(seg: Any, idx: int):
             """合成单个片段；失败时重试或返回 Failure。"""
 
@@ -104,7 +138,7 @@ class SayAction(BaseAction):
                         stream_id=self.chat_stream.stream_id,
                         text=seg.text,
                         emotion=seg.emotion,
-                        markers=seg.markers,
+                        markers=_build_markers_for_seg(seg),
                     )
                 )
                 if not artifact.audio and empty_audio_retry_count > 0:
@@ -134,60 +168,63 @@ class SayAction(BaseAction):
         completed_artifacts: dict[int, Any] = {}
         success_count = 0
 
-        for task in asyncio.as_completed(tasks):
-            idx, artifact = await task
-            completed_artifacts[idx] = artifact
+        # 整段合成 + 播放期间 generator 会 await 几十秒不 yield，主动喂 watchdog
+        # 防止 stream_warning_threshold / stream_restart_threshold 误触发。
+        async with feed_watchdog_during(self.chat_stream.stream_id):
+            for task in asyncio.as_completed(tasks):
+                idx, artifact = await task
+                completed_artifacts[idx] = artifact
 
-            while next_to_play in completed_artifacts:
-                current_idx = next_to_play
-                current_art = completed_artifacts.pop(current_idx)
-                current_seg = segments[current_idx]
+                while next_to_play in completed_artifacts:
+                    current_idx = next_to_play
+                    current_art = completed_artifacts.pop(current_idx)
+                    current_seg = segments[current_idx]
 
-                if isinstance(current_art, Failure) or (
-                    hasattr(current_art, "metadata")
-                    and cast(dict, current_art.metadata).get("error")
-                ):
-                    logger.error(f"跳过播放失败段落 {current_idx}: {current_seg.text}")
-                elif not current_art.audio:
-                    logger.error(f"跳过无音频段落 {current_idx}: {current_seg.text}")
-                else:
-                    if current_seg.wait_before >= 0.1:
-                        await asyncio.sleep(current_seg.wait_before)
-
-                    # 关键路由分流：
-                    # - 本地直接通话（platform=local_asr）：走 backend.emit
-                    #   发 voice envelope → asr_adapter._send_platform_message
-                    #   → 本机扬声器播放。这是 SayAction 的原行为。
-                    # - QQ 等平台被 anima_chatter 接管的"打电话"场景：**不能**
-                    #   走 emit——emit 用 chat_stream.platform 路由，会把 voice
-                    #   envelope 发给 napcat 等真平台适配器，那边要么报错要么
-                    #   把音频转成 QQ 语音消息发出去（违反"打电话只有声音"的
-                    #   语义）。改为直接调插件的 audio_player 本地扬声器播放。
-                    played = False
-                    if (
-                        in_voice_call
-                        and audio_player is not None
-                        and current_art.audio
+                    if isinstance(current_art, Failure) or (
+                        hasattr(current_art, "metadata")
+                        and cast(dict, current_art.metadata).get("error")
                     ):
-                        try:
-                            await audio_player.play_audio(current_art.audio)
-                            played = True
-                        except Exception as exc:
-                            logger.error(
-                                f"通话中本地播放音频失败 段{current_idx}: {exc}",
-                                exc_info=True,
+                        logger.error(f"跳过播放失败段落 {current_idx}: {current_seg.text}")
+                    elif not current_art.audio:
+                        logger.error(f"跳过无音频段落 {current_idx}: {current_seg.text}")
+                    else:
+                        if current_seg.wait_before >= 0.1:
+                            await asyncio.sleep(current_seg.wait_before)
+
+                        # 关键路由分流：
+                        # - 本地直接通话（platform=local_asr）：走 backend.emit
+                        #   发 voice envelope → asr_adapter._send_platform_message
+                        #   → 本机扬声器播放。这是 SayAction 的原行为。
+                        # - QQ 等平台被 anima_chatter 接管的"打电话"场景：**不能**
+                        #   走 emit——emit 用 chat_stream.platform 路由，会把 voice
+                        #   envelope 发给 napcat 等真平台适配器，那边要么报错要么
+                        #   把音频转成 QQ 语音消息发出去（违反"打电话只有声音"的
+                        #   语义）。改为直接调插件的 audio_player 本地扬声器播放。
+                        played = False
+                        if (
+                            in_voice_call
+                            and audio_player is not None
+                            and current_art.audio
+                        ):
+                            try:
+                                await audio_player.play_audio(current_art.audio)
+                                played = True
+                            except Exception as exc:
+                                logger.error(
+                                    f"通话中本地播放音频失败 段{current_idx}: {exc}",
+                                    exc_info=True,
+                                )
+                        elif not in_voice_call:
+                            played = await backend.emit(current_art, self.chat_stream)
+
+                        if played:
+                            success_count += 1
+                            logger.info(
+                                f"已播放段落 {current_idx} ({'本地' if in_voice_call else '通过适配器'}): "
+                                f"{current_seg.text[:20]}..."
                             )
-                    elif not in_voice_call:
-                        played = await backend.emit(current_art, self.chat_stream)
 
-                    if played:
-                        success_count += 1
-                        logger.info(
-                            f"已播放段落 {current_idx} ({'本地' if in_voice_call else '通过适配器'}): "
-                            f"{current_seg.text[:20]}..."
-                        )
-
-                next_to_play += 1
+                    next_to_play += 1
 
         return True, f"已流水线处理 {success_count}/{len(segments)} 段语音播放"
 

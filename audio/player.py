@@ -41,17 +41,32 @@ _ENVELOPE_HOP_SECONDS = 1.0 / 30.0
 
 
 class AudioPlayer:
-    """串行播放音频到指定设备。"""
+    """串行播放音频到指定设备，并按目标 dBFS 做响度归一化。
 
-    def __init__(self, output_device: str = "") -> None:
+    所有走这个 player 的音频（TTS / 唱歌 / 任何 ``play_audio`` 调用）都会
+    被同一目标响度统一拉齐——避免直播间观众听到时一会儿大一会儿小。
+    """
+
+    def __init__(
+        self,
+        output_device: str = "",
+        *,
+        loudness_target_dbfs: float | None = -20.0,
+    ) -> None:
         """初始化音频播放器。
 
         Args:
             output_device: ``设备名@驱动`` 或纯设备名；为空则使用系统默认。
+            loudness_target_dbfs: 目标 RMS 响度（dBFS）。所有播放的音频会被
+                统一拉到这个响度——TTS 自带的音量 / 翻唱歌曲音量 / 其它任何
+                走 :meth:`play_audio` 的内容都按这个值归一化。
+                推荐值 ``-20`` ~ ``-16``（直播 / 流媒体常用）。设为 ``None``
+                关闭归一化，按原始音量播放。
         """
 
         self.output_device_name: str = (output_device or "").strip()
         self.output_device_id: int | None = None
+        self.loudness_target_dbfs: float | None = loudness_target_dbfs
         self._play_lock = asyncio.Lock()
         # 主路径（WASAPI + latency=high）一旦失败，记住后续直接走 MME 备用路径，
         # 避免每条音频都浪费 ~1 秒走重试链路。
@@ -142,7 +157,12 @@ class AudioPlayer:
             return None
 
     async def play_audio(self, audio_data: bytes) -> None:
-        """异步播放 WAV bytes，等待播放完成。"""
+        """异步播放音频 bytes（任何 ``soundfile`` 能解码的格式），等待播放完成。
+
+        播放前会按 ``loudness_target_dbfs`` 把响度归一化到统一目标——TTS
+        说话和翻唱歌曲都走同一个目标，避免直播间观众听到一会儿响一会儿轻。
+        ``loudness_target_dbfs`` 设为 ``None`` 时跳过归一化（按原音量播放）。
+        """
 
         if not audio_data:
             logger.warning("接收到的音频数据为空，跳过播放。")
@@ -155,6 +175,19 @@ class AudioPlayer:
 
                 if data.dtype != np.float32:
                     data = data.astype(np.float32)
+
+                # ── 响度归一化 ───────────────────────────
+                # 在算 envelope / 播放前把 RMS 拉到目标 dBFS。这样：
+                # - VTS 的麦克风口型 / SpeechAnimator 包络都基于归一化后的真实
+                #   播放音量，不会因为原文件偏小导致动作幅度不够；
+                # - 多次连续播放（say + sing_song 交替）观众听感一致。
+                # 整段内联用 numpy，大约 1ms / 5 分钟立体声，开销可忽略。
+                if self.loudness_target_dbfs is not None:
+                    from .loudness import normalize_audio_array
+
+                    data = normalize_audio_array(
+                        data, target_dbfs=self.loudness_target_dbfs
+                    )
 
                 # 在 sd.play 之前先算好 envelope。这是一段已经在内存里的 PCM，
                 # 离线计算很快（10s 音频大概 1ms 量级）。这样 SpeechAnimator

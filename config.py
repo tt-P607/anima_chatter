@@ -219,6 +219,16 @@ class AnimaChatterConfig(BaseConfig):
                 "避免显得乱抖；调到 0.0 等于平静时完全不动。"
             ),
         )
+        loudness_target_dbfs: float = Field(
+            default=-20.0,
+            description=(
+                "全局响度目标（dBFS）。AudioPlayer 在播放任何音频（TTS / 唱歌 / "
+                "其它）前，会按 RMS 把响度统一拉到这个值——不同 TTS 生成结果"
+                "和翻唱歌曲音量再不齐也会被拉齐，直播间观众听感一致。"
+                "推荐 -20 ~ -16（直播 / 流媒体常用）。"
+                "设为 0 关闭归一化，按原音量播放。"
+            ),
+        )
 
     @config_section("idle_animation", title="待机动画频率 / 幅度")
     class IdleAnimationSection(SectionBase):

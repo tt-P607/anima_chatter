@@ -41,7 +41,7 @@ VTube Studio 虚拟形象互动 + 实时语音通话 + 直播弹幕，三模式�
 
 | 插件 | 必需 | 用途 |
 |------|----|----|
-| [`asr_adapter`](../asr_adapter/) | voice 模式必需 | ASR 实时语音输入 + 转发路由 |
+| [`asr_adapter_anima`](../asr_adapter_anima/) | voice 模式必需 | ASR 实时语音输入 + 转发路由 |
 | [`tts_http_server`](../tts_http_server/) | 三模式必需 | TTS HTTP 后端 |
 | [`bilibili_live_adapter`](../bilibili_live_adapter/) | vtb_live 才需要 | B 站直播弹幕入站 |
 | `pyvts >= 0.3.3` | vtb / vtb_live 才需要 | VTube Studio API 客户端 |
@@ -60,7 +60,7 @@ VTube Studio 虚拟形象互动 + 实时语音通话 + 直播弹幕，三模式�
 
 ## 快速上手（语音通话场景）
 
-1. 确保 `asr_adapter` 已加载（即便配置为 `enabled = false` 也可以，插件会自动按需启动）。
+1. 确保 `asr_adapter_anima` 已加载（即便配置为 `enabled = false` 也可以，插件会自动按需启动）。
 2. 在 QQ 私聊中对模型说"想跟你语音聊"，模型会调用 `start_voice_call`。
 3. 听到"我打给你吧"提示后，直接对着麦克风说话即可（无需按键，通话期间 ASR 强制 `always_on`）。
 4. 挂断：模型说"挂了"或双方安静超过 5 分钟。

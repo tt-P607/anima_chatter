@@ -22,10 +22,13 @@ from src.core.prompt import get_prompt_manager
 from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry
 from src.kernel.llm.payload.tooling import LLMUsable
 
+from pathlib import Path
+
 from .actions import (
     EndVoiceCallAction,
     SayAction,
     SayAndPerformAction,
+    SingSongAction,
     StartVoiceCallAction,
     AnimaPassAndWaitAction,
 )
@@ -41,6 +44,7 @@ from .prompts import (
     AnimaChatterPromptBuilder,
 )
 from .runner import run_voice_conversation
+from .song_library import SongLibrary
 from .sub_agent import VOICE_CHATTER_SUB_AGENT_PROMPT_TEMPLATE
 from .vts import VTSPerformer
 
@@ -61,9 +65,9 @@ class AnimaChatter(BaseChatter):
         "语音通话与 VTube Studio 虚拟形象互动通用 Chatter。"
         "platform=local_asr 时为实时通话模式；其他平台需通过 /vtb on 显式接管。"
     )
-    associated_platforms = ["local_asr"]
+    associated_platforms = ["local_asr", "bilibili_live"]
     chat_type = ChatType.ALL
-    dependencies = ["asr_adapter:adapter:asr_adapter"]
+    dependencies = ["asr_adapter_anima:adapter:asr_adapter_anima"]
 
     # 默认值；apply_stream_runtime_options 会按 platform 动态覆写。
     stream_tick_interval = 0.1
@@ -244,11 +248,13 @@ class AnimaChatterPlugin(BasePlugin):
         "anima_chatter：sherpa-onnx ASR 实时语音通话 + VTube Studio 虚拟形象互动 通用 Chatter"
     )
     configs = [AnimaChatterConfig]
-    dependent_components = ["asr_adapter:adapter:asr_adapter"]
+    dependent_components = ["asr_adapter_anima:adapter:asr_adapter_anima"]
 
     # vtb 模式运行时资源；on_plugin_loaded 中按配置初始化。
     audio_player: AudioPlayer | None = None
     vts_performer: VTSPerformer | None = None
+    # 直播清唱歌库；扫描 plugins/anima_chatter/songs/ 目录下的清唱文件。
+    song_library: SongLibrary | None = None
 
     async def on_plugin_loaded(self) -> None:
         """注册提示词模板，并按配置初始化 VTB 资源（AudioPlayer + VTS）。"""
@@ -342,7 +348,40 @@ class AnimaChatterPlugin(BasePlugin):
             )
             return
 
-        self.audio_player = AudioPlayer(output_device=config.vts.audio_output_device)
+        # 0 表示关闭响度归一化；否则把目标 dBFS 传给 AudioPlayer。
+        loudness_target = float(config.audio_drive.loudness_target_dbfs)
+        loudness_arg: float | None = (
+            None if loudness_target == 0.0 else loudness_target
+        )
+        self.audio_player = AudioPlayer(
+            output_device=config.vts.audio_output_device,
+            loudness_target_dbfs=loudness_arg,
+        )
+        if loudness_arg is None:
+            logger.info("响度归一化已关闭（按原音量播放所有音频）")
+        else:
+            logger.info(
+                f"响度归一化已启用：目标 {loudness_arg:.1f} dBFS"
+                "（TTS 说话 / 唱歌 / 其它播放统一拉齐）"
+            )
+
+        # 初始化直播清唱歌库（自动扫描 plugins/anima_chatter/songs/ 目录）
+        plugin_dir = Path(__file__).resolve().parent
+        try:
+            self.song_library = SongLibrary(plugin_dir=plugin_dir)
+            song_count = len(self.song_library.get_song_names())
+            if song_count > 0:
+                logger.info(
+                    f"清唱歌库已加载 {song_count} 首：{self.song_library.songs_dir}"
+                )
+            else:
+                logger.info(
+                    f"清唱歌库为空（路径：{self.song_library.songs_dir}），"
+                    "把清唱文件放进去后无需重启即可被 sing_song action 识别。"
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"清唱歌库初始化失败: {exc}")
+            self.song_library = None
 
         if config.vts.enabled:
             self.vts_performer = VTSPerformer(
@@ -379,6 +418,7 @@ class AnimaChatterPlugin(BasePlugin):
             AnimaChatter,
             SayAction,
             SayAndPerformAction,
+            SingSongAction,
             AnimaPassAndWaitAction,
             StartVoiceCallAction,
             EndVoiceCallAction,
@@ -391,6 +431,7 @@ __all__ = [
     "EndVoiceCallAction",
     "SayAction",
     "SayAndPerformAction",
+    "SingSongAction",
     "AnimaChatter",
     "AnimaChatterPlugin",
     "StartVoiceCallAction",

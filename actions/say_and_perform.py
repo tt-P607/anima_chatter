@@ -36,6 +36,7 @@ from src.core.components.base import Failure
 from src.core.components.base.action import BaseAction
 
 from ..config import AnimaChatterConfig
+from ..heartbeat import feed_watchdog_during
 from ..markers import parse_speech_segments
 from ..sub_agent import mark_reply_success
 from ..tts import TTSRequest, _retry_empty_audio, build_tts_backend
@@ -156,6 +157,34 @@ class SayAndPerformAction(BaseAction):
             " - SCARED_SHRINK：害怕收身低头\n"
             "选最匹配本句话语气的一个，不要硬选——日常叙述就 NARRATING。",
         ] = "NARRATING",
+        style: Annotated[
+            str,
+            "TTS 语音风格，决定参考音色和语气基调。可选：\n"
+            " - default：默认音色（中性叙述、日常对话首选，绝大多数场景用这个）\n"
+            " - 活泼：更明亮俏皮、笑意更足；适合开心调皮、撒娇、被夸时使用\n"
+            " - 难过：更柔软低沉、带哽咽感；适合共情、失落、严肃话题\n"
+            "切换风格不要太频繁——情绪有明显起伏时再换，平时保持 default。",
+        ] = "default",
+        language: Annotated[
+            str,
+            "整段 content 的语言代码——决定 TTS 用哪一套语言引擎来朗读。\n"
+            "**选 language 的核心原则**：看你这次 content 实际**要被读成哪种语言**就选哪个，"
+            "和文字写出来是不是汉字无关。比如「係」「嘅」「咩」「喺度」写出来是汉字、"
+            "但要朗读成粤语，应选 yue 而不是 zh；选错了 TTS 会用错引擎，比如粤语句子"
+            "用 zh 朗读会变成普通话生硬念粤字。\n"
+            "**可选值（只填代码本身，不填括号内的说明文字）**：\n"
+            "混合模式（文本中包含多种语言或外来词时选此类）：\n"
+            "  zh — 中文为主（夹杂英文）  en — 英文为主（夹杂其他语言）\n"
+            "  ja — 日文为主（夹杂英文）  yue — 粤语（夹杂英文）\n"
+            "  ko — 韩文（夹杂英文）      auto — 自动识别多语种\n"
+            "  auto_yue — 自动识别（含粤语优先）\n"
+            "纯语言模式（文本仅含单一语言时优先选此类，推理效果更好）：\n"
+            "  all_zh — 纯中文  all_ja — 纯日文  all_yue — 纯粤语  all_ko — 纯韩文\n"
+            "**整段只能是一种语言**——一次 say_and_perform 调用所有 content 共享同一个 language。"
+            "如果你想在一次回复里**先说普通话再说其他语言**（比如先用普通话开场再切粤语），"
+            "请**分两次** say_and_perform 调用，每次用对应的 language；"
+            "不要把多种语言塞进同一次调用。",
+        ] = "zh",
     ) -> tuple[bool, str]:
         """发文本 → TTS 合成 → 本地播放 + VTS 表演。"""
 
@@ -235,6 +264,20 @@ class SayAndPerformAction(BaseAction):
         backend = build_tts_backend(plugin_config, logger)
         semaphore = asyncio.Semaphore(max_parallel)
 
+        # 把 style / language 透传给 TTS provider：通过 TTSRequest.markers 字段。
+        # tts_voice_plugin-neo 的 TTSVoiceProvider 会读 markers["style"] 和
+        # markers["language"]，分别决定语音风格（参考音色）和文本语言代码。
+        # markers 是按段构造的，所以需要为每个 segment 合并：seg.markers 自身
+        # （行内标记给的）+ 顶层 style/language。seg.markers 优先（行内标记
+        # 应该能覆盖默认）。
+        def _build_markers_for_seg(seg: Any) -> dict[str, Any]:
+            """合并 segment 自身 markers + 本次 action 的 style / language。"""
+
+            base = dict(getattr(seg, "markers", None) or {})
+            base.setdefault("style", style)
+            base.setdefault("language", language)
+            return base
+
         async def synthesize_one(seg: Any, idx: int) -> tuple[int, Any]:
             try:
                 async with semaphore:
@@ -243,7 +286,7 @@ class SayAndPerformAction(BaseAction):
                             stream_id=self.chat_stream.stream_id,
                             text=seg.text,
                             emotion=seg.emotion,
-                            markers=seg.markers,
+                            markers=_build_markers_for_seg(seg),
                         )
                     )
                     if not artifact.audio and empty_audio_retry_count > 0:
@@ -259,7 +302,16 @@ class SayAndPerformAction(BaseAction):
                 logger.error(f"TTS 合成段落 {idx} 失败: {exc}")
                 return idx, Failure(str(exc))
 
-        tasks = [synthesize_one(seg, i) for i, seg in enumerate(segments)]
+        # 关键性能优化：用 asyncio.create_task 把合成任务**立即挂到事件循环**，
+        # 而不是等到 ``consume_in_order`` 里 ``asyncio.as_completed`` 才包装。
+        # 这样多个 say_and_perform action 同时被调度时，每个 action 的合成都
+        # 在拿 VTS performer 锁之前就开始跑——前一个 action 在播放音频时，
+        # 后一个 action 的 TTS 已经在 GSV 服务器上推理了，避免"播放完才合成"
+        # 的串行浪费。配合下方 consume_in_order 用 wait_for 顺序消费即可。
+        tasks: list[asyncio.Task[tuple[int, Any]]] = [
+            asyncio.create_task(synthesize_one(seg, i))
+            for i, seg in enumerate(segments)
+        ]
 
         # 取顶层 emotion 主类型（happy / sad / ...），用作行内 motion 切换时
         # expression 命中的兜底键（intent 不命中 expression_map 时退回 emotion）。
@@ -273,68 +325,70 @@ class SayAndPerformAction(BaseAction):
             - segment.motion 有值：用它切（行内 [motion:X] 标记）。
             - segment.motion 为 None：切回顶层 intent（标记块外 / 标记结束后）。
             没有 performer（VTS 未连）时整段静默跳过这一切。
+
+            注意：tasks 已经是 ``asyncio.create_task`` 提前挂上事件循环的对象，
+            合成在拿 VTS 锁之前已经开始跑了。这里只需按 idx 顺序 await 即可，
+            前段播放期间后段会持续在 GSV 上推理。
             """
 
             next_to_play = 0
-            completed: dict[int, Any] = {}
             played = 0
 
-            for fut in asyncio.as_completed(tasks):
-                idx, artifact = await fut
-                completed[idx] = artifact
+            while next_to_play < len(tasks):
+                cur_idx = next_to_play
+                _, cur_art = await tasks[cur_idx]
+                cur_seg = segments[cur_idx]
 
-                while next_to_play in completed:
-                    cur_idx = next_to_play
-                    cur_art = completed.pop(cur_idx)
-                    cur_seg = segments[cur_idx]
+                if isinstance(cur_art, Failure) or (
+                    hasattr(cur_art, "metadata")
+                    and cast(dict, cur_art.metadata).get("error")
+                ):
+                    logger.error(f"跳过失败段 {cur_idx}: {cur_seg.text[:30]}...")
+                elif not cur_art.audio:
+                    logger.error(f"跳过空音频段 {cur_idx}: {cur_seg.text[:30]}...")
+                else:
+                    if cur_seg.wait_before >= 0.1:
+                        await asyncio.sleep(cur_seg.wait_before)
 
-                    if isinstance(cur_art, Failure) or (
-                        hasattr(cur_art, "metadata")
-                        and cast(dict, cur_art.metadata).get("error")
-                    ):
-                        logger.error(f"跳过失败段 {cur_idx}: {cur_seg.text[:30]}...")
-                    elif not cur_art.audio:
-                        logger.error(f"跳过空音频段 {cur_idx}: {cur_seg.text[:30]}...")
-                    else:
-                        if cur_seg.wait_before >= 0.1:
-                            await asyncio.sleep(cur_seg.wait_before)
-
-                        # 关键时序：首段音频"已经合成完准备播放"时，才真正
-                        # 触发 VTS 动作链（speaking + performing + hotkey + 顶层
-                        # expression）。这样推理过程中 VTB 维持 IDLE，避免出现
-                        # 「动作先动起来，过几秒才发声」的诡异画面。
-                        # start_speech_playback 是幂等的，后续段调用是 no-op。
-                        if performer is not None:
-                            await performer.start_speech_playback()
-                            # 行内 motion 切换：每段播放前根据 segment.motion 切 intent。
-                            # segment.motion 为 None 时切回顶层 intent，自然实现"标记块
-                            # 结束就归位"。
-                            seg_intent = cur_seg.motion or intent
-                            await performer.switch_segment_intent(
-                                seg_intent,
-                                emotion_main_for_expression=emotion_main,
-                            )
-                            await performer.play(cur_art.audio)
-                        elif audio_player is not None:
-                            await audio_player.play_audio(cur_art.audio)
-                        played += 1
-                        seg_intent_log = cur_seg.motion or intent
-                        logger.info(
-                            f"已播放段 {cur_idx}: {cur_seg.text[:20]}... "
-                            f"emotion={emotion} intent={seg_intent_log}"
+                    # 关键时序：首段音频"已经合成完准备播放"时，才真正
+                    # 触发 VTS 动作链（speaking + performing + hotkey + 顶层
+                    # expression）。这样推理过程中 VTB 维持 IDLE，避免出现
+                    # 「动作先动起来，过几秒才发声」的诡异画面。
+                    # start_speech_playback 是幂等的，后续段调用是 no-op。
+                    if performer is not None:
+                        await performer.start_speech_playback()
+                        # 行内 motion 切换：每段播放前根据 segment.motion 切 intent。
+                        # segment.motion 为 None 时切回顶层 intent，自然实现"标记块
+                        # 结束就归位"。
+                        seg_intent = cur_seg.motion or intent
+                        await performer.switch_segment_intent(
+                            seg_intent,
+                            emotion_main_for_expression=emotion_main,
                         )
+                        await performer.play(cur_art.audio)
+                    elif audio_player is not None:
+                        await audio_player.play_audio(cur_art.audio)
+                    played += 1
+                    seg_intent_log = cur_seg.motion or intent
+                    logger.info(
+                        f"已播放段 {cur_idx}: {cur_seg.text[:20]}... "
+                        f"emotion={emotion} intent={seg_intent_log}"
+                    )
 
-                    next_to_play += 1
+                next_to_play += 1
             return played
 
         # 把整次说话作为一个完整周期：进入时设一次 emotion / intent / speaking=True，
         # 中间所有段共享，退出时再统一收尾。这样段间切换不会让 SpeechAnimator
         # 进入 emotion 缓退状态机。
-        if performer is not None:
-            async with performer.speaking_session(emotion=emotion, intent=intent):
+        # 整段播放期间 generator 会 await 几十秒不 yield，需要主动喂 watchdog
+        # 避免触发 stream_warning_threshold / stream_restart_threshold。
+        async with feed_watchdog_during(self.chat_stream.stream_id):
+            if performer is not None:
+                async with performer.speaking_session(emotion=emotion, intent=intent):
+                    success_count = await consume_in_order()
+            else:
                 success_count = await consume_in_order()
-        else:
-            success_count = await consume_in_order()
 
         return True, f"已播放 {success_count}/{len(segments)} 段"
 

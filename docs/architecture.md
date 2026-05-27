@@ -119,7 +119,7 @@ while not stopping:
     build_history + build_user_prompt(mode) → 注入 LLM 上下文
     LLM call → tool calls
     分发：
-      - say / say_and_perform → 进 TTS → 进 audio / asr_adapter
+      - say / say_and_perform → 进 TTS → 进 audio / asr_adapter_anima
       - pass_and_wait → 标记本轮等待
     根据 enable_action_suspend 决定是 yield Wait() 还是继续 follow-up
 ```

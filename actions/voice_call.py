@@ -11,7 +11,7 @@
         │  → 调用 start_voice_call action
         │
         ▼
-    本插件接管该 stream + asr_adapter 转发到 QQ stream
+    本插件接管该 stream + asr_adapter_anima 转发到 QQ stream
         │
         │  期间：模型 say -> TTS 本地播放
         │        用户说话 -> ASR -> 注入 QQ stream unread
@@ -53,7 +53,7 @@ logger = get_logger("anima_chatter.action.voice_call")
 _VOICE_CHATTER_SIGNATURE = "anima_chatter:chatter:anima_chatter"
 
 # asr_adapter 的转发服务签名。
-_ASR_REDIRECT_SERVICE = "asr_adapter:service:asr_redirect"
+_ASR_REDIRECT_SERVICE = "asr_adapter_anima:service:asr_redirect"
 
 # 事件名（与设计文档第 10 节一致；kfc handler 会订阅 ended）。
 EVENT_VOICE_CALL_STARTED = "voice_call.started"
@@ -123,7 +123,7 @@ async def _start_asr_voice_session(
     if service is None or not hasattr(service, "start_voice_call_session"):
         logger.error(
             f"未找到 {_ASR_REDIRECT_SERVICE} 服务（或版本过旧），无法启动 ASR 通话会话。"
-            "请检查 asr_adapter 是否启用 + 版本是否 >= 1.1.0"
+            "请检查 asr_adapter_anima 是否启用 + 版本是否 >= 1.1.0"
         )
         return False
     try:
