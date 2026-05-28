@@ -14,7 +14,7 @@ from src.core.components.base import Failure
 from src.core.components.base.action import BaseAction
 from src.kernel.concurrency import get_task_manager
 
-from .. import call_state
+# call_state 移至方法内局部延迟导入，以防模块初始化时循环导入
 from ..config import AnimaChatterConfig
 from ..heartbeat import feed_watchdog_during
 from ..markers import parse_speech_segments
@@ -53,7 +53,8 @@ class SayAction(BaseAction):
 
         if self.chat_stream.platform == "local_asr":
             return True
-        return await call_state.is_call_active_for_stream(self.chat_stream.stream_id)
+        from .. import call_state as _cs
+        return await _cs.is_call_active_for_stream(self.chat_stream.stream_id)
 
     async def execute(
         self,
@@ -66,22 +67,15 @@ class SayAction(BaseAction):
         ] = "default",
         language: Annotated[
             str,
-            "整段 content 的语言代码——决定 TTS 用哪一套语言引擎来朗读。\n"
-            "**选 language 的核心原则**：看你这次 content 实际**要被读成哪种语言**就选哪个，"
-            "和文字写出来是不是汉字无关。比如「係」「嘅」「咩」「喺度」写出来是汉字、"
-            "但要朗读成粤语，应选 yue 而不是 zh；选错了 TTS 会用错引擎，比如粤语句子"
-            "用 zh 朗读会变成普通话生硬念粤字。\n"
-            "**可选值（只填代码本身，不填括号内的说明文字）**：\n"
-            "混合模式（文本中包含多种语言或外来词时选此类）：\n"
-            "  zh — 中文为主（夹杂英文）  en — 英文为主（夹杂其他语言）\n"
-            "  ja — 日文为主（夹杂英文）  yue — 粤语（夹杂英文）\n"
-            "  ko — 韩文（夹杂英文）      auto — 自动识别多语种\n"
-            "  auto_yue — 自动识别（含粤语优先）\n"
-            "纯语言模式（文本仅含单一语言时优先选此类，推理效果更好）：\n"
+            "朗读文本的语言代码，决定 TTS 引擎选择。\n"
+            "【核心原则】根据实际朗读语言选择，而非文字形式。例如粤语「係」「嘅」虽是汉字，但应选 yue 而非 zh。\n"
+            "【可选值】\n"
+            "混合模式（文本含多语言或外来词）：\n"
+            "  zh — 中文为主（夹杂英文）  en — 英文为主  ja — 日文为主（夹杂英文）\n"
+            "  yue — 粤语（夹杂英文）  ko — 韩文（夹杂英文）  auto — 自动识别多语种  auto_yue — 自动识别（含粤语优先）\n"
+            "纯语言模式（文本仅含单一语言，推理效果更好）：\n"
             "  all_zh — 纯中文  all_ja — 纯日文  all_yue — 纯粤语  all_ko — 纯韩文\n"
-            "**整段只能是一种语言**——一次 say 调用所有 content 共享同一个 language。"
-            "想先说普通话再说其他语言，请**分两次** say 调用，每次用对应的 language；"
-            "不要把多种语言塞进同一次调用。",
+            "【重要】一次调用所有内容必须共享同一个语言，跨语言时请分多次调用。",
         ] = "zh",
     ) -> tuple[bool, str]:
         """执行语音播放动作。"""
@@ -101,11 +95,12 @@ class SayAction(BaseAction):
 
         # 通话期间记录 bot 说的话——把所有 segment 的 text 拼起来作为本次发言。
         # 这样 voice_call.ended 事件 payload 才能完整包含通话中的 user/assistant 对。
-        in_voice_call = await call_state.is_call_active_for_stream(self.chat_stream.stream_id)
+        from .. import call_state as _cs
+        in_voice_call = await _cs.is_call_active_for_stream(self.chat_stream.stream_id)
         if in_voice_call:
             spoken_text = " ".join(seg.text for seg in segments if seg.text).strip()
             if spoken_text:
-                await call_state.record_assistant_message(
+                await _cs.record_assistant_message(
                     self.chat_stream.stream_id, spoken_text
                 )
 

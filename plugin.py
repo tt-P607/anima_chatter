@@ -45,7 +45,11 @@ from .prompts import (
 )
 from .runner import run_voice_conversation
 from .song_library import SongLibrary
-from .sub_agent import VOICE_CHATTER_SUB_AGENT_PROMPT_TEMPLATE
+from .sub_agent import (
+    VOICE_CHATTER_SUB_AGENT_PROMPT_TEMPLATE,
+    SUB_AGENT_PROMPT_VTB,
+    SUB_AGENT_PROMPT_LIVE,
+)
 from .vts import VTSPerformer
 
 
@@ -325,10 +329,24 @@ class AnimaChatterPlugin(BasePlugin):
             },
         )
 
-        # vtb 模式 sub-agent（"是否要回复"决策器）prompt。
+        # vtb 模式 sub-agent（"是否要回复"决策器）prompt —— 区分群聊与直播。
         get_prompt_manager().get_or_create(
-            name="anima_chatter_sub_agent_prompt",
-            template=VOICE_CHATTER_SUB_AGENT_PROMPT_TEMPLATE,
+            name="anima_chatter_sub_agent_prompt_vtb",
+            template=SUB_AGENT_PROMPT_VTB,
+            policies={
+                "nickname": optional(personality.nickname),
+                "bot_id": optional(""),
+                "bot_id_section": optional(""),
+                "personality_core_section": optional(personality.personality_core)
+                .then(wrap("它的核心人格是：", "\n")),
+                "personality_side_section": optional(personality.personality_side)
+                .then(wrap("它的人格侧面是：", "\n")),
+            },
+        )
+
+        get_prompt_manager().get_or_create(
+            name="anima_chatter_sub_agent_prompt_vtb_live",
+            template=SUB_AGENT_PROMPT_LIVE,
             policies={
                 "nickname": optional(personality.nickname),
                 "bot_id": optional(""),
@@ -365,10 +383,10 @@ class AnimaChatterPlugin(BasePlugin):
                 "（TTS 说话 / 唱歌 / 其它播放统一拉齐）"
             )
 
-        # 初始化直播清唱歌库（自动扫描 plugins/anima_chatter/songs/ 目录）
+        # 初始化直播清唱歌库（统一移到全局 data/anima_chatter/songs/ 目录）
         plugin_dir = Path(__file__).resolve().parent
         try:
-            self.song_library = SongLibrary(plugin_dir=plugin_dir)
+            self.song_library = SongLibrary(plugin_dir=plugin_dir, songs_rel_path="")
             song_count = len(self.song_library.get_song_names())
             if song_count > 0:
                 logger.info(

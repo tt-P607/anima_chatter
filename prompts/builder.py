@@ -94,7 +94,7 @@ class AnimaChatterPromptBuilder:
             base = VOICE_SCENE_GUIDE
             if chat_stream is None:
                 return base
-            # 检查 anima_chatter 接管的"主动通话"语境（QQ 等私聊升级到通话）
+            # 延迟局部导入，避免在模块初始化（Import Time）引发循环导入
             from .. import call_state as _cs
 
             active = _cs._active_call  # noqa: SLF001 — 同插件读模块级单例
@@ -156,9 +156,7 @@ class AnimaChatterPromptBuilder:
 
         # 用 <expression_hints> 标签把额外说明圈起来，与 base 文案视觉分离。
         # 文案目标：让模型**积极使用**这些预设动作，但保持自然灵活
-        # ——不是"每条都要切一个"，而是"该激动就大方激动起来、该撒娇就大方
-        # 撒娇起来"。表演型 chatter 的精髓在于"敢动"，沉默式 NARRATING 太多
-        # 反而让虚拟形象显得呆。
+        # ——根据 Live2D 动作本身的特点在适合的语境下触发，避免机械硬套。
         suffix = (
             "\n\n<expression_hints>\n"
             "**虚拟形象的「招牌」动作触发表**：下面这些 intent / emotion 已经在 "
@@ -166,17 +164,11 @@ class AnimaChatterPromptBuilder:
             "最有辨识度的几个表演动作。\n"
             "\n"
             "选择策略——**敢用、积极用，但要自然**：\n"
-            "- 情绪有起伏的句子优先从这表里挑：心情好就用 EXCITED / PROUD_LIFT，"
-            "被夸 / 害羞就用 SHY_DOWN，调皮就 PLAYFUL_TILT 或 MISCHIEF。\n"
-            "- 一段对话里**鼓励**多种动作交替——比如开场 EXCITED，中间穿插 "
-            "PROUD_LIFT 或 SHY_DOWN，结尾再回 NARRATING——让虚拟形象看起来"
-            "鲜活有戏，而不是一直一个姿势。\n"
-            "- 但**不要硬切**：每条只选一个最贴合当下情绪的；找不到合适的就用 "
-            "NARRATING（默认叙述）兜底，比硬塞动作显得更自然。\n"
-            "- 行内 ``[motion:NAME]`` 标记是高级用法——一段话里语义明显切换时"
-            "（比如从害羞转兴奋）用它；普通对话保持单一 intent 就够。\n"
+            "- 一段对话里**鼓励**多种动作随语境交替，让虚拟形象看起来鲜活有戏，而不是一直一个姿势。\n"
+            "- 每条回复只选一个最贴合当下情绪的；找不到非常贴切的就用 NARRATING（默认叙述）兜底。\n"
+            "- 行内 ``[motion:NAME]`` 标记是高级用法——一段话里语义明显切换时用它，普通对话保持单一 intent 就够。\n"
             "\n"
-            "**预设动作清单**（描述写得越具体的越值得在对应语境里用）：\n"
+            "**预设动作清单**：\n"
             + "\n".join(lines)
             + "\n</expression_hints>"
         )

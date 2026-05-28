@@ -4,11 +4,7 @@ __pycache__/
 .pytest_cache/
 .vscode/
 .idea/
-
-# 本地私人/调试文件
-actions/sing_song.py
-audio/loudness.py
-heartbeat.py
-song_library.py
-songs/
 dist/
+data/
+*.log
+
