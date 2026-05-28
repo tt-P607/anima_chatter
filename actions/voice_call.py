@@ -300,10 +300,8 @@ class StartVoiceCallAction(BaseAction):
             await call_state.clear_active_call()
             return False, "未找到 anima_chatter 组件，无法接管"
 
-        if existing is not None:
-            chat_api.unregister_active_chatter(stream_id)
         instance = chatter_cls(stream_id=stream_id, plugin=self.plugin)
-        chat_api.register_active_chatter(stream_id, instance)
+        chat_api.bind_chatter_for_stream(stream_id, instance)
         await _restart_stream_loop(stream_id)
 
         # ── 5) 接通提示 ─────────────────
@@ -478,7 +476,7 @@ async def _finalize_call(
     # 也要尽早做：anima_chatter 主循环还在跑就可能继续生成消息。
     existing = chat_api.get_chatter_by_stream(stream_id)
     if existing is not None and existing.__class__.get_signature() == _VOICE_CHATTER_SIGNATURE:
-        chat_api.unregister_active_chatter(stream_id)
+        chat_api.restore_stream_to_default(stream_id)
     await _restart_stream_loop(stream_id)
 
     # ── 3) 告别词录入 + TTS 本地播放（不发回 QQ 文本） ──

@@ -37,14 +37,17 @@ VTube Studio 虚拟形象互动 + 实时语音通话 + 直播弹幕，三模式�
 | `anima_chatter:command:vtb` | Command | `/vtb on/off/status`，手动接管 VTB 模式 |
 | `anima_chatter:command:voice` | Command | `/voice off/status`，语音通话兜底控制 |
 
-## 依赖
+## 依赖与配套关系
 
-| 插件 | 必需 | 用途 |
+为了使用本插件的 **实时语音通话** 功能，您**必须**搭配使用以下定制版本的配套插件，原版插件无法兼容：
+
+| 插件名称 | 必需性 | 作用与来源 |
 |------|----|----|
-| [`asr_adapter_anima`](../asr_adapter_anima/) | voice 模式必需 | ASR 实时语音输入 + 转发路由 |
-| [`tts_http_server`](../tts_http_server/) | 三模式必需 | TTS HTTP 后端 |
-| [`bilibili_live_adapter`](../bilibili_live_adapter/) | vtb_live 才需要 | B 站直播弹幕入站 |
-| `pyvts >= 0.3.3` | vtb / vtb_live 才需要 | VTube Studio API 客户端 |
+| [`asr_adapter_anima`](../asr_adapter_anima/) | voice 模式必需 | 定制版 ASR 适配器。由言柒定制提供 `asr_redirect` 文本重定向与按需启动服务。➜ [GitHub 仓库](https://github.com/tt-P607/asr_adapter_anima) |
+| [`funasr_asr_provider_anima`](../funasr_asr_provider_anima/) | voice 模式必需 | 定制版 FunASR 后端提供商。用于向 ASR 适配器提供语音推理。➜ [GitHub 仓库](https://github.com/tt-P607/funasr_asr_provider_anima) |
+| [`tts_http_server`](../tts_http_server/) | 三模式必需 | 语音合成（TTS）本地服务。可以使用原作者的官方版本。 |
+| [`bilibili_live_adapter`](../bilibili_live_adapter/) | vtb_live 模式可选 | B 站直播弹幕监听适配器。可以使用官方版本。 |
+| `pyvts >= 0.3.3` | vtb / vtb_live 必需 | VTube Studio API 客户端 Python 依赖。 |
 
 ## 文档导航
 

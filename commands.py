@@ -84,12 +84,8 @@ class VTBCommand(BaseCommand):
             await self._reply("当前聊天流已经处于 VTB 模式。")
             return True, "already active"
 
-        # 释放原有 chatter，立即注册 anima_chatter。
-        if existing is not None:
-            chat_api.unregister_active_chatter(self.stream_id)
-
         instance = chatter_cls(stream_id=self.stream_id, plugin=self.plugin)
-        chat_api.register_active_chatter(self.stream_id, instance)
+        chat_api.bind_chatter_for_stream(self.stream_id, instance)
         # 重启流循环：销毁旧 chatter 生成器，下一 tick 会用 anima_chatter 重建。
         await self._force_restart_loop()
 
@@ -117,7 +113,7 @@ class VTBCommand(BaseCommand):
             )
             return True, "not vtb"
 
-        chat_api.unregister_active_chatter(self.stream_id)
+        chat_api.restore_stream_to_default(self.stream_id)
         # 重启流循环：销毁旧 anima_chatter 生成器，下一 tick 会按
         # ChatType / platform 自动绑回 default_chatter。
         await self._force_restart_loop()
