@@ -72,7 +72,8 @@ hotkey_map = {}
 | `port` | int | `8001` | VTS WebSocket 端口（VTube Studio 默认） |
 | `auth_token` | str | `""` | 鉴权 token；首次留空，VTS 会弹授权窗，pyvts 自动写入 `data/anima_chatter/vts_token.txt` |
 | `audio_output_device` | str | `CABLE Input@WASAPI` | 本地播放 TTS 的 sounddevice 输出设备，格式 `设备名@驱动名`。通常指向 VB-Cable Input，让 VTS 与直播软件听到同一份音频 |
-| `hotkey_map` | dict[str, str] | `{}` | 可选：emotion / intent → VTS Hotkey ID 映射 |
+| `hotkey_map` | dict[str, str] | `{}` | 可选：intent / emotion → VTS Hotkey ID 映射，详见下文 |
+| `expression_map` | dict[str, dict[str, str]] | `{}` | 可选：intent / emotion → Live2D `.exp3.json` 文件，详见下文 |
 
 ### `hotkey_map` 用法
 
@@ -91,6 +92,35 @@ hotkey_map = { "THINKING" = "ThinkAnim", "happy" = "SmileExpr" }
 
 留空（默认）则完全不触发热键，所有表演由 emotion + intent 参数注入完成
 （嘴型 / 表情 / 头部姿态 / 身体晃动）。
+
+适合**复合 hotkey**（动画 + 道具 + 声音组合按钮）。如果你只是想切换某个
+`.exp3.json` 表情文件，用 `expression_map` 更直接。
+
+### `expression_map` 用法
+
+把 intent / emotion 映射到 Live2D 表情文件（`.exp3.json`）。走 VTS 的
+`ExpressionActivationRequest`，不需要在 VTS 里预先配 hotkey，只要文件物理
+存在于模型目录就能调用。
+
+格式：每个键映射到 `{file, desc}` 双字段：
+
+- `file` — `.exp3.json` 文件名（不含路径）
+- `desc` — 动作描述。**会被注入到模型 prompt**，让 LLM 知道选哪个 intent 会触
+  发什么表情；这一段是模型选对率的关键，描述写得越具体生动，场景化匹配越准
+
+```toml
+[vts.expression_map]
+EXCITED     = { file = "expression17.exp3.json", desc = "兴奋时左手高举挥舞" }
+PROUD_LIFT  = { file = "expression18.exp3.json", desc = "得意时双手比心炫耀" }
+```
+
+匹配规则与 `hotkey_map` 一致：先按 intent 名（已大写归一）查，没命中再按
+emotion 主类型查。
+
+**互斥设计**——每次说话最多激活一个表情，避免多个手部表情同时显示（多个手
+部表情同时 active 会出现"多只手"的视觉错乱）。退出 `speaking_session` 时
+自动停用所有上次激活的表情，下一次说话时由 `_sync_expressions` 决定要不要
+重新激活。
 
 ### 找设备名
 

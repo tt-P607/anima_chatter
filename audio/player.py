@@ -27,7 +27,7 @@ import numpy as np
 import sounddevice as sd  # type: ignore
 import soundfile as sf  # type: ignore
 
-from src.kernel.logger import get_logger
+from src.app.plugin_system.api.log_api import get_logger
 
 from .envelope import EnvelopeTracker, compute_envelope
 
@@ -86,13 +86,45 @@ class AudioPlayer:
         self.output_device_name = (output_device or "").strip()
         self._resolve_device()
 
+    # 虚拟声卡名称关键词（小写匹配）。这类设备是纯软件管道，没有真实硬件
+    # pin 拓扑——PortAudio 的 WASAPI 实现在 start stream 时会查询
+    # KSPROPERTY_PIN_PHYSICALCONNECTION，虚拟设备返回 ERROR_NOT_FOUND，
+    # 直接导致 WASAPI 流启动失败。对这类设备应优先走 MME / DirectSound。
+    _VIRTUAL_DEVICE_KEYWORDS = ("cable", "virtual", "voicemeeter", "vb-audio")
+
+    def _looks_like_virtual_device(self, name: str) -> bool:
+        """根据设备名判断是否是虚拟声卡（VB-Cable / VoiceMeeter 等）。"""
+
+        lowered = name.lower()
+        return any(kw in lowered for kw in self._VIRTUAL_DEVICE_KEYWORDS)
+
     def _resolve_device(self) -> None:
-        """根据当前 output_device_name 解析 device id。"""
+        """根据当前 output_device_name 解析 device id。
+
+        若用户把虚拟声卡（VB-Cable 等）配成了 ``@WASAPI``，启动时直接给一条
+        WARNING 提示——WASAPI + 虚拟设备在 PortAudio 下注定失败（KS pin 物理
+        连接查询返回 ERROR_NOT_FOUND），运行期会每次先失败一次再 fallback 到
+        MME。建议直接把配置改成 ``@MME`` 省掉这次无谓的失败重试。
+        """
 
         if not self.output_device_name:
             logger.info("未配置音频输出设备，将使用系统默认输出。")
             self.output_device_id = None
             return
+
+        # 虚拟设备 + WASAPI 的组合预警（仅提示，不强制改写配置）。
+        if (
+            "@" in self.output_device_name
+            and self.output_device_name.split("@", 1)[1].strip().lower() == "wasapi"
+            and self._looks_like_virtual_device(self.output_device_name.split("@", 1)[0])
+        ):
+            logger.warning(
+                f"检测到虚拟声卡 '{self.output_device_name}' 配置为 WASAPI——"
+                "VB-Cable / VoiceMeeter 等虚拟设备在 WASAPI 下会因缺少物理 pin "
+                "拓扑而启动失败（KS pin PHYSICALCONNECTION 查询返回 ERROR_NOT_FOUND）。"
+                "建议把 audio_output_device 改为 '设备名@MME'。当前仍会尝试 WASAPI，"
+                "失败后自动 fallback 到 MME。"
+            )
 
         device_id = self._find_device_id(self.output_device_name)
         if device_id is None:
@@ -199,8 +231,11 @@ class AudioPlayer:
                 )
                 self.envelope_tracker.begin(envelope, _ENVELOPE_HOP_SECONDS)
 
+                # 推断当前 PCM 通道数（mono = 1, 多声道 = data.shape[1]）。
+                # 仅用于日志显示；真正的通道适配在 _play_sync 里按目标设备 max_output_channels 决定。
+                current_ch = 1 if data.ndim == 1 else int(data.shape[1])
                 logger.info(
-                    f"开始播放音频：{len(data)} samples @ {samplerate}Hz "
+                    f"开始播放音频：{len(data)} samples @ {samplerate}Hz, {current_ch}ch "
                     f"(device_id={self.output_device_id}) envelope_frames={len(envelope)}"
                 )
 
@@ -218,24 +253,44 @@ class AudioPlayer:
                 logger.error(f"播放音频时发生错误: {exc}")
 
     def _play_sync(self, data: Any, samplerate: int) -> None:
-        """同步播放，包含设备适配 + 主路径/MME 备用路径。"""
+        """同步播放，包含设备适配 + 主路径/MME 备用路径。
 
-        # 1) 选择目标设备并按需重采样
-        target_device_id = (
-            self._fallback_device_id
-            if self._prefer_fallback and self._fallback_device_id is not None
-            else self.output_device_id
-        )
+        **每次播放前重新解析 device id** ——sounddevice 的 device id 在 Windows
+        上不是稳定的（拔插任何 USB 音频 / VB-Cable / 蓝牙耳机都会让 id 重新分
+        配），缓存的 id 会过期触发 ``MME error 2: 使用的设备标识号已超出本地
+        系统范围``。这一段无开销（``sd.query_devices`` 在 Windows 上 < 1ms）。
+        """
+
+        # 1) 每次播放前重新解析 device id——避免缓存过期。
+        if self._prefer_fallback:
+            self._fallback_device_id = self._resolve_fallback_device_id()
+            target_device_id = self._fallback_device_id
+        else:
+            target_device_id = self._find_device_id(self.output_device_name) if self.output_device_name else None
+            self.output_device_id = target_device_id  # 同步更新缓存
 
         if target_device_id is not None:
             try:
                 dev_info = sd.query_devices(target_device_id)
                 default_rate = self._read_attr(dev_info, "default_samplerate", 44100)
                 target_rate = int(float(default_rate))
+                target_channels = int(
+                    self._read_attr(dev_info, "max_output_channels", 1) or 1
+                )
+
+                # 1) 采样率适配：差距 > 10Hz 就重采样到设备默认值。
+                #    WASAPI shared mode 严格要求采样率 = Windows mixer 当前值（一般 48kHz），
+                #    送 32kHz 进去会被 KS pin 直接拒绝。
                 if abs(samplerate - target_rate) > 10:
                     data, samplerate = self._resample(data, samplerate, target_rate)
+
+                # 2) 通道适配：mono → stereo 等。WASAPI shared mode 对通道数一样
+                #    严格——VB-Cable 的 WASAPI 输出通常 max_output_channels=2，
+                #    送 mono PCM 进去会触发 "WdmSyncIoctl: DeviceIoControl GLE=0x00000490
+                #    Windows WDM-KS error 0"（KS pin 属性拒绝）。
+                data = self._adapt_channels(data, target_channels)
             except Exception as exc:
-                logger.warning(f"采样率自动适配失败: {exc}")
+                logger.warning(f"采样率/通道自动适配失败: {exc}")
 
         # 2) 已记忆要走 MME 备用路径 → 直接播
         if self._prefer_fallback and self._fallback_device_id is not None:
@@ -252,7 +307,15 @@ class AudioPlayer:
                 logger.error(f"MME 备用路径播放失败: {exc}")
                 # 保留 _prefer_fallback=True；继续走最终回退。
 
-        # 3) 主路径：WASAPI + latency='high'
+        # 3) 主路径：按 host API 选最合适的 extra_settings。
+        #
+        #    WASAPI shared mode 严格——即使我们已对齐了采样率 + 通道数，VB-Cable
+        #    这种虚拟设备在底层查 KS pin 属性时仍可能抛 ``WdmSyncIoctl GLE 0x490
+        #    [Windows WDM-KS error 0]``。最稳的做法是显式构造
+        #    ``WasapiSettings(exclusive=False, auto_convert=True)``——让 WASAPI
+        #    在内核层自动做格式协商（SRC + channel mapping + sample format），
+        #    应用层就完全不必担心格式不匹配。
+        extra_settings = self._build_extra_settings(self.output_device_id)
         if not self._prefer_fallback:
             try:
                 sd.play(
@@ -260,11 +323,20 @@ class AudioPlayer:
                     samplerate,
                     device=self.output_device_id,
                     latency="high",
+                    extra_settings=extra_settings,
                 )
                 sd.wait()
                 return
             except Exception as exc:
-                logger.error(f"底层播放调用失败: {exc}")
+                # 对虚拟声卡（VB-Cable）来说，WASAPI 失败是**预期行为**（见
+                # _resolve_device 的说明），不是真正的错误——降级为 WARNING，
+                # 避免在终端刷红色 ERROR 吓人。真实硬件设备失败才是值得关注的。
+                if self._looks_like_virtual_device(self.output_device_name):
+                    logger.warning(
+                        f"WASAPI 主路径对虚拟声卡不可用（预期，将走 MME）: {exc}"
+                    )
+                else:
+                    logger.error(f"底层播放调用失败: {exc}")
                 # 一次失败即标记走 MME 备用路径，避免后续每次都浪费 1 秒。
                 self._cache_fallback_device_id()
                 if self._fallback_device_id is not None:
@@ -293,21 +365,124 @@ class AudioPlayer:
         except Exception as exc:
             logger.error(f"所有播放尝试均告失败: {exc}")
 
-    def _cache_fallback_device_id(self) -> None:
-        """缓存 ``设备名@MME`` 的 device id，作为主路径失败后的备用通道。"""
+    def _build_extra_settings(self, device_id: int | None) -> Any:
+        """根据目标设备的 host API 构造 sounddevice ``extra_settings``。
 
-        if self._fallback_device_id is not None or not self.output_device_name:
-            return
+        当目标 host API 是 WASAPI 时，返回
+        ``sd.WasapiSettings(exclusive=False, auto_convert=True)`` —— 让内核层
+        自动做 SRC / channel / sample format 协商，跳过 KS pin 严格属性检查。
+        其它 host API（MME / DirectSound / WDM-KS）不需要 extra_settings，
+        返回 ``None``。
+
+        Args:
+            device_id: 目标 sounddevice device id；为 None 时返回 None。
+
+        Returns:
+            ``sd.WasapiSettings`` 实例 / None。
+        """
+
+        if device_id is None:
+            return None
+        try:
+            dev_info = sd.query_devices(device_id)
+            api_idx = self._read_attr(dev_info, "hostapi", None)
+            if api_idx is None:
+                return None
+            api_info = sd.query_hostapis(int(api_idx))
+            api_name = str(self._read_attr(api_info, "name", "")).lower()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"查询 host API 类型失败（继续走默认 extra_settings）: {exc}")
+            return None
+
+        if "wasapi" in api_name:
+            try:
+                # auto_convert=True 让 WASAPI 自己做 SRC / channel mapping，
+                # 是 mono TTS PCM 走 stereo 虚拟设备的最干净路径。
+                return sd.WasapiSettings(exclusive=False, auto_convert=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"构造 WasapiSettings 失败（fall back to None）: {exc}")
+                return None
+        return None
+
+    def _resolve_fallback_device_id(self) -> int | None:
+        """每次播放前实时解析 ``设备名@MME`` 的 device id。
+
+        Windows 上 device id 不稳定，``__init__`` 里缓存的会过期。每次播放
+        都重新查 ``sd.query_devices`` —— Windows 上 < 1ms，开销可忽略。
+        """
+
+        if not self.output_device_name:
+            return None
         base = (
             self.output_device_name.split("@", 1)[0]
             if "@" in self.output_device_name
             else self.output_device_name
         )
         try:
-            fallback_id = self._find_device_id(f"{base}@MME")
+            return self._find_device_id(f"{base}@MME")
         except Exception:
-            fallback_id = None
-        self._fallback_device_id = fallback_id
+            return None
+
+    def _cache_fallback_device_id(self) -> None:
+        """首次主路径失败时记下 fallback 设备名（实际 id 解析延迟到播放时）。
+
+        这个方法仅在主路径首次失败时触发，作用只是把 ``self._fallback_device_id``
+        设成非 None 让 ``_prefer_fallback`` 切换路径。真正的 id 解析在
+        :meth:`_play_sync` 头部完成。
+        """
+
+        if self._fallback_device_id is not None or not self.output_device_name:
+            return
+        # 首次只用一次解析，后续每次播放会刷新。
+        self._fallback_device_id = self._resolve_fallback_device_id()
+
+    @staticmethod
+    def _adapt_channels(data: Any, target_channels: int) -> Any:
+        """把 PCM 数据适配到目标通道数（mono ↔ stereo ↔ N-ch）。
+
+        WASAPI / DirectSound 在 shared mode 下对通道数严格——TTS 输出常是
+        mono（1ch），但 VB-Cable 等虚拟设备的 WASAPI 输出口往往是 stereo
+        （2ch）。不做适配会触发 KS pin 属性拒绝错误，PortAudio 报：
+        ``Windows WDM-KS error 0 / WdmSyncIoctl GLE=0x00000490``。
+
+        策略：
+        - mono → multi: 复制单声道到所有目标通道；
+        - multi → mono: 取所有通道平均值；
+        - n → m (n > m): 截取前 m 个通道；
+        - n → m (n < m): 用最后一个通道补足。
+
+        Args:
+            data: ``float32`` numpy 数组，shape=(N,) 或 (N, C)。
+            target_channels: 目标通道数（≥1）。
+
+        Returns:
+            ``float32`` numpy 数组，shape=(N,) for mono、(N, target_channels) for multi。
+        """
+
+        target_channels = max(1, int(target_channels))
+        # 当前通道数：1D 视为 mono；2D 取第二维
+        current = 1 if data.ndim == 1 else int(data.shape[1])
+
+        if current == target_channels:
+            return data
+
+        # mono → multi-channel：复制
+        if current == 1:
+            mono = data if data.ndim == 1 else data[:, 0]
+            if target_channels == 1:
+                return mono.astype(np.float32, copy=False)
+            return np.tile(mono[:, np.newaxis], (1, target_channels)).astype(np.float32)
+
+        # multi → mono：取均值
+        if target_channels == 1:
+            return data.mean(axis=1).astype(np.float32)
+
+        # multi → multi（不同声道数）
+        if data.shape[1] >= target_channels:
+            return data[:, :target_channels].astype(np.float32, copy=False)
+        # 通道数不足：用最后一个声道补齐
+        pad = np.tile(data[:, -1:], (1, target_channels - data.shape[1]))
+        return np.concatenate([data, pad], axis=1).astype(np.float32)
 
     @staticmethod
     def _resample(data: Any, src_rate: int, dst_rate: int) -> tuple[Any, int]:

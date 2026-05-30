@@ -15,8 +15,9 @@ import math
 import os
 from typing import TYPE_CHECKING, Any
 
-from src.kernel.concurrency import get_task_manager
-from src.kernel.logger import get_logger
+from src.app.plugin_system.api.log_api import get_logger
+
+from .._internal_compat import create_background_task
 
 if TYPE_CHECKING:
     from .animation.base import BaseAnimator
@@ -170,19 +171,18 @@ class VTSConnection:
                 self.is_connected = True
                 logger.info("✅ VTube Studio 连接并认证成功")
 
-                tm = get_task_manager()
                 if self._heartbeat_handle is None:
-                    self._heartbeat_handle = tm.create_task(
+                    self._heartbeat_handle = create_background_task(
                         self._heartbeat_loop(),
                         name="anima_chatter.vts.heartbeat",
                     )
                 if self._animation_handle is None:
-                    self._animation_handle = tm.create_task(
+                    self._animation_handle = create_background_task(
                         self._animation_loop(),
                         name="anima_chatter.vts.animation",
                     )
                 if self._sender_handle is None:
-                    self._sender_handle = tm.create_task(
+                    self._sender_handle = create_background_task(
                         self._param_sender_loop(),
                         name="anima_chatter.vts.sender",
                     )
@@ -297,7 +297,6 @@ class VTSConnection:
                     await vts_local.request(msg)
                 # 心跳成功：清零退避状态。
                 consecutive_failures = 0
-                backoff_seconds = 5.0
             except asyncio.CancelledError:
                 logger.info("VTS 心跳循环已停止")
                 return

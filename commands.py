@@ -20,22 +20,14 @@ from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.api.send_api import send_text
 from src.app.plugin_system.base import BaseCommand, cmd_route
 from src.app.plugin_system.types import PermissionLevel
-# NOTE: 触碰内部模块（非 src.app.plugin_system.api）。
-# StreamLoopManager 当前没有暴露公开的插件 API，但切换 chatter 实例后必须
-# 重启流循环销毁缓存的 chatter 生成器，否则旧 chatter 的 execute() 仍会被
-# asend 推进，``/vtb on`` / ``/vtb off`` 会"看似执行成功但完全不生效"。
-# default_chatter / kokoro_flow_chatter 同样直接 import 此模块——属于框架历史
-# 缺口。等公开 API（例如 ``stream_api.restart_loop``）补齐后改为公开调用。
-from src.core.transport.distribution.stream_loop_manager import get_stream_loop_manager
 
 from . import call_state
-from .actions.voice_call import _finalize_call
+from ._internal_compat import restart_stream_loop
+from .constants import CHATTER_SIGNATURE as _CHATTER_SIGNATURE
+from .voice_call_lifecycle import finalize_call
 
 
 logger = get_logger("anima_chatter.commands")
-
-
-_CHATTER_SIGNATURE = "anima_chatter:chatter:anima_chatter"
 
 
 class VTBCommand(BaseCommand):
@@ -63,7 +55,7 @@ class VTBCommand(BaseCommand):
         """
 
         try:
-            await get_stream_loop_manager().restart_stream_loop(self.stream_id)
+            await restart_stream_loop(self.stream_id)
         except Exception as exc:
             logger.warning(
                 f"重启流循环失败 stream={self.stream_id}: {exc}",
@@ -202,7 +194,7 @@ class VoiceCommand(BaseCommand):
         except Exception:
             platform = ""
 
-        ok, msg = await _finalize_call(
+        ok, msg = await finalize_call(
             stream_id=self.stream_id,
             platform=platform,
             farewell="通话已被手动挂断。",

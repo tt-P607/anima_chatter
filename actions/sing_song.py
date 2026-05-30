@@ -38,28 +38,11 @@ from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base.action import BaseAction
 
 from ..config import AnimaChatterConfig
+from ..constants import normalize_intent, split_emotion
 from ..heartbeat import feed_watchdog_during
 
 
 logger = get_logger("anima_chatter.action.sing_song")
-
-
-# 与 VTSPerformer 同步的合法 intent 集合；非法值降级为 NARRATING。
-# 复制而非 import 是为了避免 schema 序列化阶段引入 vts 模块。
-_VALID_INTENTS: frozenset[str] = frozenset(
-    {
-        "IDLE", "NARRATING", "THINKING", "CONFUSED",
-        "EXCITED", "SURPRISED",
-        "PEEK_LEFT", "PEEK_RIGHT", "LOOKAWAY", "STARE_DOWN", "DREAMY_GAZE",
-        "PROUD_LIFT", "WORRIED_TILT", "SHY_DOWN", "ATTENTIVE",
-        "PLAYFUL_TILT", "MISCHIEF", "SCARED_SHRINK",
-    }
-)
-
-# 唱歌时的合法 emotion 主类型。带不带 :level 都接收，没传或非法会归一。
-_VALID_EMOTION_TYPES: frozenset[str] = frozenset(
-    {"neutral", "happy", "sad", "angry", "surprised"}
-)
 
 
 def _format_duration(seconds: float | None) -> str:
@@ -79,15 +62,12 @@ def _get_singing_plugin_song_library() -> Any | None:
     plugin_manager 拿到本插件实例再读 ``song_library`` 属性。
     """
 
-    try:
-        from src.core.managers import get_plugin_manager
+    from .._internal_compat import get_anima_chatter_plugin
 
-        plugin = get_plugin_manager().get_plugin("anima_chatter")
-        if plugin is None:
-            return None
-        return getattr(plugin, "song_library", None)
-    except Exception:  # noqa: BLE001
+    plugin = get_anima_chatter_plugin()
+    if plugin is None:
         return None
+    return getattr(plugin, "song_library", None)
 
 
 def _build_song_keyword_desc(library: Any | None) -> str:
@@ -124,28 +104,23 @@ def _build_song_keyword_desc(library: Any | None) -> str:
     return base + "\n\n【可用歌单】（共 " + str(len(songs)) + " 首）：\n" + "\n".join(lines)
 
 
-def _normalize_intent(intent: str | None) -> str:
-    """归一化 intent；非法值降级为 NARRATING。"""
-
-    if not intent:
-        return "NARRATING"
-    upper = str(intent).strip().upper()
-    return upper if upper in _VALID_INTENTS else "NARRATING"
+# sing_song 自己的兜底默认值（与通话 / 普通说话不同）：唱歌默认轻表现。
+_SING_DEFAULT_EMOTION_TYPE = "happy"
+_SING_DEFAULT_EMOTION_LEVEL = 1
 
 
-def _normalize_emotion(emotion: str | None) -> tuple[str, int]:
-    """``"happy:2"`` → ``("happy", 2)``；非法降级 ``("happy", 1)``（唱歌默认轻微表现）。"""
+def _normalize_sing_emotion(emotion: str | None) -> tuple[str, int]:
+    """sing_song 专用 emotion 解析：缺省 / 非法时降级为 ``("happy", 1)``。
 
-    if not emotion:
-        return ("happy", 1)
-    parts = str(emotion).strip().lower().split(":", 1)
-    main = parts[0] if parts[0] in _VALID_EMOTION_TYPES else "happy"
-    if len(parts) > 1 and parts[1].strip().isdigit():
-        level = int(parts[1])
-    else:
-        level = 1
-    level = max(1, min(3, level))
-    return (main, level)
+    与 :func:`constants.split_emotion` 共享一份解析规则，只是兜底默认换成
+    "唱歌时表现轻一点"——避免每次出意料外的 emotion 输入就强行套上中性 2 级。
+    """
+
+    return split_emotion(
+        emotion,
+        default_type=_SING_DEFAULT_EMOTION_TYPE,
+        default_level=_SING_DEFAULT_EMOTION_LEVEL,
+    )
 
 
 def _parse_motion_timeline(timeline: list[dict[str, Any]] | None) -> list[tuple[float, str, str]]:
@@ -184,8 +159,8 @@ def _parse_motion_timeline(timeline: list[dict[str, Any]] | None) -> list[tuple[
             continue
         if at_sec < 0:
             continue
-        intent = _normalize_intent(item.get("intent"))
-        emo_main, _ = _normalize_emotion(item.get("emotion"))
+        intent = normalize_intent(item.get("intent"))
+        emo_main, _ = _normalize_sing_emotion(item.get("emotion"))
         parsed.append((at_sec, intent, emo_main))
 
     parsed.sort(key=lambda triple: triple[0])

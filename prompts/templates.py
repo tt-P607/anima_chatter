@@ -1,23 +1,32 @@
 """anima_chatter 的提示词模板字符串。
 
-四个常量：
+设计要点：
 
-- :data:`SYSTEM_PROMPT`：三种模式共享的 system prompt 主体（人设 + 行为准则
-  + ``{scene_guide}`` 占位符）。``{scene_guide}`` 在运行时由
+- :data:`SYSTEM_PROMPT` —— 三种模式共享的 system prompt 主体（人设 + 行为
+  准则 + ``{scene_guide}`` 占位符）。``{scene_guide}`` 在运行时由
   :mod:`.scenes` 按 mode 注入。
-- :data:`USER_PROMPT_VOICE` / :data:`USER_PROMPT_VTB` / :data:`USER_PROMPT_VTB_LIVE`：
-  三种模式各自的 user prompt 模板，由
-  :class:`.builder.AnimaChatterPromptBuilder` 按 mode 选取后填充占位符。
+- :data:`USER_PROMPT_TEMPLATE` —— **统一**的 user prompt 模板，三种模式都用
+  同一个；只通过 ``{mode_header}`` / ``{section_history}`` / ``{section_unreads}``
+  / ``{section_tail}`` 这几个占位符决定风格差异，避免维护三个内容几乎一样
+  的模板。
+- :data:`MODE_PROMPT_PROFILES` —— 每个模式对应的"标题 / 段头 / 尾部提示"配置。
+  :class:`.builder.AnimaChatterPromptBuilder` 用它把模板和模式衔接起来。
 
 模板字段命名约定：
 
 - ``{stream_name}`` / ``{current_time}`` / ``{platform}``：场景元信息。
-- ``{history}`` / ``{unreads}``：聊天上下文（由
-  prompt_manager 的 wrap policy 自动加段头）。
+- ``{history}`` / ``{unreads}``：聊天上下文（由 prompt_manager 的 wrap policy
+  自动加段头）。
 - ``{extra}``：补充提醒文字（如负面行为约束）。
+- ``{mode_header}``：当前模式的段标题，如 "# 实时语音通话输入"。
+- ``{section_history}``：``history`` 段头文案，用于 wrap policy。
+- ``{section_unreads}``：``unreads`` 段头文案，用于 wrap policy。
+- ``{section_tail}``：模式专属的"末尾指令"。
 """
 
 from __future__ import annotations
+
+from typing import TypedDict
 
 
 SYSTEM_PROMPT = """
@@ -108,28 +117,19 @@ Agent：通常是你在对话中需要调用的 AI 智能体，类似于你的�
 <custom_rules>
 # 安全准则
 {safety_guidelines}
-
-# 负面行为
-{negative_behaviors}
 </custom_rules>
 """
+# 注：早期版本里 ``<custom_rules>`` 块还有一段 ``# 负面行为\n{negative_behaviors}``，
+# 现已删除——同一份 negative_behaviors 在 user prompt 末尾会再注入一次（"近因
+# 效应"对模型注意力更友好），system 不再重复注入；详见
+# :meth:`AnimaChatterPromptBuilder.build_negative_behaviors_extra` 的 docstring。
 
 
-USER_PROMPT_VOICE = """# 实时语音通话输入
-当前时间：{current_time}
-平台：{platform}
-通话对象：{stream_name}
-
-{history}
-
-{unreads}
-
-{extra}
-请基于以上 ASR 输入和通话上下文决定下一步。需要说话时调用 say；说完等待用户时调用 pass_and_wait。
-"""
-
-
-USER_PROMPT_VTB = """# VTube Studio 互动输入
+# 统一的 user prompt 模板。
+# 占位符：{stream_name} / {current_time} / {platform} / {history} / {unreads} /
+# {extra} / {mode_header} / {section_tail}。
+# section_tail 必须以"\n"开头，因为它会接在 ``{extra}`` 后；不希望换行就传空串。
+USER_PROMPT_TEMPLATE = """{mode_header}
 当前时间：{current_time}
 平台：{platform}
 聊天对象：{stream_name}
@@ -138,33 +138,78 @@ USER_PROMPT_VTB = """# VTube Studio 互动输入
 
 {unreads}
 
-{extra}
-请基于以上聊天上下文决定下一步。需要说话/做动作时调用 say_and_perform；说完想等待用户继续时调用 pass_and_wait。
-注意：你的输出会同时显示为文本、TTS 朗读和虚拟形象表演，请按 <scene_and_protocol> 段的协议执行。
-"""
+{extra}{section_tail}"""
 
 
-USER_PROMPT_VTB_LIVE = """# VTube Studio 直播弹幕输入
-当前时间：{current_time}
-直播平台：{platform}
-直播间：{stream_name}
+class ModePromptProfile(TypedDict):
+    """单个运行模式的 user prompt 配置。
 
-{history}
+    Attributes:
+        template_name: 在 prompt manager 注册时的模板名（与 mode 一一对应）。
+        mode_header: ``{mode_header}`` 占位的文案，如 "# 实时语音通话输入"。
+        history_wrap_prefix: 历史段头文案，用于 wrap policy（前缀）。
+        unreads_wrap_prefix: 未读段头文案，用于 wrap policy（前缀）。
+        stream_name_default: ``stream_name`` 占位的兜底值（见 optional() policy）。
+        section_tail: 模板末尾的模式专属指令；空串表示无尾部。
+    """
 
-{unreads}
+    template_name: str
+    mode_header: str
+    history_wrap_prefix: str
+    unreads_wrap_prefix: str
+    stream_name_default: str
+    section_tail: str
 
-{extra}
-请基于以上弹幕上下文决定本轮怎么应对。
-- 弹幕飘得快是常态，**没必要每条都回**。挑值得回的回；其他可以无视。
-- 你的回复**只通过 TTS 让观众听见**，不会变成弹幕，所以要直接复述弹幕内容（让没看到弹幕的观众也能跟上）。
-- 选择回应时调用 say_and_perform；本轮不回应或刚说完一段，调用 pass_and_wait 让自己沉默几秒。
-- 严格遵循 <scene_and_protocol> 段里的直播间礼仪与禁忌。
-"""
+
+# voice / vtb / vtb_live 三种模式对应的 prompt 配置。
+# AnimaChatterPromptBuilder.build_user_prompt 会按 mode 取对应配置进而填充模板。
+MODE_PROMPT_PROFILES: dict[str, ModePromptProfile] = {
+    "voice": {
+        "template_name": "anima_chatter_user_prompt",
+        "mode_header": "# 实时语音通话输入",
+        "history_wrap_prefix": "# 历史通话内容\n",
+        "unreads_wrap_prefix": "# 新识别到的语音\n",
+        "stream_name_default": "未知通话",
+        "section_tail": (
+            "\n请基于以上 ASR 输入和通话上下文决定下一步。"
+            "需要说话时调用 say；说完等待用户时调用 pass_and_wait。\n"
+        ),
+    },
+    "vtb": {
+        "template_name": "anima_chatter_vtb_user_prompt",
+        "mode_header": "# VTube Studio 互动输入",
+        "history_wrap_prefix": "# 历史对话\n",
+        "unreads_wrap_prefix": "# 新收到的消息\n",
+        "stream_name_default": "未知聊天",
+        "section_tail": (
+            "\n请基于以上聊天上下文决定下一步。"
+            "需要说话/做动作时调用 say_and_perform；说完想等待用户继续时调用 pass_and_wait。\n"
+            "注意：你的输出会同时显示为文本、TTS 朗读和虚拟形象表演，"
+            "请按 <scene_and_protocol> 段的协议执行。\n"
+        ),
+    },
+    "vtb_live": {
+        "template_name": "anima_chatter_vtb_live_user_prompt",
+        "mode_header": "# VTube Studio 直播弹幕输入",
+        "history_wrap_prefix": "# 直播历史弹幕\n",
+        "unreads_wrap_prefix": "# 新到弹幕\n",
+        "stream_name_default": "未知直播间",
+        "section_tail": (
+            "\n请基于以上弹幕上下文决定本轮怎么应对。\n"
+            "- 弹幕飘得快是常态，**没必要每条都回**。挑值得回的回；其他可以无视。\n"
+            "- 你的回复**只通过 TTS 让观众听见**，不会变成弹幕，"
+            "所以要直接复述弹幕内容（让没看到弹幕的观众也能跟上）。\n"
+            "- 选择回应时调用 say_and_perform；本轮不回应或刚说完一段，"
+            "调用 pass_and_wait 让自己沉默几秒。\n"
+            "- 严格遵循 <scene_and_protocol> 段里的直播间礼仪与禁忌。\n"
+        ),
+    },
+}
 
 
 __all__ = [
+    "MODE_PROMPT_PROFILES",
+    "ModePromptProfile",
     "SYSTEM_PROMPT",
-    "USER_PROMPT_VOICE",
-    "USER_PROMPT_VTB",
-    "USER_PROMPT_VTB_LIVE",
+    "USER_PROMPT_TEMPLATE",
 ]

@@ -23,8 +23,9 @@ import asyncio
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, TYPE_CHECKING
 
-from src.kernel.logger import get_logger
+from src.app.plugin_system.api.log_api import get_logger
 
+from ..constants import normalize_intent, split_emotion
 from .animation import AutoAnimator, SpeechAnimator
 from .connection import VTSConnection, build_default_token_path
 
@@ -34,22 +35,6 @@ if TYPE_CHECKING:
 
 
 logger = get_logger("anima_chatter.vts.performer")
-
-
-# SpeechAnimator 接受的合法 intent 名（其它值会被忽略，不报错）。
-# 与 :data:`SpeechAnimator.intent_map` 保持同步——新增 intent 必须两边都加。
-_VALID_INTENTS: set[str] = {
-    # 基础姿态
-    "IDLE", "NARRATING", "THINKING", "CONFUSED",
-    # 高表现力情绪
-    "EXCITED", "SURPRISED",
-    # 眼神方向
-    "PEEK_LEFT", "PEEK_RIGHT", "LOOKAWAY", "STARE_DOWN", "DREAMY_GAZE",
-    # 态度倾向
-    "PROUD_LIFT", "WORRIED_TILT", "SHY_DOWN", "ATTENTIVE",
-    # 调皮 / 紧张
-    "PLAYFUL_TILT", "MISCHIEF", "SCARED_SHRINK",
-}
 
 
 class VTSPerformer:
@@ -225,30 +210,21 @@ class VTSPerformer:
         logger.info("VTSPerformer 已关闭")
 
     # ── 解析 emotion / intent ────────────────────────
+    # 这两个方法保留作为 staticmethod 包装层，仅转发到 :mod:`..constants` 里
+    # 的统一实现。主要是为了兼容外部测试 / 历史调用方；新代码请直接 import
+    # constants.normalize_intent / split_emotion。
 
     @staticmethod
     def _normalize_intent(intent: str) -> str:
         """把模型给的 intent 字串转成 SpeechAnimator 接受的合法值。"""
 
-        normalized = (intent or "").strip().upper()
-        if normalized in _VALID_INTENTS:
-            return normalized
-        return "NARRATING"
+        return normalize_intent(intent)
 
     @staticmethod
     def _split_emotion(emotion: str) -> tuple[str, int]:
         """``"happy:2"`` → ``("happy", 2)``；非法值降级为 ``("neutral", 2)``。"""
 
-        if not emotion:
-            return ("neutral", 2)
-        parts = emotion.strip().lower().split(":", 1)
-        emo_type = parts[0] or "neutral"
-        if len(parts) > 1 and parts[1].strip().isdigit():
-            level = int(parts[1])
-        else:
-            level = 2
-        level = max(1, min(3, level))
-        return emo_type, level
+        return split_emotion(emotion)
 
     def _resolve_hotkey(self, *keys: str) -> str | None:
         """按顺序在 hotkey_map 里查找；返回第一个命中的热键 ID。"""

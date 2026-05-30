@@ -97,7 +97,7 @@ class AnimaChatterPromptBuilder:
             # 延迟局部导入，避免在模块初始化（Import Time）引发循环导入
             from .. import call_state as _cs
 
-            active = _cs._active_call  # noqa: SLF001 — 同插件读模块级单例
+            active = _cs.snapshot_active_call_unlocked()
             if active is None or active.caller_stream_id != (chat_stream.stream_id or ""):
                 return base
 
@@ -192,6 +192,7 @@ class AnimaChatterPromptBuilder:
                 vtb_live 场景文案末尾追加额外动作触发说明。
         """
 
+        _ = plugin_config  # 保留参数以兼容历史调用方
         actual_mode: ChatterMode = mode or AnimaChatterPromptBuilder.resolve_mode(chat_stream)
         tmpl = get_prompt_manager().get_template("anima_chatter_system_prompt")
         if not tmpl:
@@ -224,13 +225,11 @@ class AnimaChatterPromptBuilder:
     ) -> str:
         """构建用户提示词，按模式选择对应模板。"""
 
+        from .templates import MODE_PROMPT_PROFILES
+
         actual_mode: ChatterMode = mode or AnimaChatterPromptBuilder.resolve_mode(chat_stream)
-        if actual_mode == "vtb_live":
-            template_name = "anima_chatter_vtb_live_user_prompt"
-        elif actual_mode == "vtb":
-            template_name = "anima_chatter_vtb_user_prompt"
-        else:
-            template_name = "anima_chatter_user_prompt"
+        profile = MODE_PROMPT_PROFILES.get(actual_mode) or MODE_PROMPT_PROFILES["voice"]
+        template_name = profile["template_name"]
 
         tmpl = get_prompt_manager().get_template(template_name)
         assert tmpl, f"缺少模板 {template_name}"
@@ -242,6 +241,8 @@ class AnimaChatterPromptBuilder:
             .set("unreads", unread_lines)
             .set("extra", extra)
             .set("stream_id", chat_stream.stream_id or "")
+            .set("mode_header", profile["mode_header"])
+            .set("section_tail", profile["section_tail"])
             .build()
         )
 
@@ -256,7 +257,15 @@ class AnimaChatterPromptBuilder:
 
     @staticmethod
     def build_negative_behaviors_extra() -> str:
-        """构建负面行为提醒。"""
+        """构建用户提示词末尾的负面行为提醒（"近因效应"复述）。
+
+        历史上 system prompt 与 user prompt 各注入一份，模型会在一次请求里
+        看到两份相同的 negative_behaviors 文本——浪费 token 不说，还容易让
+        模型觉得"这就是模板冗余"，反而降低提醒效果。
+
+        现在策略：**只**在 user prompt 末尾注入一份（"近因效应"对模型注意力
+        最友好），system prompt 模板里同名占位符已经移除。
+        """
 
         negative_behaviors = get_core_config().personality.negative_behaviors
         if not negative_behaviors:

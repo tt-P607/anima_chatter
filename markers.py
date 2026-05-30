@@ -32,6 +32,31 @@ _MOTION_OPEN_RE = re.compile(r"\[motion\s*:\s*([a-zA-Z0-9_\-]+)\]", re.IGNORECAS
 _SENTENCE_END_RE = re.compile(r"(.+?(?:……|[。！？!?]|\n+))", re.DOTALL)
 
 
+# 用于 :func:`strip_markers` 的"宽松"剥离规则——只要长得像 wait / emotion / motion
+# 标记就拆掉（不要求闭合，方便处理 LLM 截断输出）。与 :data:`_EMOTION_RE` 不同
+# 的是它**不**要求两端配对，所以容错性更强。
+_STRIP_WAIT_RE = re.compile(r"\[wait\s*:\s*[0-9.]+\]", re.IGNORECASE)
+_STRIP_EMOTION_RE = re.compile(
+    r"\[/?emotion(?:\s*:\s*[a-zA-Z0-9_\-]+)?\]", re.IGNORECASE
+)
+_STRIP_MOTION_RE = re.compile(
+    r"\[/?motion(?:\s*:\s*[a-zA-Z0-9_\-]+)?\]", re.IGNORECASE
+)
+
+
+def strip_markers(text: str) -> str:
+    """把 ``[wait]`` / ``[emotion]`` / ``[motion]`` 三类内联标记一次性剥离。
+
+    供发文本到聊天界面时把整段干净化，或在 :func:`parse_speech_segments`
+    没出片段时做兜底处理。返回 strip 后的文本（首尾空白已去）。
+    """
+
+    cleaned = _STRIP_WAIT_RE.sub("", text)
+    cleaned = _STRIP_EMOTION_RE.sub("", cleaned)
+    cleaned = _STRIP_MOTION_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
 @dataclass
 class SpeechSegment:
     """单个待合成/播放的语音片段。"""
@@ -303,4 +328,9 @@ def split_complete_sentences(text: str) -> list[str]:
     return chunks
 
 
-__all__ = ["SpeechSegment", "parse_speech_segments", "split_complete_sentences"]
+__all__ = [
+    "SpeechSegment",
+    "parse_speech_segments",
+    "split_complete_sentences",
+    "strip_markers",
+]

@@ -17,6 +17,7 @@ import math
 import time
 from typing import TYPE_CHECKING, Any, Optional
 
+from ...constants import normalize_intent, split_emotion
 from .base import BaseAnimator
 
 if TYPE_CHECKING:
@@ -163,16 +164,13 @@ class SpeechAnimator(BaseAnimator):
     ) -> None:
         """统一入口；emotion 支持 ``"happy:3"`` 这种 ``类型:强度`` 格式。"""
 
-        if intent and intent.upper() in self.intent_map:
-            self.intent = intent.upper()
+        if intent:
+            normalized = normalize_intent(intent, default=self.intent)
+            if normalized in self.intent_map:
+                self.intent = normalized
 
         if emotion:
-            parts = emotion.lower().split(":")
-            self.emotion_type = parts[0]
-            if len(parts) > 1 and parts[1].isdigit():
-                self.emotion_level = int(parts[1])
-            else:
-                self.emotion_level = 2
+            self.emotion_type, self.emotion_level = split_emotion(emotion)
 
         if is_speaking is not None:
             if is_speaking and not self.is_speaking:

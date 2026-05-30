@@ -15,20 +15,7 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from typing import Annotated, Any, cast
-
-
-# 与 :data:`SpeechAnimator.intent_map` 保持一致的 intent 名集合。VTSPerformer
-# 会在内部做一次大写化，所以这里也用大写。
-# 字段含义详见 :class:`SpeechAnimator` 的 intent_map 注释。
-_VALID_INTENTS: tuple[str, ...] = (
-    "IDLE", "NARRATING", "THINKING", "CONFUSED",
-    "EXCITED", "SURPRISED",
-    "PEEK_LEFT", "PEEK_RIGHT", "LOOKAWAY", "STARE_DOWN", "DREAMY_GAZE",
-    "PROUD_LIFT", "WORRIED_TILT", "SHY_DOWN", "ATTENTIVE",
-    "PLAYFUL_TILT", "MISCHIEF", "SCARED_SHRINK",
-)
 
 from src.app.plugin_system.api import send_api
 from src.app.plugin_system.api.log_api import get_logger
@@ -37,31 +24,13 @@ from src.core.components.base.action import BaseAction
 
 from ..config import AnimaChatterConfig
 from ..heartbeat import feed_watchdog_during
-from ..markers import parse_speech_segments
-from ..sub_agent import mark_reply_success
+from ..markers import parse_speech_segments, strip_markers
+from ..prompts.scenes import (
+    EMOTION_SCHEMA_DESC,
+    INTENT_SCHEMA_DESC,
+    LANGUAGE_SCHEMA_DESC,
+)
 from ..tts import TTSRequest, _retry_empty_audio, build_tts_backend
-
-
-# 兜底正则：从原始 content 把所有内联标记剥掉。
-# 同时用于：(1) parse_speech_segments 没出片段时的兜底；(2) 给群里
-# 发文本时一次性清洗整段（避免 motion 切碎导致每个 segment 单独 send_text）。
-_FALLBACK_WAIT_RE = re.compile(r"\[wait\s*:\s*[0-9.]+\]", re.IGNORECASE)
-_FALLBACK_EMOTION_RE = re.compile(
-    r"\[/?emotion(?:\s*:\s*[a-zA-Z0-9_\-]+)?\]", re.IGNORECASE
-)
-_FALLBACK_MOTION_RE = re.compile(
-    r"\[/?motion(?:\s*:\s*[a-zA-Z0-9_\-]+)?\]", re.IGNORECASE
-)
-
-
-def _strip_all_markers(text: str) -> str:
-    """把 ``[wait]`` / ``[emotion]`` / ``[motion]`` 三类内联标记都剥掉，
-    返回适合直接发到聊天界面的干净文本。"""
-
-    cleaned = _FALLBACK_WAIT_RE.sub("", text)
-    cleaned = _FALLBACK_EMOTION_RE.sub("", cleaned)
-    cleaned = _FALLBACK_MOTION_RE.sub("", cleaned)
-    return cleaned.strip()
 
 
 logger = get_logger("anima_chatter.action.say_and_perform")
@@ -124,59 +93,14 @@ class SayAndPerformAction(BaseAction):
                 "- 不必每段都用——只在一句话里语义明显切换时用，过度切换反而显得机械"
             ),
         ],
-        emotion: Annotated[
-            str,
-            "情绪类型:强度，格式如 'happy:2' / 'sad:1' / 'angry:3' / 'neutral:1' / 'surprised:2'。"
-            "类型决定嘴角与眉头的基准；强度 1~3 决定表现幅度，3 级会带身体晃动。"
-            "留空或 neutral:1 表示平静。",
-        ] = "neutral:1",
-        intent: Annotated[
-            str,
-            "动作意图，决定头部姿态 + 眼神方向。从下面 18 个里选一个，不确定时填 NARRATING：\n"
-            "【基础姿态】\n"
-            " - IDLE：静止不动\n"
-            " - NARRATING：正常叙述（默认）\n"
-            " - THINKING：想问题，头微抬眼神上飘\n"
-            " - CONFUSED：困惑，歪头\n"
-            "【高表现力情绪】\n"
-            " - EXCITED：兴奋赞同，前倾抬头眼神发亮\n"
-            " - SURPRISED：惊讶意外，大抬头瞪眼\n"
-            "【眼神方向】\n"
-            " - PEEK_LEFT / PEEK_RIGHT：偷瞄左/右侧\n"
-            " - LOOKAWAY：害羞回避，左下看\n"
-            " - STARE_DOWN：低头盯着 / 沮丧低落\n"
-            " - DREAMY_GAZE：神游远眺\n"
-            "【态度倾向】\n"
-            " - PROUD_LIFT：得意抬头\n"
-            " - WORRIED_TILT：担心歪头\n"
-            " - SHY_DOWN：害羞低头偏侧\n"
-            " - ATTENTIVE：认真专注地听\n"
-            "【调皮 / 紧张】\n"
-            " - PLAYFUL_TILT：调皮明显歪头\n"
-            " - MISCHIEF：坏笑斜眼\n"
-            " - SCARED_SHRINK：害怕收身低头\n"
-            "选最匹配本句话语气的一个，不要硬选——日常叙述就 NARRATING。",
-        ] = "NARRATING",
+        emotion: Annotated[str, EMOTION_SCHEMA_DESC] = "neutral:1",
+        intent: Annotated[str, INTENT_SCHEMA_DESC] = "NARRATING",
         style: Annotated[
             str,
-            "TTS 语音风格，决定参考音色和语气基调。可选：\n"
-            " - default：默认音色（中性叙述、日常对话首选，绝大多数场景用这个）\n"
-            " - 活泼：更明亮俏皮、笑意更足；适合开心调皮、撒娇、被夸时使用\n"
-            " - 难过：更柔软低沉、带哽咽感；适合共情、失落、严肃话题\n"
-            "切换风格不要太频繁——情绪有明显起伏时再换，平时保持 default。",
+            "TTS 语音风格。可选：default（中性叙述，默认）/ 活泼（俏皮明亮，开心调皮时用）/ "
+            "难过（柔软低沉，共情失落时用）。情绪明显起伏时再换，平时保持 default。",
         ] = "default",
-        language: Annotated[
-            str,
-            "朗读文本的语言代码，决定 TTS 引擎选择。\n"
-            "【核心原则】根据实际朗读语言选择，而非文字形式。例如粤语「係」「嘅」虽是汉字，但应选 yue 而非 zh。\n"
-            "【可选值】\n"
-            "混合模式（文本含多语言或外来词）：\n"
-            "  zh — 中文为主（夹杂英文）  en — 英文为主  ja — 日文为主（夹杂英文）\n"
-            "  yue — 粤语（夹杂英文）  ko — 韩文（夹杂英文）  auto — 自动识别多语种  auto_yue — 自动识别（含粤语优先）\n"
-            "纯语言模式（文本仅含单一语言，推理效果更好）：\n"
-            "  all_zh — 纯中文  all_ja — 纯日文  all_yue — 纯粤语  all_ko — 纯韩文\n"
-            "【重要】一次调用所有内容必须共享同一个语言，跨语言时请分多次调用。",
-        ] = "zh",
+        language: Annotated[str, LANGUAGE_SCHEMA_DESC] = "zh",
     ) -> tuple[bool, str]:
         """发文本 → TTS 合成 → 本地播放 + VTS 表演。"""
 
@@ -209,7 +133,7 @@ class SayAndPerformAction(BaseAction):
                 segments.extend(parsed)
             else:
                 # parse 不出片段（例如纯标记内容）：兜底剥掉标记后整段塞回去。
-                fallback_text = _strip_all_markers(text)
+                fallback_text = strip_markers(text)
                 if fallback_text:
                     from ..markers import SpeechSegment
 
@@ -225,7 +149,7 @@ class SayAndPerformAction(BaseAction):
         # 的整段）。这样群里看到的是完整一段话，而不是被 motion 标记切碎的多
         # 条短消息。
         for raw_text in content_list:
-            clean = _strip_all_markers(raw_text)
+            clean = strip_markers(raw_text)
             if not clean:
                 continue
             ok = await send_api.send_text(
@@ -239,7 +163,10 @@ class SayAndPerformAction(BaseAction):
                 )
 
         # 文本发送成功 → 标记下一 tick 的概率门加成（沿用 dfc 的"刚回复就再回复"心理）。
-        mark_reply_success(self.chat_stream)
+        # 局部导入避免循环依赖（plugin.py 顶层引用本模块）。
+        from ..plugin import AnimaChatter
+
+        AnimaChatter.mark_reply_success(self.chat_stream)
 
         # 3) 拿 performer / audio_player
         performer = getattr(self.plugin, "vts_performer", None)

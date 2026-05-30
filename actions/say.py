@@ -12,12 +12,12 @@ from typing import Annotated, Any, cast
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base import Failure
 from src.core.components.base.action import BaseAction
-from src.kernel.concurrency import get_task_manager
 
 # call_state 移至方法内局部延迟导入，以防模块初始化时循环导入
 from ..config import AnimaChatterConfig
 from ..heartbeat import feed_watchdog_during
 from ..markers import parse_speech_segments
+from ..prompts.scenes import LANGUAGE_SCHEMA_DESC
 from ..tts import TTSRequest, _retry_empty_audio, build_tts_backend
 
 
@@ -65,18 +65,7 @@ class SayAction(BaseAction):
             "活泼（俏皮明亮，开心调皮时用）、难过（柔软低沉，共情失落时用）。"
             "切风格只在情绪明显起伏时用，平时保持 default。",
         ] = "default",
-        language: Annotated[
-            str,
-            "朗读文本的语言代码，决定 TTS 引擎选择。\n"
-            "【核心原则】根据实际朗读语言选择，而非文字形式。例如粤语「係」「嘅」虽是汉字，但应选 yue 而非 zh。\n"
-            "【可选值】\n"
-            "混合模式（文本含多语言或外来词）：\n"
-            "  zh — 中文为主（夹杂英文）  en — 英文为主  ja — 日文为主（夹杂英文）\n"
-            "  yue — 粤语（夹杂英文）  ko — 韩文（夹杂英文）  auto — 自动识别多语种  auto_yue — 自动识别（含粤语优先）\n"
-            "纯语言模式（文本仅含单一语言，推理效果更好）：\n"
-            "  all_zh — 纯中文  all_ja — 纯日文  all_yue — 纯粤语  all_ko — 纯韩文\n"
-            "【重要】一次调用所有内容必须共享同一个语言，跨语言时请分多次调用。",
-        ] = "zh",
+        language: Annotated[str, LANGUAGE_SCHEMA_DESC] = "zh",
     ) -> tuple[bool, str]:
         """执行语音播放动作。"""
 
@@ -149,8 +138,8 @@ class SayAction(BaseAction):
                 logger.error(f"TTS 合成段落 {idx} 失败: {exc}")
                 return idx, Failure(str(exc))
 
-        tm = get_task_manager()
-        _ = tm  # task_manager 在此函数内未直接使用，留作未来 trace 标识；保留导入避免 lint
+        # 注：以前这里取 task_manager 留作未来 trace 标识，但实际从未使用，
+        # 直接删除避免引入对内部 ``src.kernel.concurrency`` 的依赖。
         semaphore = asyncio.Semaphore(max_parallel)
 
         async def sem_process(seg: Any, idx: int):

@@ -19,8 +19,9 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator
 
-from src.kernel.concurrency import get_watchdog
-from src.kernel.logger import get_logger
+from src.app.plugin_system.api.log_api import get_logger
+
+from ._internal_compat import feed_watchdog
 
 _logger = get_logger("anima_chatter.heartbeat")
 
@@ -50,7 +51,6 @@ async def feed_watchdog_during(
         return
 
     stop_event = asyncio.Event()
-    watchdog = get_watchdog()
 
     async def _feeder() -> None:
         """后台喂狗循环：每 ``interval`` 秒喂一次，直到 stop_event 触发。"""
@@ -58,7 +58,7 @@ async def feed_watchdog_during(
         try:
             while not stop_event.is_set():
                 try:
-                    watchdog.feed_dog(stream_id)
+                    feed_watchdog(stream_id)
                 except Exception as exc:  # noqa: BLE001
                     _logger.debug(f"feed_dog 失败 stream={stream_id[:8]}: {exc}")
                 # 用 wait_for 实现"sleep 但可被立即唤醒"

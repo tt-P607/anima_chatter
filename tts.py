@@ -156,8 +156,18 @@ class HttpTTSBackend:
         return await get_message_sender().send_message(message)
 
 
-class LoggingTTSBackend:
-    """测试/降级用 TTS 后端。"""
+class LoggingTTSBackend:  # pragma: no cover - 仅在 endpoint="logging" 时启用，纯日志桩
+    """**仅供开发 / 调试**的 TTS 后端，写日志而不真正合成音频。
+
+    **生产环境不要把 ``[tts]`` 的 ``endpoint`` 设为 ``"logging"``**——
+    这条路径只是给本地排查 prompt / 标点 / segment 切分用的纯文本回显，
+    走的是 ``logger.info`` 而不是 HTTP 调用，无音频输出，无法驱动 VTS 嘴型 /
+    audio_player 播放，会让所有依赖音频的功能（VTB 表演 / 唱歌 / 通话 TTS）
+    全部失效。
+
+    保留它的意义：单元测试 / 离线开发场景下不需要拉起真实 TTS 服务也能跑
+    completer 决策链路。
+    """
 
     def __init__(self, logger: Logger, *, mime_type: str = "audio/wav") -> None:
         """初始化日志 TTS 后端。"""

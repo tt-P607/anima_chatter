@@ -62,11 +62,12 @@ def resolve_mode(chat_stream: "ChatStream") -> ChatterMode:
     """
 
     # ── 优先级 1：通话中的 stream 强制 voice ─────────
-    # 直接读模块级单例，不走锁——anima_chatter 自己的 runner 持续
-    # poll，不会出现"读到旧值导致模式判错一拍"的严重后果。
+    # 走 call_state 暴露的同步快照接口；底层是模块级单变量原子读，性能等同
+    # 直接访问 _active_call，但接口名清晰、未来 call_state 内部存储换了形态
+    # 这里不会被悄悄打破。
     from . import call_state  # 局部导入避免循环依赖（call_state 不依赖 modes）
 
-    active = call_state._active_call  # noqa: SLF001 — 同模块快照读
+    active = call_state.snapshot_active_call_unlocked()
     if active is not None and active.caller_stream_id == (chat_stream.stream_id or ""):
         return "voice"
 

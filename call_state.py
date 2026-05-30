@@ -42,6 +42,7 @@ __all__ = [
     "record_system_note",
     "record_user_message",
     "set_active_call",
+    "snapshot_active_call_unlocked",
 ]
 
 
@@ -102,6 +103,24 @@ async def get_active_call() -> ActiveCall | None:
 
     async with _lock:
         return _active_call
+
+
+def snapshot_active_call_unlocked() -> ActiveCall | None:
+    """**不加锁**地读取当前 ActiveCall 的快照。
+
+    供 :mod:`.modes` / :mod:`.prompts.builder` 这种**同步路径**使用——
+    那两条调用链不能 ``await``，但又需要看到通话状态来决定模式 / prompt。
+
+    在 CPython 下读模块级单变量是原子操作，与写路径（必须拿 :data:`_lock`）
+    不会出现"读到半个 ActiveCall 实例"的中间态——最多读到刚被替换前的旧值，
+    "判定 + 立即用"的场景能容忍一拍延迟。
+
+    Returns:
+        当前 ``ActiveCall`` 引用；没有通话返回 ``None``。绝**不**修改返回值，
+        如要修改请走加锁的 :func:`set_active_call` / :func:`record_*_message`。
+    """
+
+    return _active_call
 
 
 async def is_call_active_for_stream(stream_id: str) -> bool:

@@ -21,7 +21,7 @@ import random
 import time
 from typing import Any
 
-from src.kernel.logger import get_logger
+from src.app.plugin_system.api.log_api import get_logger
 
 from .base import BaseAnimator
 

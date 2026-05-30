@@ -27,7 +27,7 @@ from typing import Final
 import numpy as np
 import soundfile as sf  # type: ignore
 
-from src.kernel.logger import get_logger
+from src.app.plugin_system.api.log_api import get_logger
 
 logger = get_logger("anima_chatter.audio.loudness")
 
