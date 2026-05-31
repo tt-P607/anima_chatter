@@ -1,7 +1,7 @@
 {
     "name": "anima_chatter",
     "display_name": "语音通话与 VTube Studio 互动聊天器",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "description": "ASR 实时语音通话 + VTube Studio 虚拟形象 通用 Chatter",
     "author": "MoFox Team",
     "dependencies": {
