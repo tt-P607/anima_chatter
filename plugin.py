@@ -151,7 +151,7 @@ class AnimaChatter(BaseChatter):
         "语音通话与 VTube Studio 虚拟形象互动通用 Chatter。"
         "platform=local_asr 时为实时通话模式；其他平台需通过 /vtb on 显式接管。"
     )
-    associated_platforms = ["local_asr", "bilibili_live"]
+    associated_platforms = ["local_asr", "live"]
     chat_type = ChatType.ALL
     dependencies = ["asr_adapter_anima:adapter:asr_adapter_anima"]
 
@@ -217,6 +217,39 @@ class AnimaChatter(BaseChatter):
         return AnimaChatterPromptBuilder.build_history_text(
             chat_stream, self.format_message_line
         )
+
+    def format_message_line(
+        self,
+        msg: Message,
+        time_format: str = "%H:%M",
+    ) -> str:
+        """重写基类版本，给消息行带上"来源平台"前缀。
+
+        当 ``msg.extra["source_platform"]`` 存在时（直播场景下由 dispatcher
+        注入，例如 ``bilibili_live`` / ``douyin_live``），在 platform_id 前面
+        加 ``<source_platform>`` 标签，让模型一眼能看出这条来自哪个平台：
+
+        ``【03:02】<成员> <bilibili_live>[open_id...] 昵称 [msg]: 内容``
+        ``【03:02】<成员> <douyin_live>[sec_uid...] 昵称 [msg]: 内容``
+        ``【03:02】<成员> [3905802962] 昵称 [msg]: 内容``  （非直播场景，无前缀）
+
+        没有 ``source_platform`` 字段时回退到基类格式，行为不变。
+        """
+
+        line = super().format_message_line(msg, time_format=time_format)
+        try:
+            source = msg.extra.get("source_platform") if isinstance(msg.extra, dict) else None
+        except Exception:
+            source = None
+        if not source:
+            return line
+        # 在第一段角色之后、platform_id 之前插入 ``<source_platform>``。
+        # 基类格式是：``【时间】<角色> [id] 名称 [msg_id]：内容``
+        # 我们在 ``[id]`` 前插入。如果没有 ``[`` 直接前置。
+        marker_idx = line.find("[")
+        if marker_idx <= 0:
+            return f"<{source}> {line}"
+        return f"{line[:marker_idx]}<{source}>{line[marker_idx:]}"
 
     def _build_enhanced_history_text(self, chat_stream: ChatStream) -> str:
         """dfc Session 期望的 PromptAdapter 协议方法（同步）。

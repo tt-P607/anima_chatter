@@ -118,6 +118,8 @@ Agent：通常是你在对话中需要调用的 AI 智能体，类似于你的�
 # 安全准则
 {safety_guidelines}
 </custom_rules>
+
+{custom_instructions_block}
 """
 # 注：早期版本里 ``<custom_rules>`` 块还有一段 ``# 负面行为\n{negative_behaviors}``，
 # 现已删除——同一份 negative_behaviors 在 user prompt 末尾会再注入一次（"近因

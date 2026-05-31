@@ -77,6 +77,24 @@ class AnimaChatterConfig(BaseConfig):
                 "适合不想让 bot 唱歌、或者还没准备好歌库的场景。"
             ),
         )
+        custom_prompt: str = Field(
+            default="",
+            description=(
+                "自定义提示词。会以 ``<custom_instructions>`` 块形式追加到指定模式的 "
+                "system prompt 末尾，用来声明部署独有的行为（口癖、台风、回复策略等）。"
+                "支持多行；可以写 markdown / 标签等任意格式，模型会原样收到。"
+                "留空则不注入；具体在哪些模式生效由 ``custom_prompt_modes`` 控制。"
+            ),
+        )
+        custom_prompt_modes: list[str] = Field(
+            default_factory=lambda: ["voice", "vtb", "vtb_live"],
+            description=(
+                "``custom_prompt`` 生效的模式列表。可选值：``voice`` / ``vtb`` / ``vtb_live``。"
+                "默认三种模式都注入；想只在某些模式下生效就改成对应子集，"
+                "比如只想直播时生效就写 ``[\"vtb_live\"]``。"
+                "空列表 ``[]`` 等于完全禁用 ``custom_prompt``（即便其内容非空）。"
+            ),
+        )
 
     @config_section("tts", title="TTS 设置")
     class TTSSection(SectionBase):

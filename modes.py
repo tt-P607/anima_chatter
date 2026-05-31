@@ -30,11 +30,14 @@ ChatterMode = Literal["voice", "vtb", "vtb_live"]
 """
 
 
-LIVE_PLATFORMS: frozenset[str] = frozenset({"bilibili_live"})
+LIVE_PLATFORMS: frozenset[str] = frozenset({"live"})
 """被识别为"直播"的 ``adapter.platform`` 字符串集合。
 
-必须与对应 adapter 类的 ``platform`` 类属性保持一致，例如
-:class:`plugins.bilibili_live_adapter.plugin.BilibiliLiveAdapter.platform`。
+为了让多平台直播（B 站 + 抖音 + 未来的 Twitch / YouTube 等）能合并到**同一个
+chat_stream**、由 anima_chatter 串行决策（避免两边 chatter 同时触发 VTS hotkey
+打架），所有直播 adapter 都把 ``platform`` 类属性写成统一的 ``"live"``。
+真实来源由 envelope 的 ``additional_config.source_platform`` 携带，能在
+prompt 里区分（详见 ``prompts/scenes.py``）。
 """
 
 

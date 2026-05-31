@@ -16,7 +16,41 @@ from src.core.config import get_core_config
 from src.core.prompt import get_prompt_manager
 
 from ..modes import ChatterMode, resolve_mode
-from .scenes import VOICE_SCENE_GUIDE, VTB_LIVE_SCENE_GUIDE, VTB_SCENE_GUIDE
+from .scenes import (
+    VOICE_SCENE_GUIDE,
+    VTB_SCENE_GUIDE,
+    build_vtb_live_scene_guide,
+)
+
+
+def _detect_active_live_sources() -> frozenset[str]:
+    """检测当前有哪些直播 adapter 在跑，返回它们的 ``source_platform`` 集合。
+
+    通过 ``adapter_api`` 拿活跃 adapter 实例列表，过滤出有 ``source_platform``
+    类属性的实例（约定：直播 adapter 必须在类上声明 ``source_platform``，
+    与 envelope 的 ``additional_config.source_platform`` 一致）。
+
+    设计要点：
+    - 不直接 import 任何具体直播 adapter 模块，**保持 anima_chatter 与各
+      直播 adapter 之间零硬依赖**。
+    - 任何带 ``source_platform`` 类属性的 adapter 都会被识别为"直播来源"，
+      未来加 Twitch / YouTube 适配器只要遵循该约定即可，无需改 anima_chatter。
+    """
+
+    try:
+        from src.app.plugin_system.api import adapter_api
+    except Exception:
+        return frozenset()
+
+    sources: set[str] = set()
+    try:
+        for adapter in adapter_api.get_all_adapters().values():
+            source = getattr(adapter, "source_platform", "")
+            if source:
+                sources.add(str(source))
+    except Exception:
+        return frozenset()
+    return frozenset(sources)
 
 if TYPE_CHECKING:
     from src.core.models.message import Message
@@ -140,7 +174,12 @@ class AnimaChatterPromptBuilder:
             )
             return base + call_status_block
 
-        base = VTB_LIVE_SCENE_GUIDE if mode == "vtb_live" else VTB_SCENE_GUIDE
+        if mode == "vtb_live":
+            # 按当前实际启用的直播 adapter 动态渲染——单平台 / 多平台 /
+            # 未来加新平台都能给到精准的 prompt，不会让用户看到无关分支。
+            base = build_vtb_live_scene_guide(_detect_active_live_sources())
+        else:
+            base = VTB_SCENE_GUIDE
         if not expression_hints:
             return base
 
@@ -192,7 +231,6 @@ class AnimaChatterPromptBuilder:
                 vtb_live 场景文案末尾追加额外动作触发说明。
         """
 
-        _ = plugin_config  # 保留参数以兼容历史调用方
         actual_mode: ChatterMode = mode or AnimaChatterPromptBuilder.resolve_mode(chat_stream)
         tmpl = get_prompt_manager().get_template("anima_chatter_system_prompt")
         if not tmpl:
@@ -212,7 +250,62 @@ class AnimaChatterPromptBuilder:
                     actual_mode, expression_hints, chat_stream=chat_stream
                 ),
             )
+            .set(
+                "custom_instructions_block",
+                AnimaChatterPromptBuilder.build_custom_instructions_block(
+                    plugin_config, actual_mode
+                ),
+            )
             .build()
+        )
+
+    @staticmethod
+    def build_custom_instructions_block(
+        plugin_config: "AnimaChatterConfig | None",
+        mode: ChatterMode,
+    ) -> str:
+        """按当前模式构建用户自定义提示词块。
+
+        从 ``plugin.custom_prompt`` 读取部署级 prompt 补丁；当且仅当
+        当前 ``mode`` 出现在 ``plugin.custom_prompt_modes`` 列表里时才注入。
+        渲染成 ``<custom_instructions>`` 标签块拼到 system prompt 末尾。
+
+        优先级与失效条件：
+        - ``custom_prompt`` 留空 → 不注入。
+        - ``custom_prompt_modes`` 为 ``[]`` → 完全禁用，不注入。
+        - 当前 mode 不在 ``custom_prompt_modes`` 里 → 不注入。
+        - 上述都不触发 → 注入；最终 prompt 末尾出现 ``<custom_instructions>`` 块。
+        """
+
+        if plugin_config is None:
+            return ""
+
+        try:
+            custom_text = str(plugin_config.plugin.custom_prompt or "").strip()
+        except Exception:
+            return ""
+        if not custom_text:
+            return ""
+
+        try:
+            allowed_modes = list(plugin_config.plugin.custom_prompt_modes or [])
+        except Exception:
+            return ""
+        if not allowed_modes:
+            return ""
+        # 容忍空白 / 大小写不规范
+        normalized = {str(m).strip().lower() for m in allowed_modes if m}
+        if mode not in normalized:
+            return ""
+
+        return (
+            "<custom_instructions>\n"
+            "# 部署级自定义指令\n"
+            "下面是本机部署者额外提供的指令；它们补充（不覆盖）上面的人设与场景说明。\n"
+            "如果这里的要求与前面的安全准则冲突，则**仍然以前面的安全准则为准**。\n"
+            "\n"
+            f"{custom_text}\n"
+            "</custom_instructions>"
         )
 
     @staticmethod
