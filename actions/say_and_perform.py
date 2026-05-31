@@ -10,27 +10,45 @@
 
 如果 VTS 未启用或未连接，performer 会降级为"仅本地播放"，依然会进 VB-Cable，
 让虚拟形象的嘴型还能跟上（通过 VTS 自带的麦克风口型驱动）。
+
+**vtb_live 流水线模式**（仅在 ``mode == "vtb_live"`` + ``[pipelining].enabled``
+同时满足时启用）：
+
+- 合成完成后通过 :mod:`plugins.anima_chatter.pipeline_state.reserve` 申请播放
+  时段，派发到后台 task 执行播放，Action 立即返回 Success。
+- LLM 在 ``plugin.sub_agent`` / ``_build_user_prompt`` 入口被流水线门阻塞，
+  累积时长达到 ``trigger_percent`` 时放行——音频还在播时下一轮 LLM 已经在
+  推理新回复。
+- 累积时长 < ``min_duration_seconds`` 时不启用流水线，走原阻塞模式。
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Annotated, Any, cast
+import time
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
 from src.app.plugin_system.api import send_api
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base import Failure
 from src.core.components.base.action import BaseAction
 
+from .. import pipeline_state
+from .._internal_compat import create_background_task
+from ..audio import read_duration_from_bytes
 from ..config import AnimaChatterConfig
 from ..heartbeat import feed_watchdog_during
 from ..markers import parse_speech_segments, strip_markers
+from ..modes import resolve_mode
 from ..prompts.scenes import (
     EMOTION_SCHEMA_DESC,
     INTENT_SCHEMA_DESC,
     LANGUAGE_SCHEMA_DESC,
 )
 from ..tts import TTSRequest, _retry_empty_audio, build_tts_backend
+
+if TYPE_CHECKING:
+    pass
 
 
 logger = get_logger("anima_chatter.action.say_and_perform")
@@ -102,7 +120,12 @@ class SayAndPerformAction(BaseAction):
         ] = "default",
         language: Annotated[str, LANGUAGE_SCHEMA_DESC] = "zh",
     ) -> tuple[bool, str]:
-        """发文本 → TTS 合成 → 本地播放 + VTS 表演。"""
+        """发文本 → TTS 合成 → 本地播放 + VTS 表演。
+
+        当 ``mode == "vtb_live"`` 且 ``[pipelining].enabled`` 时走流水线模式：
+        合成完成后立即把播放任务派发到后台，Action 提前返回 Success；其他场景
+        保留原阻塞行为（合成 + 播放都在 Action 内完成）。
+        """
 
         # 1) 规范化输入：兼容模型偶尔传 str（虽然 schema 是 list[str]）。
         if isinstance(content, str):
@@ -168,7 +191,7 @@ class SayAndPerformAction(BaseAction):
 
         AnimaChatter.mark_reply_success(self.chat_stream)
 
-        # 3) 拿 performer / audio_player
+        # 4) 拿 performer / audio_player
         performer = getattr(self.plugin, "vts_performer", None)
         audio_player = getattr(self.plugin, "audio_player", None)
 
@@ -179,7 +202,14 @@ class SayAndPerformAction(BaseAction):
             )
             return True, "已发送文本（无音频输出）"
 
-        # 4) 流水线合成（限并发） + 顺序播放
+        # 5) 流水线门判定：仅 vtb_live 模式且配置启用时走流水线
+        mode = resolve_mode(self.chat_stream)
+        pipeline_enabled = (
+            mode == "vtb_live"
+            and bool(plugin_config.pipelining.enabled)
+        )
+
+        # 6) 流水线合成（限并发） + 顺序播放
         backend = build_tts_backend(plugin_config, logger)
         semaphore = asyncio.Semaphore(max_parallel)
 
@@ -236,6 +266,19 @@ class SayAndPerformAction(BaseAction):
         # expression 命中的兜底键（intent 不命中 expression_map 时退回 emotion）。
         emotion_main = (emotion or "neutral").split(":", 1)[0].strip().lower() or "neutral"
 
+        # ── 流水线模式：先合成全部 → 计算总时长 → reserve → 派发后台 → 立即返回 ──
+        if pipeline_enabled:
+            return await self._execute_pipelined(
+                segments=segments,
+                tasks=tasks,
+                performer=performer,
+                audio_player=audio_player,
+                emotion=emotion,
+                intent=intent,
+                emotion_main=emotion_main,
+            )
+
+        # ── 阻塞模式（vtb / 通话中临时接管 / 流水线禁用）：原行为 ──
         async def consume_in_order() -> int:
             """按 idx 顺序消费合成结果并回调播放。
 
@@ -310,6 +353,259 @@ class SayAndPerformAction(BaseAction):
                 success_count = await consume_in_order()
 
         return True, f"已播放 {success_count}/{len(segments)} 段"
+
+    # ── vtb_live 流水线分支 ────────────────────────────────────
+
+    async def _execute_pipelined(
+        self,
+        *,
+        segments: list[Any],
+        tasks: list[asyncio.Task[tuple[int, Any]]],
+        performer: Any,
+        audio_player: Any,
+        emotion: str,
+        intent: str,
+        emotion_main: str,
+    ) -> tuple[bool, str]:
+        """vtb_live 流水线分支：合成完 → reserve → 派发后台 → 立即返回。
+
+        与阻塞分支的区别：
+        - 阻塞分支在 ``feed_watchdog_during`` 包装下播完才返回，stream loop 卡住；
+        - 流水线分支播放派发到后台 task 后立即返回 Success，stream loop 进入下
+          一轮 sub_agent / _build_user_prompt（在 plugin.py 入口被流水线门拦截）。
+
+        合成期间（5~10s）Action 仍会阻塞——但合成时间远小于播放时间（30s+），
+        换来的并行收益（LLM 推理 + 后台播放重叠）值得。
+        """
+
+        plugin_config = getattr(self.plugin, "config", None)
+        if not isinstance(plugin_config, AnimaChatterConfig):
+            return False, "插件配置缺失"
+
+        # 1) 等所有 segment 合成完
+        results: list[tuple[int, Any]] = await asyncio.gather(*tasks)
+        # 按 idx 排序还原原始顺序（gather 不保证顺序）
+        results.sort(key=lambda pair: pair[0])
+
+        # 2) 收集成功的 segment + 音频时长
+        valid_pairs: list[tuple[Any, Any, float]] = []  # (segment, artifact, duration)
+        total_audio_duration = 0.0
+        for idx, art in results:
+            seg = segments[idx]
+            if isinstance(art, Failure) or (
+                hasattr(art, "metadata")
+                and cast(dict, art.metadata).get("error")
+            ):
+                logger.error(f"流水线模式跳过失败段 {idx}: {seg.text[:30]}...")
+                continue
+            if not getattr(art, "audio", None):
+                logger.error(f"流水线模式跳过空音频段 {idx}: {seg.text[:30]}...")
+                continue
+            duration = read_duration_from_bytes(art.audio) or 0.0
+            if duration <= 0:
+                # 兜底：用字符数估算（理论上不应触发，因为 read_duration_from_bytes
+                # 只对 header 解析失败才返回 None）
+                from ..audio import estimate_tts_duration_by_chars
+                duration = estimate_tts_duration_by_chars(seg.text)
+                logger.warning(
+                    f"流水线模式段 {idx} 时长读取失败，按字数估算 {duration:.2f}s"
+                )
+            # wait_before 也要算进段总占用——给后续 reserve 准确时长
+            seg_total = duration + max(0.0, seg.wait_before)
+            valid_pairs.append((seg, art, seg_total))
+            total_audio_duration += seg_total
+
+        if not valid_pairs:
+            logger.warning("流水线模式：所有段合成失败，已发送文本但无音频输出")
+            return True, "已发送文本（合成全部失败）"
+
+        # 3) 总时长低于 min_duration → 退化为阻塞模式（避免短句也走流水线增加复杂度）
+        min_duration = float(plugin_config.pipelining.min_duration_seconds)
+        if total_audio_duration < min_duration:
+            logger.info(
+                f"⚠️ say_and_perform 流水线退化：本次总时长 "
+                f"{total_audio_duration:.2f}s < min_duration {min_duration:.2f}s，"
+                "本次走原阻塞模式"
+            )
+            return await self._play_blocking(
+                valid_pairs=valid_pairs,
+                performer=performer,
+                audio_player=audio_player,
+                emotion=emotion,
+                intent=intent,
+                emotion_main=emotion_main,
+            )
+
+        # 4) 申请播放时段
+        logger.info(
+            f"🎬 say_and_perform 进入流水线：合成完成 "
+            f"({len(valid_pairs)} 段, 总 {total_audio_duration:.2f}s)，开始 reserve"
+        )
+        start_at, finish_at = await pipeline_state.reserve(
+            self.chat_stream.stream_id, total_audio_duration
+        )
+
+        # 5) 派发后台播放 task —— 不等待
+        play_task = create_background_task(
+            self._background_play(
+                start_at=start_at,
+                finish_at=finish_at,
+                valid_pairs=valid_pairs,
+                performer=performer,
+                audio_player=audio_player,
+                emotion=emotion,
+                intent=intent,
+                emotion_main=emotion_main,
+                stream_id=self.chat_stream.stream_id,
+            ),
+            name=f"anima_chatter.background_play.{self.chat_stream.stream_id[:8]}",
+        )
+        # play_task 是 fire-and-forget；create_background_task 走的是框架
+        # task_manager，会在 stream 关闭时统一清理，无需在这里 await。
+        _ = play_task
+
+        logger.info(
+            f"✈️ say_and_perform 已派发后台、Action 立即返回 "
+            f"({len(valid_pairs)}/{len(segments)} 段, 后台播放预计 "
+            f"{total_audio_duration:.2f}s)"
+        )
+        return True, (
+            f"已派发 {len(valid_pairs)}/{len(segments)} 段到后台播放队列 "
+            f"(总时长 {total_audio_duration:.2f}s, 流水线 enabled)"
+        )
+
+    async def _play_blocking(
+        self,
+        *,
+        valid_pairs: list[tuple[Any, Any, float]],
+        performer: Any,
+        audio_player: Any,
+        emotion: str,
+        intent: str,
+        emotion_main: str,
+    ) -> tuple[bool, str]:
+        """阻塞播放共享逻辑（也供流水线"短句退化"路径调用）。"""
+
+        async with feed_watchdog_during(self.chat_stream.stream_id):
+            if performer is not None:
+                async with performer.speaking_session(emotion=emotion, intent=intent):
+                    played = await self._play_pairs_with_performer(
+                        valid_pairs=valid_pairs,
+                        performer=performer,
+                        intent=intent,
+                        emotion_main=emotion_main,
+                    )
+            else:
+                played = 0
+                for seg, art, _dur in valid_pairs:
+                    if seg.wait_before >= 0.1:
+                        await asyncio.sleep(seg.wait_before)
+                    if audio_player is not None:
+                        await audio_player.play_audio(art.audio)
+                        played += 1
+
+        return True, f"已播放 {played}/{len(valid_pairs)} 段"
+
+    async def _background_play(
+        self,
+        *,
+        start_at: float,
+        finish_at: float,
+        valid_pairs: list[tuple[Any, Any, float]],
+        performer: Any,
+        audio_player: Any,
+        emotion: str,
+        intent: str,
+        emotion_main: str,
+        stream_id: str,
+    ) -> None:
+        """后台播放任务：等到 start_at → 拿 performer 锁 → 串行播放所有 segment。
+
+        本协程不属于 chatter generator——stream loop 已经 yield 进入下一轮，
+        watchdog 不会管这条 task，所以**不需要喂狗**。
+
+        异常仅记日志：流水线模式下 Action 已经返回 Success，错误反馈给 LLM
+        的成本远高于直接吞掉 + 日志（参考 user 决策）。
+        """
+
+        try:
+            # 等到 reserve 的 start_at 时刻
+            now = time.monotonic()
+            wait = start_at - now
+            if wait > 0:
+                logger.info(
+                    f"⏳ [bg_play {stream_id[:8]}] 排队中：等待 {wait:.2f}s 到 start_at "
+                    f"(finish_at={finish_at - now:.2f}s)"
+                )
+                await asyncio.sleep(wait)
+                logger.info(
+                    f"🔊 [bg_play {stream_id[:8]}] 开始播放 ({len(valid_pairs)} 段)"
+                )
+            else:
+                logger.info(
+                    f"🔊 [bg_play {stream_id[:8]}] 立即开始播放 "
+                    f"({len(valid_pairs)} 段)"
+                )
+
+            # 串行播放
+            if performer is not None:
+                async with performer.speaking_session(emotion=emotion, intent=intent):
+                    await self._play_pairs_with_performer(
+                        valid_pairs=valid_pairs,
+                        performer=performer,
+                        intent=intent,
+                        emotion_main=emotion_main,
+                    )
+            elif audio_player is not None:
+                for seg, art, _dur in valid_pairs:
+                    if seg.wait_before >= 0.1:
+                        await asyncio.sleep(seg.wait_before)
+                    await audio_player.play_audio(art.audio)
+
+            logger.info(
+                f"✅ [bg_play {stream_id[:8]}] 后台播放完成 "
+                f"({len(valid_pairs)} 段全部播完)"
+            )
+        except asyncio.CancelledError:
+            logger.info(f"[bg_play {stream_id[:8]}] 后台播放被取消")
+            raise
+        except Exception as exc:
+            logger.error(
+                f"[bg_play {stream_id[:8]}] 后台播放异常: {exc}",
+                exc_info=True,
+            )
+
+    async def _play_pairs_with_performer(
+        self,
+        *,
+        valid_pairs: list[tuple[Any, Any, float]],
+        performer: Any,
+        intent: str,
+        emotion_main: str,
+    ) -> int:
+        """共享播放循环：在 ``speaking_session`` 内按 segment 顺序播。
+
+        阻塞模式 / 流水线后台模式都用这条共享路径，避免逻辑分叉。
+        """
+
+        played = 0
+        for idx, (seg, art, _dur) in enumerate(valid_pairs):
+            if seg.wait_before >= 0.1:
+                await asyncio.sleep(seg.wait_before)
+
+            await performer.start_speech_playback()
+            seg_intent = seg.motion or intent
+            await performer.switch_segment_intent(
+                seg_intent,
+                emotion_main_for_expression=emotion_main,
+            )
+            await performer.play(art.audio)
+            played += 1
+            logger.info(
+                f"已播放段 {idx}: {seg.text[:20]}... "
+                f"intent={seg_intent}"
+            )
+        return played
 
 
 __all__ = ["SayAndPerformAction"]

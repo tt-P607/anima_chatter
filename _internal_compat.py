@@ -88,6 +88,79 @@ def get_anima_chatter_plugin() -> Any | None:
         return None
 
 
+# ── 主动唤醒 stream loop 的 Wait 状态 ─────────────────────
+def wake_stream_from_wait(stream_id: str, *, only_if_new_unreads: bool = True) -> bool:
+    """让 stream loop 解除当前的 ``Wait()`` 状态并立即推进 chatter。
+
+    TODO(framework): 等 ``chat_api.wake_stream`` 公开后切回去。
+
+    背景：dfc Session 在 ``yield Wait(None)`` 时框架会记录
+    ``unread_count_at_yield``。后续只有 ``unread_count_now > unread_count_at_yield``
+    才解除 wait。但流水线模式下：
+    - Action 立即返回 → yield Wait(None) 时 unread 已经包含未处理消息
+    - 没有新弹幕进来 → 永不解除
+
+    本函数主动写入 ``_pending_wait_resume_events``，让
+    [`stream_loop_manager._wait_state_check`](src/core/transport/distribution/stream_loop_manager.py:530)
+    在下次 tick 立刻判定 "已有 pending event"，pop wait_state 并解除。
+
+    用 ``source="message"`` 注入——这样 dfc Session 收到 resume_event 时**不**
+    会走"主动构造 reminder_text 进 MODEL_TURN"那条路径（那条只对
+    ``timer / sub_agent`` source 生效），而是回到正常的 unread 检查流程：
+    没有新弹幕就直接 ``yield Wait()`` 继续等。
+
+    Args:
+        stream_id: 目标 stream。
+        only_if_new_unreads: 仅当 stream 有新于 wait 时刻的未读消息时才唤醒。
+            ``True`` 防止唤醒后没有新弹幕导致 LLM 主动发起对话；``False`` 强
+            制唤醒。默认 ``True``。
+
+    Returns:
+        bool: ``True`` 表示成功注入；``False`` 表示当前没有 wait 状态可解除
+            或没有新未读消息（此时本函数为 no-op）。
+    """
+
+    try:
+        from src.core.components.base import WaitResumeEvent
+        from src.core.transport.distribution.stream_loop_manager import (
+            get_stream_loop_manager,
+        )
+
+        slm = get_stream_loop_manager()
+        # 没有 wait_state 就别注入——避免把"正常推进中"的 chatter 干扰。
+        wait_state = slm._wait_states.get(stream_id)  # noqa: SLF001
+        if wait_state is None:
+            return False
+        # 已经有 pending event 就别叠加
+        if stream_id in slm._pending_wait_resume_events:  # noqa: SLF001
+            return False
+
+        # only_if_new_unreads：检查 wait 时刻 unread_count 是否被新增
+        if only_if_new_unreads:
+            _, _, unread_count_at_yield = wait_state
+            try:
+                from src.core.managers.stream_manager import get_stream_manager
+
+                ctx = get_stream_manager()._streams.get(stream_id)  # noqa: SLF001
+                if ctx is None:
+                    return False
+                # ctx 是 ChatStream；context.unread_messages 是当前快照
+                unread_count_now = len(ctx.context.unread_messages)
+                if unread_count_now <= unread_count_at_yield:
+                    return False
+            except Exception:  # noqa: BLE001
+                return False
+
+        slm._pending_wait_resume_events[stream_id] = WaitResumeEvent(  # noqa: SLF001
+            source="message",
+            wait_time=None,
+            unread_count=0,
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # ── 构造 NOTICE / TEXT 类 Message 注入到历史 ──────────────
 def build_notice_message(
     *,
@@ -129,4 +202,5 @@ __all__ = [
     "feed_watchdog",
     "get_anima_chatter_plugin",
     "restart_stream_loop",
+    "wake_stream_from_wait",
 ]

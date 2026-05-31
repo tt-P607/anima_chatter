@@ -6,7 +6,7 @@
 - ``vtb``：被 ``/vtb on`` 接管的普通群聊 / 私聊（VTube Studio 表演但不直播）。
 - ``vtb_live``：直播平台（如 ``bilibili_live``），观众是直播间弹幕。
 
-配置区段（共 6 个）：
+配置区段（共 7 个）：
 
 ============================ ===================================================
 section                       适用模式 / 用途
@@ -17,6 +17,7 @@ section                       适用模式 / 用途
                               （仅 vtb / vtb_live 生效）
 ``[vtb_attention]``           vtb / vtb_live 模式的"是否回复"过滤器
 ``[audio_drive]``             音频驱动律动（vtb / vtb_live 表演时让形象跟着声音动）
+``[pipelining]``              vtb_live 流水线优化（让 LLM 推理与音频播放并行）
 ``[idle_animation]``          待机动画频率与幅度（vtb / vtb_live 共用）
 ============================ ===================================================
 """
@@ -64,6 +65,16 @@ class AnimaChatterConfig(BaseConfig):
             description=(
                 "是否启用纯 Action 回合的挂起机制。关闭后，纯 Action 结果会"
                 "像常规工具结果一样继续 follow-up，而不是立即等待用户。"
+            ),
+        )
+        enable_singing: bool = Field(
+            default=True,
+            description=(
+                "是否启用唱歌能力（SingSongAction）。"
+                "关闭后插件会**完全卸载**该能力——不注册 sing_song action、"
+                "不初始化 song_library、prompt 中也不会出现任何关于唱歌的描述，"
+                "模型完全感知不到这个功能存在。"
+                "适合不想让 bot 唱歌、或者还没准备好歌库的场景。"
             ),
         )
 
@@ -216,6 +227,83 @@ class AnimaChatterConfig(BaseConfig):
             ),
         )
 
+    @config_section("pipelining", title="vtb_live 流水线优化")
+    class PipeliningSection(SectionBase):
+        """**仅 ``vtb_live`` 模式**生效的"动作流水线"优化。
+
+        痛点：直播 TTS 经常一段 30 秒以上、唱歌 1~3 分钟，原阻塞模式下
+        Bot 在播放期间完全不能响应新弹幕，弹幕会堆到队尾才被处理。
+
+        优化思路：让 Action 派发完后台播放任务后**立即返回**，并在 LLM
+        即将发起新一轮调用前（``sub_agent`` / ``_build_user_prompt`` 入口）
+        阻塞到累积播放进度达到 ``trigger_percent`` 才放行。这样：
+
+        - **物理音频**永远按队列串行播放（底层 audio_player 锁 + 时段 reserve
+          双重保证），不会重叠；
+        - **LLM 推理**与音频播放重叠，下一轮回复在上一轮播完前就准备好；
+        - **弹幕聚合**：流水线门期间积累的弹幕，被下一轮 LLM 综合处理而非
+          逐条响应，节奏更接近主播本人。
+
+        其他模式（``voice`` / ``vtb``）始终按原阻塞模式工作，不受本配置影响。
+        """
+
+        enabled: bool = Field(
+            default=True,
+            description=(
+                "vtb_live 流水线总开关。关闭后所有 Action 走原阻塞模式"
+                "（Action 阻塞到播放结束才返回），适合调试或不希望弹幕聚合的场景。"
+            ),
+        )
+        trigger_percent: float = Field(
+            default=0.6,
+            description=(
+                "本轮累积音频时长达到此比例时触发 LLM 流水线门放行（0~1）。"
+                "默认 0.6 表示总播放时长 60% 时让 LLM 醒来准备新一轮。"
+                "调小（如 0.4）→ LLM 更激进，转场更紧凑但可能偶尔抢话；"
+                "调大（如 0.8）→ LLM 更保守，节奏稳但流水线收益变小。"
+            ),
+        )
+        silence_gap_seconds: float = Field(
+            default=7.0,
+            description=(
+                "**跨轮**音频之间的强制静默间隔（秒）。上一轮所有音频播完后等"
+                "这么久才放下一轮第一段，避免接得太急显得机械。"
+                "**不影响轮内**：同一次 LLM 响应里多个 Action 紧接排队不加间隔。"
+                "**实际生效值会按 ``silence_gap_jitter`` 加随机波动**。"
+            ),
+        )
+        silence_gap_jitter: float = Field(
+            default=2.0,
+            description=(
+                "跨轮静默间隔的随机抖动幅度（秒）。每次跨轮 reserve 时实际间隔 = "
+                "``silence_gap_seconds + uniform(-jitter, +jitter)``。"
+                "默认 2.0 表示在 7±2 秒之间随机；设为 0 关闭抖动让间隔严格固定。"
+                "调大让节奏更不规律（更像真人主播），调小让节奏更稳定。"
+            ),
+        )
+        min_remaining_seconds: float = Field(
+            default=25.0,
+            description=(
+                "**距结束最少剩余秒数**——本轮播放结束前至少留这么多秒给 LLM 推理。\n"
+                "实际门时刻 = ``max(trigger_percent_gate, finish_at - min_remaining_seconds)``\n"
+                "—— trigger_percent 算出的时刻和'结束前 N 秒'取**较晚者**，"
+                "尽可能多吞吐弹幕：\n"
+                "- 短回复（30s, trigger=60%）：18s 触发（按比例）\n"
+                "- 长歌曲（180s, trigger=60%）：155s 触发（结束前 25s 唤醒，"
+                "前 155s 全都用来聚合弹幕）\n"
+                "默认 25 秒；设 0 或负数关闭，完全按 trigger_percent 等待。"
+            ),
+        )
+        min_duration_seconds: float = Field(
+            default=10.0,
+            description=(
+                "最低门槛（秒）：本轮累积音频时长低于此值时**不启用**流水线，"
+                "Action 走原阻塞模式（直接等播完才返回）。"
+                "防止短句也参与流水线导致没必要的复杂状态切换。"
+                "建议保持 10s 左右；调到 0 等于『任何时长都启用流水线』。"
+            ),
+        )
+
     @config_section("idle_animation", title="待机动画频率 / 幅度")
     class IdleAnimationSection(SectionBase):
         """vtb / vtb_live 模式下"待机自动化"动画的频率与幅度。
@@ -290,6 +378,7 @@ class AnimaChatterConfig(BaseConfig):
     vts: VTSSection = Field(default_factory=VTSSection)
     vtb_attention: VTBAttentionSection = Field(default_factory=VTBAttentionSection)
     audio_drive: AudioDriveSection = Field(default_factory=AudioDriveSection)
+    pipelining: PipeliningSection = Field(default_factory=PipeliningSection)
     idle_animation: IdleAnimationSection = Field(default_factory=IdleAnimationSection)
 
 

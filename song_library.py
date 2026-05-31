@@ -94,16 +94,16 @@ class SongLibrary:
     - 不暴露 ``get_song_as_b64`` 这种序列化接口，因为 audio_player 直接吃 bytes；
     - 扫描时同步读取每首歌的时长，给 prompt schema 用。
 
-    **mtime 缓存**：``rescan()`` 开销主要来自 ``os.listdir`` + 每首歌的
-    ``soundfile.info()``——如果歌库目录文件没有变动，重复扫盘是浪费。本类
-    在 :meth:`get_song_names` / :meth:`get_songs` / :meth:`find_song` /
-    :meth:`get_random_song_path` 等查询方法里改为先比对目录 mtime，发生变化
-    才走真正的 ``rescan()``，否则直接复用上次的内存快照。直播场景下
-    ``SingSongAction.to_schema()`` 每次 LLM 请求都会触发查询，缓存能显著降 IO。
+    **加载策略**：本类**只在 Bot 启动时（``__init__``）扫描一次**。运行时所有
+    查询接口（:meth:`get_song_names` / :meth:`get_songs` / :meth:`find_song` /
+    :meth:`get_random_song_path`）都直接走内存快照，**不再触发任何磁盘 IO**。
+    新增 / 删除歌曲需要重启 Bot 才会生效——这换来 schema 序列化（每次 LLM
+    请求都会跑）等热路径 0 IO 开销，且行为稳定可预测。
+    需要强制重新加载时调 :meth:`rescan`（仅限调试 / 测试，业务路径不应使用）。
     """
 
     def __init__(self, plugin_dir: Path, songs_rel_path: str = "") -> None:
-        """初始化歌库。
+        """初始化歌库（**启动时一次性扫描**）。
 
         Args:
             plugin_dir: 插件根目录。
@@ -119,38 +119,11 @@ class SongLibrary:
         # 歌名 → SongInfo 元数据；扫描时填充。
         self._song_map: dict[str, SongInfo] = {}
 
-        # 上次扫描时记录的目录 mtime（_songs_dir 自身的 mtime）。
-        # _ensure_fresh 会用它判断"是否有文件被增删"——目录 mtime 在文件被
-        # 创建 / 删除 / 重命名时会变化（Windows / Linux 都满足这个语义）。
-        # 仅文件**内容**修改不会让目录 mtime 变化，但歌库场景下文件内容修改
-        # 比较罕见——清唱通常只是新增 / 删除，所以 mtime 缓存够用。
-        self._cached_dir_mtime: float = -1.0
-
         if not self._songs_dir.is_dir():
             logger.info(f"清唱歌库目录不存在，已自动创建: {self._songs_dir}")
             self._songs_dir.mkdir(parents=True, exist_ok=True)
 
-        self.rescan()
-
-    def _current_dir_mtime(self) -> float:
-        """读当前 ``_songs_dir`` 的 mtime；目录不存在时返回 ``-1.0``。"""
-
-        try:
-            return self._songs_dir.stat().st_mtime
-        except OSError:
-            return -1.0
-
-    def _ensure_fresh(self) -> None:
-        """惰性刷新：只有目录 mtime 变了才重新扫盘。
-
-        每次查询接口（:meth:`get_song_names` / :meth:`get_songs` /
-        :meth:`find_song` / :meth:`get_random_song_path`）都会先调一次本方法。
-        热路径下绝大多数命中缓存，``stat()`` 开销 O(1)。
-        """
-
-        current = self._current_dir_mtime()
-        if current == self._cached_dir_mtime:
-            return
+        # 启动时扫描一次；之后所有查询都走内存快照。
         self.rescan()
 
     @property
@@ -166,18 +139,16 @@ class SongLibrary:
         return not self._song_map
 
     def rescan(self) -> int:
-        """**强制**重扫歌库，返回当前歌曲数量。
+        """重扫歌库，返回当前歌曲数量。
 
-        外部调用方一般用 :meth:`_ensure_fresh` 即可——只有想跳过 mtime 比对
-        强行重扫时（如调试 / 测试覆盖率）才直接调本方法。
+        正常运行流程**不应**主动调本方法——歌库在 :meth:`__init__` 里扫一次
+        即可。仅供调试 / 单元测试 / 未来"手动 reload"命令使用。
 
-        扫描时同步读取每首歌的时长（``soundfile.info``，不解码波形 O(1)），
-        所以不会显著拖慢 ``find_song`` / ``get_random_song_path`` 这条热路径。
+        扫描时同步读取每首歌的时长（``soundfile.info``，不解码波形 O(1)）。
         """
 
         if not self._songs_dir.is_dir():
             self._song_map = {}
-            self._cached_dir_mtime = -1.0
             return 0
 
         new_map: dict[str, SongInfo] = {}
@@ -195,20 +166,16 @@ class SongLibrary:
             )
 
         self._song_map = new_map
-        # 扫描成功后才更新 mtime——若扫描中途异常会保留旧 mtime 让下次重试。
-        self._cached_dir_mtime = self._current_dir_mtime()
         return len(new_map)
 
     def get_song_names(self) -> list[str]:
         """获取当前歌库的所有歌名（按文件名字母序，稳定）。"""
 
-        self._ensure_fresh()
         return sorted(self._song_map.keys())
 
     def get_songs(self) -> list[SongInfo]:
         """获取所有歌曲的元数据列表（按歌名字母序）。"""
 
-        self._ensure_fresh()
         return [self._song_map[name] for name in sorted(self._song_map.keys())]
 
     def get_song_list_str(self, max_show: int = 100) -> str:
@@ -245,7 +212,6 @@ class SongLibrary:
             匹配到的文件 Path；找不到返回 None。
         """
 
-        self._ensure_fresh()
         if not self._song_map:
             return None
 
@@ -276,7 +242,6 @@ class SongLibrary:
     def get_random_song_path(self) -> Path | None:
         """随机选一首歌，返回路径；歌库为空返回 None。"""
 
-        self._ensure_fresh()
         if not self._song_map:
             return None
         return random.choice(list(self._song_map.values())).path

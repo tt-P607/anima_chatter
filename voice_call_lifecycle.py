@@ -29,7 +29,7 @@ from src.app.plugin_system.api import chat_api, event_api
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.api.service_api import get_service
 
-from . import call_state
+from . import call_state, pipeline_state
 from ._internal_compat import build_notice_message, restart_stream_loop
 from .constants import CHATTER_SIGNATURE as _VOICE_CHATTER_SIGNATURE
 
@@ -253,6 +253,16 @@ async def finalize_call(
     # 否则对方在挂断瞬间说的话会被识别后注入到目标 QQ 流，造成"挂断后
     # 还能听到对方说话"的错觉。
     await _end_asr_voice_session()
+
+    # ── 1.5) 清空流水线状态 ──────────
+    # 通话挂断后切回原 chatter（kfc / dfc 等）；流水线只对 vtb_live 模式生
+    # 效，但 stream 上残留的 audio_finish_at 可能影响下一次 stream 进入
+    # vtb_live 时的首次 reserve（让它误以为还有未播完的音频要等）。挂断
+    # 时一并清掉，保证下次重新进入流水线模式时从零开始。
+    try:
+        await pipeline_state.clear(stream_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"清空流水线状态失败（忽略）: {exc}")
 
     # ── 2) 释放 chatter 接管，让 anima_chatter 主循环退出 ──
     # 也要尽早做：anima_chatter 主循环还在跑就可能继续生成消息。

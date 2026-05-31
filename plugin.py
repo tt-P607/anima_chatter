@@ -48,6 +48,7 @@ from plugins.default_chatter.type_defs import (
     SubAgentDecision,
 )
 
+from . import pipeline_state
 from .actions import (
     EndVoiceCallAction,
     SayAction,
@@ -72,6 +73,63 @@ from .vts import VTSPerformer
 
 
 logger = get_logger("anima_chatter")
+
+
+class _SafeLoggerWrapper:
+    """对 :class:`Logger` 的薄包装，仅在 ``print_panel`` 时把内容做 rich 转义。
+
+    背景：dfc Session 会用 ``logger.print_panel(_build_actor_decision_panel(...))``
+    打印 Actor 决策面板，其中 LLM 输出的 ``content`` 字段可能包含我们自定义的
+    ``[motion:NAME]...[/motion]`` 内联标记。Rich 的 ``[xxx]`` 标记会把这些方括号
+    当成 markup tag 解析——遇到无配对的 ``[/motion]`` 时直接抛
+    ``MarkupError: closing tag '[/motion]' doesn't match any open tag``，
+    把整条 stream loop 杀掉。
+
+    本包装把 ``print_panel`` 的 ``message`` 用 :func:`rich.markup.escape` 处理一遍，
+    其它方法（info/warning/error/debug 等）全部直接转发给原 logger。这样既不
+    影响 logger 本身的 markup 渲染（比如 ``[bold]xxx[/bold]`` 这种正常 markup
+    仍然有效——它们不会经过 print_panel 路径），又能让面板里出现的"原始 LLM
+    文本"安全显示。
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def info(self, *args: Any, **kwargs: Any) -> Any:
+        return self._inner.info(*args, **kwargs)
+
+    def debug(self, *args: Any, **kwargs: Any) -> Any:
+        return self._inner.debug(*args, **kwargs)
+
+    def warning(self, *args: Any, **kwargs: Any) -> Any:
+        return self._inner.warning(*args, **kwargs)
+
+    def error(self, *args: Any, **kwargs: Any) -> Any:
+        return self._inner.error(*args, **kwargs)
+
+    def print_panel(
+        self,
+        message: str,
+        title: str | None = None,
+        border_style: str | None = None,
+    ) -> None:
+        """转义 message 后转发，避免 LLM 输出的 ``[/motion]`` 等触发 rich MarkupError。"""
+
+        try:
+            from rich.markup import escape
+
+            safe = escape(message) if isinstance(message, str) else message
+        except Exception:
+            safe = message
+        try:
+            self._inner.print_panel(safe, title=title, border_style=border_style)
+        except Exception as exc:  # noqa: BLE001
+            # 终极兜底：连转义后还失败，就直接走 info 输出（至少不杀流）
+            self._inner.info(f"[panel-fallback] {title or ''}\n{safe}")
+            self._inner.debug(f"print_panel 转义后仍失败: {exc}")
 
 # 接管 / 释放命令使用的 chatter 签名常量。
 # 来自 :mod:`.constants` 的统一定义；保留模块级别名给历史调用点。
@@ -175,14 +233,24 @@ class AnimaChatter(BaseChatter):
         unread_lines: str,
         extra: str = "",
     ) -> str:
-        """构建用户提示词（按模式选择不同模板）。"""
+        """构建用户提示词（按模式选择不同模板）。
 
+        **vtb_live 流水线门**：在构造提示词前，如果配置启用了流水线，会先
+        阻塞到累积音频时长达到 ``trigger_percent`` 时刻才返回——sub_agent 钩子
+        在 timer 唤醒等路径不会被调到，这里是兜底入口。通过门后立即调
+        :func:`pipeline_state.reset_round` 标记新一轮——下次 reserve 会在
+        队列尾加 silence_gap，避免新一轮音频接得太急。
+        """
+
+        # 流水线门已经移到 fetch_unreads——这里不再 wait_gate，避免重复阻塞。
+        # _build_user_prompt 本身只构造提示词，不再插入流水线逻辑。
+        mode = self._resolve_mode(chat_stream)
         return await AnimaChatterPromptBuilder.build_user_prompt(
             chat_stream,
             history_text,
             unread_lines,
             extra,
-            mode=self._resolve_mode(chat_stream),
+            mode=mode,
         )
 
     @staticmethod
@@ -221,9 +289,46 @@ class AnimaChatter(BaseChatter):
         payload——kfc 等 chatter 收到事件后会基于它把通话历史补回 chain。
         ASR 识别 / QQ 文字消息都会经过 unread_messages 进入 chatter，所以
         统一在这里挂钩最稳妥。
+
+        **vtb_live 流水线门**：在真正拉 unread 前先 wait_gate——这样门期间到
+        达的所有弹幕都会被一并拉进来，让 sub_agent / _build_user_prompt 看
+        到的是聚合后的完整一批，而不是入门时的快照。
+        门通过后立即 reset_round，标记下一次 reserve 是新一轮。
+
+        wait_gate 在「累积 < min_duration」或「门已过」时立即返回，所以非
+        阻塞路径上的 fetch_unreads（每个 tick 都会调一次）不会被空转拖累。
         """
 
         from . import call_state as _cs
+
+        # ── vtb_live 流水线门（关键聚合点） ──
+        # 必须放在 super().fetch_unreads() 之前——这样阻塞期间到达的新弹幕
+        # 会进入 stream context.unread_messages，门通过后由 super 一次性
+        # 全部拉出来给 dfc Session。
+        try:
+            from src.core.managers import get_stream_manager
+
+            chat_stream = await get_stream_manager().activate_stream(self.stream_id)
+        except Exception:
+            chat_stream = None
+        if chat_stream is not None and self._resolve_mode(chat_stream) == "vtb_live":
+            from . import pipeline_state as _ps
+
+            had_gate = False
+            if _ps.get_settings().enabled:
+                # 先看一眼累积是否够触发——日志只在真要等的时候打
+                state_snap = _ps._states.get(self.stream_id)
+                if (
+                    state_snap is not None
+                    and state_snap.round_accumulated >= _ps.get_settings().min_duration_seconds
+                ):
+                    had_gate = True
+            await _ps.wait_gate(self.stream_id)
+            await _ps.reset_round(self.stream_id)
+            if had_gate:
+                logger.info(
+                    "📨 fetch_unreads 通过流水线门，准备聚合期间累积的所有弹幕"
+                )
 
         unread_lines, unread_msgs = await super().fetch_unreads(time_format=time_format)
         if not unread_msgs:
@@ -300,6 +405,12 @@ class AnimaChatter(BaseChatter):
         - 私聊：直通响应（与 dfc 一致；一对一对话不需要过滤）。
         - vtb / vtb_live：通过本地概率门 + dfc decision_agent 决策。
 
+        **vtb_live 流水线门**：在 vtb_live 模式下，无论原决策结果如何，都先
+        阻塞到累积音频播放进度达到 ``trigger_percent`` 时刻——避免 LLM 在上
+        一轮还在播放时就抢着说话。"决定响应"的请求通过门后调
+        :func:`pipeline_state.reset_round` 标记新一轮开始，让下一次 reserve
+        把 silence_gap 加到队列起点。
+
         注意力过滤的 LLM 调用、token 截断、JSON 解析降级**全部交给 dfc 的
         :func:`plugins.default_chatter.decision_agent.decide_should_respond`，
         anima 这里只负责按 mode 选 prompt 模板。
@@ -315,6 +426,24 @@ class AnimaChatter(BaseChatter):
                 "should_respond": True,
                 "reason": "voice 模式跳过过滤，直接响应",
             }
+
+        # ── vtb_live 弹幕摘要日志 ─────────────────────
+        # 流水线门已经在 fetch_unreads 处统一处理；这里只负责打印聚合后的弹幕
+        # 预览，让用户清晰看到本次会被打包给 LLM 的完整内容（流水线门可能聚
+        # 合了 N 条）。
+        if mode == "vtb_live":
+            preview_lines = [
+                f"  - {m.sender_name or m.sender_id}: {(m.processed_plain_text or str(m.content) or '').strip()[:60]}"
+                for m in unread_msgs[:5]
+            ]
+            preview_text = "\n".join(preview_lines)
+            more_hint = (
+                f"\n  ... 共 {len(unread_msgs)} 条" if len(unread_msgs) > 5 else ""
+            )
+            logger.info(
+                f"🚀 sub_agent 收到 {len(unread_msgs)} 条聚合弹幕（流水线门已通过），"
+                f"打包发给 LLM 决策：\n{preview_text}{more_hint}"
+            )
 
         if str(chat_stream.chat_type).lower() == "private":
             return {
@@ -663,7 +792,7 @@ class AnimaChatter(BaseChatter):
             usable_adapter=self,
             tool_execution_adapter=self,
             sub_agent_adapter=self,
-            logger_adapter=logger,
+            logger_adapter=_SafeLoggerWrapper(logger),
             plain_text_adapter=self,
         )
 
@@ -727,11 +856,12 @@ class AnimaChatterPlugin(BasePlugin):
     async def on_plugin_loaded(self) -> None:
         """注册提示词模板，并按配置初始化 VTB 资源（AudioPlayer + VTS）。
 
-        实际工作拆成三个私有方法：
+        实际工作拆成四个私有方法：
         1. :meth:`_register_prompts` — 注册 system / user / sub_agent prompt
            （voice / vtb / vtb_live 三个 user prompt 改为数据驱动注册）。
         2. :meth:`_init_audio_resources` — 初始化 AudioPlayer + VTSPerformer。
         3. :meth:`_init_song_library` — 扫描清唱歌库目录。
+        4. :meth:`_init_pipeline` — 把 ``[pipelining]`` 配置注入流水线状态机。
         """
 
         self._register_prompts()
@@ -741,8 +871,13 @@ class AnimaChatterPlugin(BasePlugin):
             logger.warning("插件配置加载异常，VTB 模式将无法播放音频或驱动 VTS。")
             return
 
+        self._init_pipeline(config)
         await self._init_audio_resources(config)
-        self._init_song_library()
+        if config.plugin.enable_singing:
+            self._init_song_library()
+        else:
+            logger.info("唱歌能力已通过 config.plugin.enable_singing=false 关闭，跳过歌库初始化")
+            self.song_library = None
 
     def _register_prompts(self) -> None:
         """注册 anima_chatter 在 prompt manager 上的全部模板。
@@ -821,6 +956,26 @@ class AnimaChatterPlugin(BasePlugin):
                 policies=sub_agent_policies,
             )
 
+    def _init_pipeline(self, config: AnimaChatterConfig) -> None:
+        """把 ``[pipelining]`` section 注入流水线状态机。
+
+        本配置仅在 ``vtb_live`` 模式下生效——通过 :meth:`AnimaChatter.sub_agent`
+        和 :meth:`AnimaChatter._build_user_prompt` 入口的 mode 判断把控；
+        其他模式（voice / vtb）即便 enabled=true 也不会启用流水线。
+        """
+
+        section = config.pipelining
+        pipeline_state.configure(
+            pipeline_state.PipelineSettings(
+                enabled=bool(section.enabled),
+                trigger_percent=float(section.trigger_percent),
+                silence_gap_seconds=float(section.silence_gap_seconds),
+                silence_gap_jitter=float(getattr(section, "silence_gap_jitter", 0.0)),
+                min_duration_seconds=float(section.min_duration_seconds),
+                min_remaining_seconds=float(getattr(section, "min_remaining_seconds", 25.0)),
+            )
+        )
+
     async def _init_audio_resources(self, config: AnimaChatterConfig) -> None:
         """初始化本地 AudioPlayer 与 VTSPerformer。"""
 
@@ -891,19 +1046,30 @@ class AnimaChatterPlugin(BasePlugin):
         self.audio_player = None
 
     def get_components(self) -> list[type]:
-        """返回插件组件。"""
+        """返回插件组件。
 
-        return [
+        ``SingSongAction`` 受 ``config.plugin.enable_singing`` 控制——
+        关闭时不注册到组件列表，框架完全感知不到这个 action 存在，prompt
+        里也不会出现任何唱歌相关的工具描述（schema 不再被序列化进去）。
+        """
+
+        components: list[type] = [
             AnimaChatter,
             SayAction,
             SayAndPerformAction,
-            SingSongAction,
             AnimaPassAndWaitAction,
             StartVoiceCallAction,
             EndVoiceCallAction,
             VTBCommand,
             VoiceCommand,
         ]
+
+        config = self.config if isinstance(self.config, AnimaChatterConfig) else None
+        # 配置缺失时默认启用——保持向后兼容（首次加载/配置错误不应丢功能）。
+        if config is None or config.plugin.enable_singing:
+            components.insert(3, SingSongAction)
+
+        return components
 
 
 __all__ = [

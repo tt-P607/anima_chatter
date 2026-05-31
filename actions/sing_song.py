@@ -19,11 +19,20 @@
   让虚拟形象不至于唱整首都同一个姿势。
 - **响度归一化**：歌曲 / TTS 都走 audio_player 同一套 loudness_target_dbfs
   做 RMS 拉齐，避免直播间观众一会儿响一会儿轻。
-- **watchdog 喂狗**：整段播放期间通过 ``feed_watchdog_during`` 防止 chatter
-  心跳过期被强制重启（清唱可能 30 秒以上）。
+- **watchdog 喂狗**：阻塞模式下整段播放期间通过 ``feed_watchdog_during`` 防
+  止 chatter 心跳过期被强制重启（清唱可能 30 秒以上）。
 - **Schema 动态歌单**：``to_schema()`` 被覆写——在每次序列化 action schema
   时实时读取插件挂的 ``song_library``，把当前歌单（含时长）拼到 song_keyword
   的描述里。模型每次看到的都是最新真实歌库，不会虚构曲名。
+
+**vtb_live 流水线模式**（仅在 ``mode == "vtb_live"`` + ``[pipelining].enabled``
+同时满足时启用）：
+
+- 通过 :func:`pipeline_state.reserve` 申请播放时段（基于 SongInfo 的预读时长，
+  无需重新解码）；
+- pre_song_delay 也算进 reserve 总时长——后台 task 才会真正等待这段静默；
+- 派发到后台 task 执行播放，Action 立即返回 Success；
+- 唱歌轻松超过 min_duration_seconds（默认 10s），实际场景下 100% 走流水线。
 """
 
 from __future__ import annotations
@@ -37,9 +46,13 @@ from src.app.plugin_system.api import send_api
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base.action import BaseAction
 
+from .. import pipeline_state
+from .._internal_compat import create_background_task
+from ..audio import read_duration_from_path
 from ..config import AnimaChatterConfig
 from ..constants import normalize_intent, split_emotion
 from ..heartbeat import feed_watchdog_during
+from ..modes import resolve_mode
 
 
 logger = get_logger("anima_chatter.action.sing_song")
@@ -78,13 +91,16 @@ def _build_song_keyword_desc(library: Any | None) -> str:
     """
 
     base = (
-        "要唱的歌曲名称——必须从下面【可用歌单】里选，**不能虚构曲名**。\n"
-        "支持精确匹配 / 归一化匹配（去掉括号 / 空格）/ 模糊匹配。\n"
+        "要唱的歌曲名称——**必须严格**从下面【可用歌单】里选一首，**不能虚构曲名**。\n"
+        "支持精确匹配 / 归一化匹配（去掉括号 / 空格）/ 模糊匹配（阈值 60）。\n"
         "留空或填 ``random`` / ``随机`` 时由系统随机选一首。\n"
-        "**重要**：如果观众点的歌不在歌单里，**不要**硬调本动作（系统会自动"
-        "回退到随机一首，但歌名不对）——你应该改用 ``say_and_perform`` "
-        "礼貌地说\"这首我没练过\"或\"等我下次直播再练\"之类的话术，再问"
-        "他要不要听其他歌。"
+        "\n"
+        "**【极其重要】关于歌单外的歌曲**：\n"
+        "- 如果观众点的歌**不在下面歌单里**，**绝对不要**硬调本动作。"
+        "系统不会再做随机回退——传入找不到的歌名会**直接失败并返回错误**，"
+        "本轮唱歌动作不会执行。\n"
+        "- 正确做法：改用 ``say_and_perform`` 并以符合你人设的口吻对此（无法演唱该曲目）做出回应，你拥有完全的自主权来决定如何拒绝或引导观众。\n"
+        "- 在调用前，请务必先核对下面这份【可用歌单】。"
     )
     if library is None:
         return base + "\n\n【可用歌单】（暂未加载，请稍后重试）"
@@ -95,7 +111,7 @@ def _build_song_keyword_desc(library: Any | None) -> str:
         return base + "\n\n【可用歌单】（读取失败）"
 
     if not songs:
-        return base + "\n\n【可用歌单】（歌库为空）"
+        return base + "\n\n【可用歌单】（歌库目前为空，请按你的人设口吻处理此情况）"
 
     lines = [
         f"- ``{song.name}``（时长 {_format_duration(song.duration_seconds)}）"
@@ -231,9 +247,10 @@ class SingSongAction(BaseAction):
         "- ``sing_song`` 是**唱歌**——直接播放本地已经翻唱好的音频文件\n"
         "  TTS 朗读歌词不算唱歌，听起来很怪。如果你想唱歌就只能调这个动作\n"
         "\n"
-        "**只能选歌库里已有的歌**——歌单见 ``song_keyword`` 参数描述。"
-        "**库里没有的歌**：用 say_and_perform 礼貌说\"这首没练过\"\"下次准备\"，"
-        "**不要**强行调本动作，更**不要**用 TTS 朗读歌词冒充。\n"
+        "**严格限制：只能选歌库里已有的歌**——歌单见 ``song_keyword`` 参数描述。"
+        "**库里没有的歌**：改用 say_and_perform 并以符合你人设的口吻做出回应（如拒绝、改唱其他歌或引导点歌）。\n"
+        "**绝对不要**强行调本动作传入歌单外的曲名——会直接失败，没有随机回退。\n"
+        "**绝对不要**用 TTS 朗读歌词来冒充唱歌。\n"
         "\n"
         "**唱歌期间你不能说话**——歌曲会全程播放完才能继续 say_and_perform。"
         "想表达\"切歌\"\"停下\"等想法，可以等歌唱完再 say_and_perform。"
@@ -337,7 +354,12 @@ class SingSongAction(BaseAction):
             "或 SHY_DOWN 低头深呼吸，让观众看着虚拟形象\"准备开口\"的过程。",
         ] = 4.0,
     ) -> tuple[bool, str]:
-        """执行播放：找歌 → 发开场白 → 启动时间轴 task → 推到 audio_player → 等播完。"""
+        """执行播放：找歌 → 发开场白 → (流水线模式：reserve + 派发后台) → 立即返回。
+
+        ``vtb_live`` 模式下走流水线：通过 :func:`pipeline_state.reserve` 申请
+        播放时段后立即返回，pre_song_delay + 歌曲实际时长 = reserve 总时长。
+        其他模式（vtb）保留原阻塞行为。
+        """
 
         plugin_config = getattr(self.plugin, "config", None)
         if not isinstance(plugin_config, AnimaChatterConfig):
@@ -349,23 +371,32 @@ class SingSongAction(BaseAction):
         if library.is_empty:
             return False, "歌库为空——请把清唱文件放到 plugins/anima_chatter/songs/ 目录"
 
-        # 找歌路径——library.find_song 已包含模糊匹配；空关键词随机。
+        # 1) 找歌路径
         keyword = (song_keyword or "").strip()
         song_path: Path | None = None
-        if keyword and keyword.lower() not in {"random", "随机"}:
+        if not keyword or keyword.lower() in {"random", "随机"}:
+            song_path = library.get_random_song_path()
+            if song_path is None:
+                return False, "歌库为空，无法随机选曲"
+        else:
             song_path = library.find_song(keyword)
             if song_path is None:
-                logger.info(f"未匹配到歌曲 '{keyword}'，回退随机选曲")
-                song_path = library.get_random_song_path()
-        else:
-            song_path = library.get_random_song_path()
-
-        if song_path is None:
-            return False, "歌库为空或无法选出歌曲"
+                # 关键变更：找不到不再回退随机；明确告诉模型这首没有，
+                # 让它去说话拒绝而不是糊弄一首。
+                available = library.get_song_names()
+                preview = "、".join(available[:8]) if available else "（歌库为空）"
+                more = f"...等共 {len(available)} 首" if len(available) > 8 else ""
+                logger.info(
+                    f"歌单内未找到歌曲 '{keyword}'，拒绝执行（不回退随机）"
+                )
+                return False, (
+                    f"执行失败：歌单里没有《{keyword}》这首歌。可用歌单预览：{preview}{more}。"
+                    "请根据此执行结果，以符合你人设的口吻做出回应。"
+                )
 
         song_name = song_path.stem
 
-        # 1) 发开场白。直播间观众听不到这段，但 QQ 群朋友能看到字。
+        # 2) 发开场白
         text_to_send = announce.strip() or f"♪ 我来唱一首《{song_name}》"
         try:
             await send_api.send_text(
@@ -376,14 +407,14 @@ class SingSongAction(BaseAction):
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"发送唱歌开场白失败: {exc}")
 
-        # 2) 拿 audio_player + performer
+        # 3) 拿 audio_player + performer
         audio_player = getattr(self.plugin, "audio_player", None)
         performer = getattr(self.plugin, "vts_performer", None)
 
         if audio_player is None:
             return False, "audio_player 未初始化（可能 audio 配置缺失），无法播放"
 
-        # 3) 读文件（响度归一化由 audio_player 在 play_audio 内统一处理）
+        # 4) 读文件 bytes（响度归一化由 audio_player 在 play_audio 内统一处理）
         try:
             audio_bytes = song_path.read_bytes()
         except Exception as exc:  # noqa: BLE001
@@ -393,7 +424,7 @@ class SingSongAction(BaseAction):
         if not audio_bytes:
             return False, "歌曲文件为空"
 
-        # 4) 解析 motion_timeline
+        # 5) 解析 motion_timeline
         timeline = _parse_motion_timeline(motion_timeline)
         if timeline:
             logger.info(
@@ -401,67 +432,120 @@ class SingSongAction(BaseAction):
                 f"{[(round(t[0], 1), t[1]) for t in timeline]}"
             )
 
+        # 6) 计算开场静默 + 歌曲时长
+        pre_delay = max(0.0, float(pre_song_delay))
+        song_duration = read_duration_from_path(song_path) or 0.0
+        if song_duration <= 0:
+            logger.warning(
+                f"无法读取歌曲时长 path={song_path}，流水线模式下将以 60s 兜底"
+            )
+            song_duration = 60.0
+
         logger.info(
-            f"开始播放歌曲: {song_name} ({len(audio_bytes)} bytes) → audio_player"
+            f"🎵 sing_song 处理歌曲: 《{song_name}》 ({len(audio_bytes)} bytes, "
+            f"时长 {song_duration:.1f}s, pre_delay {pre_delay:.1f}s)"
         )
 
-        # 4.5) 开场停顿：让观众有时间静下来再开始唱。
-        # 这段停顿在 speaking_session **外**进行，避免占用 VTS 锁，让其它流程
-        # 能继续走（虽然这里 anima_chatter 是单流，但出于良好实践仍这样做）。
-        pre_delay = max(0.0, float(pre_song_delay))
+        # 7) 流水线门判定
+        mode = resolve_mode(self.chat_stream)
+        pipeline_enabled = (
+            mode == "vtb_live"
+            and bool(plugin_config.pipelining.enabled)
+        )
+
+        # ── 流水线分支：reserve + 派发后台 + 立即返回 ──
+        if pipeline_enabled:
+            total_duration = pre_delay + song_duration
+            min_duration = float(plugin_config.pipelining.min_duration_seconds)
+            if total_duration < min_duration:
+                # 短歌（极罕见）走阻塞模式
+                logger.info(
+                    f"⚠️ sing_song 流水线退化：歌曲总时长 {total_duration:.2f}s < "
+                    f"min_duration {min_duration:.2f}s，本次走原阻塞模式"
+                )
+                return await self._play_blocking(
+                    audio_bytes=audio_bytes,
+                    audio_player=audio_player,
+                    performer=performer,
+                    timeline=timeline,
+                    pre_delay=pre_delay,
+                    song_name=song_name,
+                )
+
+            logger.info(
+                f"🎬 sing_song 进入流水线：《{song_name}》"
+                f" 总 {total_duration:.1f}s ({pre_delay:.1f}s 静默 + "
+                f"{song_duration:.1f}s 歌曲)，开始 reserve"
+            )
+            start_at, finish_at = await pipeline_state.reserve(
+                self.chat_stream.stream_id, total_duration
+            )
+
+            create_background_task(
+                self._background_play(
+                    start_at=start_at,
+                    pre_delay=pre_delay,
+                    audio_bytes=audio_bytes,
+                    audio_player=audio_player,
+                    performer=performer,
+                    timeline=timeline,
+                    song_name=song_name,
+                    stream_id=self.chat_stream.stream_id,
+                ),
+                name=f"anima_chatter.background_sing.{self.chat_stream.stream_id[:8]}",
+            )
+
+            logger.info(
+                f"✈️ sing_song 已派发后台、Action 立即返回 "
+                f"(《{song_name}》, 后台播放预计 {total_duration:.1f}s)"
+            )
+            return True, (
+                f"已派发歌曲《{song_name}》到后台播放队列 "
+                f"(总时长 {total_duration:.1f}s, 流水线 enabled)"
+            )
+
+        # ── 阻塞分支（vtb 模式或流水线禁用）：原行为 ──
+        return await self._play_blocking(
+            audio_bytes=audio_bytes,
+            audio_player=audio_player,
+            performer=performer,
+            timeline=timeline,
+            pre_delay=pre_delay,
+            song_name=song_name,
+        )
+
+    # ── 共享播放路径 ────────────────────────────────────────
+
+    async def _play_blocking(
+        self,
+        *,
+        audio_bytes: bytes,
+        audio_player: Any,
+        performer: Any,
+        timeline: list[tuple[float, str, str]],
+        pre_delay: float,
+        song_name: str,
+    ) -> tuple[bool, str]:
+        """阻塞模式：在 chatter generator 内部播完才返回。沿用原行为 + 喂狗。"""
+
+        # 开场停顿（在 speaking_session 外，避免占用 VTS 锁）
         if pre_delay > 0:
             logger.info(f"sing_song 开场停顿 {pre_delay:.1f}s 后开始播放")
             await asyncio.sleep(pre_delay)
 
-        # 5) 唱歌期间防 watchdog；用 speaking_session 让虚拟形象嘴型 / 身体跟动。
-        # 时间轴 task 在 speaking_session 内启动，在歌结束 / 异常时通过 stop_event
-        # 触发它退出。
         stop_event = asyncio.Event()
         timeline_task: asyncio.Task[None] | None = None
 
         try:
             async with feed_watchdog_during(self.chat_stream.stream_id):
-                if performer is not None:
-                    # 时间轴第一个 cue 决定 speaking_session 的初始 emotion / intent；
-                    # 这样首段就能立即生效，不用等 0 秒 cue 触发后再切。
-                    if timeline and timeline[0][0] <= 0.5:
-                        first_intent = timeline[0][1]
-                        first_emo_main = timeline[0][2]
-                        # 用 happy:2 作为强度默认；模型如果传了带 level 的会保留。
-                        initial_emotion = f"{first_emo_main}:2"
-                        initial_intent = first_intent
-                    else:
-                        initial_emotion = "happy:1"
-                        initial_intent = "NARRATING"
-
-                    async with performer.speaking_session(
-                        emotion=initial_emotion, intent=initial_intent
-                    ):
-                        # 启动时间轴后台任务（如果 timeline 非空）
-                        if timeline:
-                            started_at = time.monotonic()
-                            # 跳过首个 cue 如果它已经被 speaking_session 的 initial 设了
-                            tail_timeline = (
-                                timeline[1:]
-                                if timeline[0][0] <= 0.5
-                                else timeline
-                            )
-                            if tail_timeline:
-                                timeline_task = asyncio.create_task(
-                                    _run_motion_timeline(
-                                        timeline=tail_timeline,
-                                        performer=performer,
-                                        started_at=started_at,
-                                        stop_event=stop_event,
-                                    ),
-                                    name=f"sing_song_timeline_{song_name[:20]}",
-                                )
-
-                        # 不调 start_speech_playback——唱歌不需要触发 hotkey。
-                        # 让 audio_player 跑，VTS 麦克风口型 + 时间轴 task 自动同步。
-                        await audio_player.play_audio(audio_bytes)
-                else:
-                    await audio_player.play_audio(audio_bytes)
+                await self._play_with_timeline(
+                    audio_bytes=audio_bytes,
+                    audio_player=audio_player,
+                    performer=performer,
+                    timeline=timeline,
+                    stop_event=stop_event,
+                    song_name=song_name,
+                )
         except asyncio.CancelledError:
             stop_event.set()
             raise
@@ -470,7 +554,6 @@ class SingSongAction(BaseAction):
             logger.error(f"播放歌曲失败: {exc}", exc_info=True)
             return False, f"播放歌曲失败: {exc}"
         finally:
-            # 不论成功失败，让时间轴任务安静退出
             stop_event.set()
             if timeline_task is not None and not timeline_task.done():
                 timeline_task.cancel()
@@ -481,6 +564,138 @@ class SingSongAction(BaseAction):
 
         logger.info(f"歌曲播放完成: {song_name}")
         return True, f"已播放歌曲: {song_name}"
+
+    async def _background_play(
+        self,
+        *,
+        start_at: float,
+        pre_delay: float,
+        audio_bytes: bytes,
+        audio_player: Any,
+        performer: Any,
+        timeline: list[tuple[float, str, str]],
+        song_name: str,
+        stream_id: str,
+    ) -> None:
+        """后台播放任务：等到 start_at → pre_delay → 播放歌曲。
+
+        本协程脱离 chatter generator，无需喂狗——stream loop 已经 yield 进入
+        下一轮。异常仅记日志（流水线模式失败反馈给 LLM 成本太高）。
+        """
+
+        try:
+            now = time.monotonic()
+            wait = start_at - now
+            if wait > 0:
+                logger.info(
+                    f"⏳ [bg_sing {stream_id[:8]}] 排队中：等待 {wait:.2f}s "
+                    f"到 start_at（《{song_name}》）"
+                )
+                await asyncio.sleep(wait)
+
+            if pre_delay > 0:
+                logger.info(
+                    f"🎤 [bg_sing {stream_id[:8]}] 开场停顿 {pre_delay:.1f}s "
+                    f"后开始播放《{song_name}》"
+                )
+                await asyncio.sleep(pre_delay)
+
+            logger.info(
+                f"🎵 [bg_sing {stream_id[:8]}] 开唱：《{song_name}》"
+            )
+            stop_event = asyncio.Event()
+            try:
+                await self._play_with_timeline(
+                    audio_bytes=audio_bytes,
+                    audio_player=audio_player,
+                    performer=performer,
+                    timeline=timeline,
+                    stop_event=stop_event,
+                    song_name=song_name,
+                )
+            finally:
+                stop_event.set()
+
+            logger.info(
+                f"✅ [bg_sing {stream_id[:8]}] 唱完了：《{song_name}》"
+            )
+        except asyncio.CancelledError:
+            logger.info(f"[bg_sing {stream_id[:8]}] 后台歌曲被取消: {song_name}")
+            raise
+        except Exception as exc:
+            logger.error(
+                f"[bg_sing {stream_id[:8]}] 后台播放异常 {song_name}: {exc}",
+                exc_info=True,
+            )
+
+    async def _play_with_timeline(
+        self,
+        *,
+        audio_bytes: bytes,
+        audio_player: Any,
+        performer: Any,
+        timeline: list[tuple[float, str, str]],
+        stop_event: asyncio.Event,
+        song_name: str,
+    ) -> None:
+        """共享播放循环：在 ``speaking_session`` 内启动 timeline + 播音频。
+
+        阻塞模式 / 流水线后台模式都用这条共享路径，避免逻辑分叉。
+        ``stop_event`` 仅用于让 timeline_task 在异常时同步退出。
+        """
+
+        timeline_task: asyncio.Task[None] | None = None
+
+        if performer is not None:
+            # 时间轴第一个 cue 决定 speaking_session 的初始 emotion / intent；
+            # 这样首段就能立即生效，不用等 0 秒 cue 触发后再切。
+            if timeline and timeline[0][0] <= 0.5:
+                first_intent = timeline[0][1]
+                first_emo_main = timeline[0][2]
+                # 用 happy:2 作为强度默认；模型如果传了带 level 的会保留。
+                initial_emotion = f"{first_emo_main}:2"
+                initial_intent = first_intent
+            else:
+                initial_emotion = "happy:1"
+                initial_intent = "NARRATING"
+
+            async with performer.speaking_session(
+                emotion=initial_emotion, intent=initial_intent
+            ):
+                # 启动时间轴后台任务（如果 timeline 非空）
+                if timeline:
+                    started_at = time.monotonic()
+                    # 跳过首个 cue 如果它已经被 speaking_session 的 initial 设了
+                    tail_timeline = (
+                        timeline[1:]
+                        if timeline[0][0] <= 0.5
+                        else timeline
+                    )
+                    if tail_timeline:
+                        timeline_task = asyncio.create_task(
+                            _run_motion_timeline(
+                                timeline=tail_timeline,
+                                performer=performer,
+                                started_at=started_at,
+                                stop_event=stop_event,
+                            ),
+                            name=f"sing_song_timeline_{song_name[:20]}",
+                        )
+
+                try:
+                    # 不调 start_speech_playback——唱歌不需要触发 hotkey。
+                    # 让 audio_player 跑，VTS 麦克风口型 + 时间轴 task 自动同步。
+                    await audio_player.play_audio(audio_bytes)
+                finally:
+                    if timeline_task is not None and not timeline_task.done():
+                        stop_event.set()
+                        timeline_task.cancel()
+                        try:
+                            await timeline_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+        else:
+            await audio_player.play_audio(audio_bytes)
 
 
 __all__ = ["SingSongAction"]
