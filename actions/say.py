@@ -28,6 +28,8 @@ class SayAction(BaseAction):
     """把要说的话发送到 TTS 后端并交给适配器播放（语音通话模式）。"""
 
     action_name = "say"
+    # 真实可见性由 go_activate（通话中 / platform=local_asr）严格约束。
+    associated_types = ["voice", "text", "image", "emoji"]
     action_description = (
         "在实时语音通话中说出一段话。content 会进入 TTS 后端并由适配器播放。"
         "支持 [wait:n] 控制下一段播放前等待 n 秒（仅在需要长停顿、换气或思考时使用，"
@@ -35,7 +37,6 @@ class SayAction(BaseAction):
         "[wait] 只影响语音片段播放间隔，不会让聊天流等待；说完等待用户时请另外调用 pass_and_wait。"
     )
     chatter_allow = ["anima_chatter"]
-    associated_platforms = ["local_asr"]
     dependencies = ["asr_adapter_anima:adapter:asr_adapter_anima"]
 
     async def go_activate(self) -> bool:
@@ -58,7 +59,10 @@ class SayAction(BaseAction):
 
     async def execute(
         self,
-        content: Annotated[str, "要通过 TTS 说出的内容，可包含 [wait:n] 和 [emotion:name] 标记"],
+        content: Annotated[
+            str,
+            "要通过 TTS 说出的内容。注意：跨语言表达必须拆分为多次 Action 调用，每轮调用仅包含一种成句语言并设置对应的 language 参数。",
+        ],
         style: Annotated[
             str,
             "TTS 语音风格。可选：default（默认中性，绝大多数场景用这个）、"

@@ -58,6 +58,7 @@ class SayAndPerformAction(BaseAction):
     """通过虚拟形象（VTube Studio）说一段话并设定情绪与意图（vtb 模式）。"""
 
     action_name = "say_and_perform"
+    associated_types = ["voice", "text"]
     action_description = (
         "通过 VTube Studio 虚拟形象说一段话。会同时把文本发到当前聊天，"
         "用 TTS 朗读，并驱动虚拟形象的嘴型 + 表情 + 头部姿态。"
@@ -102,7 +103,10 @@ class SayAndPerformAction(BaseAction):
                 "- 适合朗读：短句、自然、口语化，避免 Markdown、列表、(笑)/[动作] 等无法朗读的标记\n"
                 "- 善用标点传递情绪：感叹号惊讶兴奋、问号疑问好奇、省略号犹豫思考\n"
                 "- 灵活使用语气词：诶咦哇呀啊（惊讶）、嗯唔额（思考）、嘛呐嘻（撒娇）\n"
-                "- 同一次调用所有段落共享同一个 emotion / intent，跨情绪时要拆成多次调用\n"
+                "【跨参数拆分准则】：\n"
+                "- 同一次调用所有段落强制共享同一个 emotion / intent / language / style，无法分段切换。\n"
+                "- **跨情绪**：必须拆分为多次 Action 调用。\n"
+                "- **跨语言**：当出现不同语种的成句表达时，必须拆分为多次 Action 调用。避免在一次调用中通过 auto 模式混合多语种，以维持音色稳定。\n"
                 "【行内 motion 标记 — 高级用法】：\n"
                 "- 可以在 content 里用 [motion:NAME]...[/motion] 临时切换 intent 动作，"
                 "让句子中段做不同动作。NAME 取值同 intent（如 EXCITED / SHY_DOWN / PROUD_LIFT）\n"

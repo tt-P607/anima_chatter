@@ -84,6 +84,7 @@ class StartVoiceCallAction(BaseAction):
     """
 
     action_name = "start_voice_call"
+    associated_types = ["text"]
     action_description = (
         "在当前**私聊**里发起一次本地语音通话。"
         "调用后：你的回复会被 TTS 通过本机扬声器播放出来（不再以文字形式发到当前对话），"
@@ -144,9 +145,27 @@ class StartVoiceCallAction(BaseAction):
         except RuntimeError as exc:
             return False, f"启动通话失败：{exc}"
 
-        # 在 messages_in_call 第一条插入系统注解，作为通话上下文的边界标记。
-        # 这条会随事件 payload 透传给 kfc handler，让 kfc 在重组 chain_payloads
-        # 时知道"这一段是发生在电话里的"，并且能看到具体的通话开始时间。
+        # ── 2.0) 提前反查通话发起方身份（必须在写入 NOTICE 边界前做） ──
+        # 为什么要先做：``_resolve_caller_identity`` 倒序扫 history 找最近的
+        # 非 bot 消息。如果先把 NOTICE 边界写进 history（sender_id="system"），
+        # 即便加了 message_type 过滤，仍存在过滤不彻底的边角情况。
+        # 把反查放在 NOTICE 写入之前，从源头消除这种风险。
+        if not platform:
+            await call_state.clear_active_call()
+            return False, "当前流缺少 platform 信息，无法启动语音通话"
+
+        target_user_id, target_user_name = _resolve_caller_identity(self.chat_stream)
+        if not target_user_id:
+            await call_state.clear_active_call()
+            return False, (
+                "无法确定通话发起方在该平台上的真实 ID（最近无对方消息记录）。"
+                "请等对方先在私聊中发一条消息后再重试。"
+            )
+
+        # ── 2.5) 在 messages_in_call 第一条插入系统注解，作为通话上下文的
+        # 边界标记。这条会随事件 payload 透传给 kfc handler，让 kfc 在重组
+        # chain_payloads 时知道"这一段是发生在电话里的"，并且能看到具体的
+        # 通话开始时间。
         import datetime as _datetime
 
         started_human = _datetime.datetime.fromtimestamp(active.started_at).strftime(
@@ -160,8 +179,8 @@ class StartVoiceCallAction(BaseAction):
         )
         await call_state.record_system_note(stream_id, note_text)
 
-        # ── 2.5) 注入 history_messages 边界（给 DFC 等无状态 chatter 看） ──
-        # 构造一条 system 类型的 Message 注入到框架通用历史中。
+        # ── 2.6) 注入 history_messages 边界（给 DFC 等无状态 chatter 看） ──
+        # 构造一条 NOTICE 类型的 Message 注入到框架通用历史中。
         # 这样 DFC 切回来时能看到明确的通话边界，不必改 DFC 源码。
         history_msg = build_notice_message(
             message_id=f"call_start_{active.started_at}",
@@ -173,22 +192,6 @@ class StartVoiceCallAction(BaseAction):
         self.chat_stream.context.add_history_message(history_msg)
 
         # ── 3) 启动 ASR 通话会话（启动 runtime + 切 always_on + 设 redirect） ──
-        if not platform:
-            await call_state.clear_active_call()
-            return False, "当前流缺少 platform 信息，无法启动语音通话"
-
-        # 从最近的 history_messages 反查通话发起方在该平台上的真实 ID。
-        # 为什么要这样：ASR 识别出的文本要"以通话发起方的身份"上行到目标
-        # stream，否则下游会把 ASR 适配器自己的 speaker_id（"local_microphone"）
-        # 当成新用户，触发"创建新流 + napcat 发消息时把 'local_microphone'
-        # 当 QQ 号 int(...) 直接崩"的连环错误。
-        target_user_id, target_user_name = _resolve_caller_identity(self.chat_stream)
-        if not target_user_id:
-            await call_state.clear_active_call()
-            return False, (
-                "无法确定通话发起方在该平台上的真实 ID（最近无对方消息记录）。"
-                "请等对方先在私聊中发一条消息后再重试。"
-            )
 
         if not await _start_asr_voice_session(
             platform,
@@ -255,6 +258,7 @@ class EndVoiceCallAction(BaseAction):
     """挂断当前语音通话并广播结束事件。"""
 
     action_name = "end_voice_call"
+    associated_types = ["text"]
     action_description = (
         "挂断当前语音通话并切回正常聊天。"
         "调用场景：你和用户已经说完想说的话、用户说要挂断、或者你判断没有继续语音的必要了。"

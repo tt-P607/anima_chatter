@@ -15,6 +15,7 @@ class AnimaPassAndWaitAction(BaseAction):
     """登记等待用户继续说话或等待指定秒数后主动恢复。"""
 
     action_name = "pass_and_wait"
+    associated_types = ["text"]
     action_description = (
         "为当前实时通话/虚拟形象会话登记等待点。说完话后调用它等待用户继续说话；"
         "seconds 为空时等待新输入，传入秒数时到时主动恢复。"

@@ -23,18 +23,73 @@
 
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator
 
 from src.app.plugin_system.api import chat_api, event_api
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.api.service_api import get_service
 
 from . import call_state, pipeline_state
-from ._internal_compat import build_notice_message, restart_stream_loop
+from ._internal_compat import build_notice_message, feed_watchdog, restart_stream_loop
 from .constants import CHATTER_SIGNATURE as _VOICE_CHATTER_SIGNATURE
 
 
 logger = get_logger("anima_chatter.voice_call_lifecycle")
+
+
+# Watchdog 喂狗间隔。框架 stream_warning_threshold 默认 40s、stream_restart_threshold
+# 默认 300s；2s 间隔足够把心跳保持在 warning 阈值之下。
+_WATCHDOG_FEED_INTERVAL_SECONDS: float = 2.0
+
+
+@asynccontextmanager
+async def _keep_watchdog_alive(stream_id: str) -> AsyncIterator[None]:
+    """在长阻塞操作期间持续喂 watchdog，避免触发 stream_restart_threshold。
+
+    通话发起时 ``_start_asr_voice_session`` 会同步等待 ASR runtime 启动
+    （冷启动可能阻塞 25 秒以上），告别时 ``_play_farewell_via_tts`` 也会
+    阻塞数秒做 TTS 合成与播放。如果不喂狗，框架会先打 warning，进而触发
+    stream 强制重启，把通话流程整个打断。
+
+    本 context manager 起一个后台 task 每 ``_WATCHDOG_FEED_INTERVAL_SECONDS``
+    秒喂一次狗，退出时自动取消该任务。喂狗本身是同步操作，开销可忽略。
+    """
+    stop_event = asyncio.Event()
+
+    async def _feed_loop() -> None:
+        # 进入即喂一次，确保即便阻塞动作还没让出协程也能抢先标记心跳。
+        try:
+            feed_watchdog(stream_id)
+        except Exception:  # noqa: BLE001 - 喂狗失败不应影响主流程
+            pass
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(),
+                    timeout=_WATCHDOG_FEED_INTERVAL_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                try:
+                    feed_watchdog(stream_id)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    task = asyncio.create_task(
+        _feed_loop(),
+        name=f"anima_chatter.watchdog_keepalive.{stream_id[:8]}",
+    )
+    try:
+        yield
+    finally:
+        stop_event.set()
+        try:
+            await asyncio.wait_for(task, timeout=1.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            task.cancel()
+        except Exception:  # noqa: BLE001 - 清理失败不应影响主流程
+            task.cancel()
 
 
 # asr_adapter 的转发服务签名。
@@ -67,10 +122,29 @@ def _resolve_caller_identity(chat_stream: Any) -> tuple[str, str]:
     扫描 ``context.history_messages`` 找最近一条**对方发的**消息——
     在私聊里 bot 自己的 ``sender_id == bot_id``，对方就是非 bot 的发送方。
 
+    跳过条件：
+    - bot 自己发的消息（``sender_id == bot_id``）
+    - 系统通知类消息（``message_type == MessageType.NOTICE``）。
+      ``start_voice_call`` 会在调用本函数前往 history 写一条边界标注
+      （``sender_id="system"``）；如果不跳过，本函数会把它当作通话对方
+      返回，导致 ASR 转发使用 ``"system"`` 作为 user_id，下游 onebot
+      adapter 在 ``int("system")`` 时崩溃，并且会因 sender_id 错误
+      生成新 stream_id，把后续 ASR 文本路由到一个空白 chatter 上。
+    - ``sender_id`` 为 ``"system"`` 等通用关键字（兜底，覆盖 NOTICE 没正确
+      标记 message_type 的边角情况）。
+
     Returns:
         ``(user_id, user_name)``。找不到时 user_id 为空字符串，调用方应据此
         提前拒绝 voice_call（通话靠对方真实 ID 路由，没有 ID 后续会崩）。
     """
+
+    # 延迟 import：MessageType 是框架内部模型，与 plugin_system.api 暴露
+    # 的公共类型解耦；import 失败时退化为只用 sender_id 关键字过滤。
+    try:
+        from src.core.models.message import MessageType
+        notice_type: Any = MessageType.NOTICE
+    except Exception:  # noqa: BLE001 - import 失败应退化而非崩溃
+        notice_type = None
 
     bot_id = str(getattr(chat_stream, "bot_id", "") or "")
     history = list(getattr(chat_stream.context, "history_messages", []) or [])
@@ -79,10 +153,13 @@ def _resolve_caller_identity(chat_stream: Any) -> tuple[str, str]:
     # 倒序扫描，先看 unread 再看 history——优先用最新一条。
     for msg in reversed(unread + history):
         sender_id = str(getattr(msg, "sender_id", "") or "")
-        if not sender_id:
+        if not sender_id or sender_id.lower() == "system":
             continue
         if bot_id and sender_id == bot_id:
             continue  # 跳过 bot 自己发的消息
+        # 跳过系统通知类消息（如 voice_call 自己写入的边界标注）
+        if notice_type is not None and getattr(msg, "message_type", None) == notice_type:
+            continue
         sender_name = str(getattr(msg, "sender_name", "") or sender_id)
         return sender_id, sender_name
     return "", ""
@@ -103,6 +180,11 @@ async def _start_asr_voice_session(
 
     通过 ``asr_adapter:service:asr_redirect`` Service 调用——保证插件之间
     通过公开 Service 接口通信，不直接 import 对方源码。
+
+    ASR runtime 冷启动（首次加载模型 / 检查依赖）可能阻塞 20 秒以上，期间
+    chatter generator 处于 await 状态、不会喂 watchdog；本函数包一层
+    ``_keep_watchdog_alive`` 持续喂狗，避免触发 ``stream_restart_threshold``
+    把整个通话流程打断。
     """
 
     service = get_service(_ASR_REDIRECT_SERVICE)
@@ -113,13 +195,14 @@ async def _start_asr_voice_session(
         )
         return False
     try:
-        return await service.start_voice_call_session(  # type: ignore[attr-defined]
-            platform,
-            stream_id,
-            target_user_id=user_id,
-            target_user_name=user_name,
-            target_group_id=group_id,
-        )
+        async with _keep_watchdog_alive(stream_id):
+            return await service.start_voice_call_session(  # type: ignore[attr-defined]
+                platform,
+                stream_id,
+                target_user_id=user_id,
+                target_user_name=user_name,
+                target_group_id=group_id,
+            )
     except Exception as exc:
         logger.error(
             f"启动 ASR 通话会话失败 platform={platform} stream={stream_id}: {exc}",
@@ -172,6 +255,9 @@ async def _play_farewell_via_tts(
     通话语义下"告别"应该是通话里的最后一句话——通过扬声器说出来，而不是
     挂断后再单独发一条 QQ 文字消息。
 
+    TTS 合成 + 播放是个数秒级的阻塞操作，整段包在 ``_keep_watchdog_alive``
+    内持续喂狗，避免框架在告别期间触发 stream 重启。
+
     出错时就静默吞掉——告别语不是关键路径，挂断流程必须能继续走完。
     """
 
@@ -192,15 +278,16 @@ async def _play_farewell_via_tts(
             logger.warning("挂断告别音频：插件配置不可用，跳过")
             return
 
-        backend = build_tts_backend(plugin_config, logger)
-        artifact = await backend.synthesize(
-            TTSRequest(stream_id=stream_id, text=farewell_text)
-        )
-        if artifact.audio:
-            await audio_player.play_audio(artifact.audio)
-            logger.info(f"已通过 TTS 播放挂断告别词: {farewell_text[:30]}")
-        else:
-            logger.warning(f"挂断告别 TTS 返回空音频 stream={stream_id}")
+        async with _keep_watchdog_alive(stream_id):
+            backend = build_tts_backend(plugin_config, logger)
+            artifact = await backend.synthesize(
+                TTSRequest(stream_id=stream_id, text=farewell_text)
+            )
+            if artifact.audio:
+                await audio_player.play_audio(artifact.audio)
+                logger.info(f"已通过 TTS 播放挂断告别词: {farewell_text[:30]}")
+            else:
+                logger.warning(f"挂断告别 TTS 返回空音频 stream={stream_id}")
     except Exception as exc:
         logger.warning(f"播放挂断告别音频失败 stream={stream_id}: {exc}", exc_info=True)
 

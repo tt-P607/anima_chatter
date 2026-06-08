@@ -220,14 +220,38 @@ async def record_user_message(stream_id: str, text: str, *, ts: float | None = N
 
     若 ``stream_id`` 不匹配当前通话 → 静默丢弃（防御调用方传错 stream）。
     刷新 ``last_activity_at``——只要有用户输入，超时计时器重置。
+
+    **幂等去重**：anima_chatter 在 ``fetch_unreads`` 钩子里把通话期间的
+    用户消息塞进 ``messages_in_call``，但同一批 unread 在 chatter 主循环
+    重试 / 续轮时可能被 ``fetch_unreads`` 多次返回。为避免通话稿出现
+    重复条目（"【第 1 轮 / 用户】咪 / 【第 2 轮 / 用户】咪"），按 ``ts``
+    + ``text`` 的组合去重：相同 ts 与 text 的 user 消息只记录一次。
+    没有 ``ts`` 的消息退化为按 ``text`` 去重，仍能避免视觉上的重复。
     """
 
     async with _lock:
         if _active_call is None or _active_call.caller_stream_id != stream_id:
             return
         now = time.time()
+        normalized_ts = float(ts) if ts is not None else now
+
+        # 幂等去重：扫描已有 user 消息中是否已存在 (text, ts) 完全相同的条目
+        for existing in _active_call.messages_in_call:
+            if existing.get("role") != "user":
+                continue
+            if existing.get("text") != text:
+                continue
+            existing_ts = existing.get("ts")
+            # 同 text + 同 ts（精确到秒级）视为重复；ts 不存在时仅按 text 去重
+            if ts is None or (
+                isinstance(existing_ts, (int, float))
+                and abs(float(existing_ts) - normalized_ts) < 0.5
+            ):
+                _active_call.last_activity_at = now
+                return
+
         _active_call.messages_in_call.append(
-            {"role": "user", "text": text, "ts": float(ts) if ts is not None else now}
+            {"role": "user", "text": text, "ts": normalized_ts}
         )
         _active_call.last_activity_at = now
 
