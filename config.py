@@ -215,6 +215,10 @@ class AnimaChatterConfig(BaseConfig):
             default=True,
             description="是否启用音频驱动律动；关闭后退回固定 sin 波动逻辑",
         )
+        organic_enabled: bool = Field(
+            default=True,
+            description="说话时头部微动用 value noise 替代 sin，去机械周期感；关闭回退旧 sin",
+        )
         head_y_gain: float = Field(
             default=8.0,
             description="头部前后倾灵敏度（rms × gain → v_head_y 度数）",
@@ -338,9 +342,19 @@ class AnimaChatterConfig(BaseConfig):
         blink_min_interval: float = Field(default=1.8, description="眨眼最小间隔（秒）")
         blink_max_interval: float = Field(default=4.0, description="眨眼最大间隔（秒）")
 
+        # 有机微动：待机头身微动用 value noise 替代 sin 叠加，去机械周期感
+        organic_enabled: bool = Field(
+            default=True,
+            description="待机头身微动用 value noise 替代 sin；关闭回退旧 sin 行为",
+        )
+
         # 呼吸频率（Hz）+ 振幅。0.28Hz ≈ 17 次/分，正常人呼吸节奏
         breath_freq: float = Field(default=0.28, description="呼吸频率 Hz")
         breath_amplitude: float = Field(default=0.9, description="呼吸 head_z 振幅（度）")
+        breath_body_amplitude: float = Field(
+            default=1.2,
+            description="呼吸带动身体上下起伏振幅（v_body_y 度数），0 关闭",
+        )
 
         # 眼神扫视：真人微眼动 0.2-0.6 秒/次，0.5-1.8 让眼神持续微动不显呆
         saccade_min_interval: float = Field(default=0.5, description="扫视最小间隔（秒）")

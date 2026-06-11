@@ -23,18 +23,45 @@ from .scenes import (
 )
 
 
+def _is_live_adapter_enabled(adapter: object) -> bool:
+    """判断一个直播 adapter 是否真正启用（而非仅被登记）。
+
+    直播 adapter 即使 ``[plugin].enabled = false`` 也会留在 adapter_manager
+    里，但不会建立长连、不会投递弹幕。检测活跃源时必须排除这种挂名实例，
+    否则只开一个平台也会被误判成多平台同播。
+
+    优先调 adapter 的 ``_is_plugin_enabled()``；没有则回退读
+    ``plugin.config.plugin.enabled``；都拿不到时保守视为启用。
+    """
+
+    probe = getattr(adapter, "_is_plugin_enabled", None)
+    if callable(probe):
+        try:
+            return bool(probe())
+        except Exception:
+            return True
+    plugin = getattr(adapter, "plugin", None)
+    config = getattr(plugin, "config", None)
+    plugin_section = getattr(config, "plugin", None)
+    return bool(getattr(plugin_section, "enabled", True))
+
+
 def _detect_active_live_sources() -> frozenset[str]:
     """检测当前有哪些直播 adapter 在跑，返回它们的 ``source_platform`` 集合。
 
     通过 ``adapter_api`` 拿活跃 adapter 实例列表，过滤出有 ``source_platform``
-    类属性的实例（约定：直播 adapter 必须在类上声明 ``source_platform``，
-    与 envelope 的 ``additional_config.source_platform`` 一致）。
+    类属性、且 ``[plugin].enabled`` 为真的实例（约定：直播 adapter 必须在类上
+    声明 ``source_platform``，与 envelope 的 ``additional_config.source_platform``
+    一致）。
 
     设计要点：
     - 不直接 import 任何具体直播 adapter 模块，**保持 anima_chatter 与各
       直播 adapter 之间零硬依赖**。
     - 任何带 ``source_platform`` 类属性的 adapter 都会被识别为"直播来源"，
       未来加 Twitch / YouTube 适配器只要遵循该约定即可，无需改 anima_chatter。
+    - **必须排除 enabled=false 的挂名 adapter**：它们仍登记在 adapter_manager
+      里、``source_platform`` 类属性也在，但实际不投递弹幕。不排除会导致只开
+      一个平台时被误判成多平台同播，错误注入多平台限流提示词。
     """
 
     try:
@@ -46,7 +73,7 @@ def _detect_active_live_sources() -> frozenset[str]:
     try:
         for adapter in adapter_api.get_all_adapters().values():
             source = getattr(adapter, "source_platform", "")
-            if source:
+            if source and _is_live_adapter_enabled(adapter):
                 sources.add(str(source))
     except Exception:
         return frozenset()

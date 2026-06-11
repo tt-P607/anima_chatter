@@ -24,6 +24,7 @@ from typing import Any
 from src.app.plugin_system.api.log_api import get_logger
 
 from .base import BaseAnimator
+from .noise import fbm
 
 
 logger = get_logger("anima_chatter.vts.auto_animator")
@@ -109,6 +110,15 @@ class AutoAnimator(BaseAnimator):
 
         # ── 头部微动幅度倍率（1.5x = 比原版动得明显） ──
         self._head_micro_scale: float = float(getattr(cfg, "head_micro_scale", 1.5))
+
+        # ── 有机微动：用 value noise 替代 sin 叠加，去掉机械周期感 ──
+        self._organic_enabled: bool = bool(getattr(cfg, "organic_enabled", True))
+        # 呼吸带动身体起伏的幅度（度），0 关闭。
+        self._breath_body_amplitude: float = float(
+            getattr(cfg, "breath_body_amplitude", 1.2)
+        )
+        # 噪声相位随机起点，避免每次启动从同一处开始。
+        self._noise_phase: float = random.uniform(0, 1000)
 
         # ── 身体随机晃动相位 ──────────────────────────
         self.sway_offsets: list[float] = [random.uniform(0, 100) for _ in range(4)]
@@ -448,17 +458,31 @@ class AutoAnimator(BaseAnimator):
 
         # 6) 头部/身体随机微动（_head_micro_scale 控制总幅度，1.0 为原版）
         scale = self._head_micro_scale
-        head_micro_x = (
-            math.sin(elapsed * 0.12 + self.sway_offsets[0]) * 2.5 * scale
-            + math.sin(elapsed * 0.05 + self.sway_offsets[1]) * 1.5 * scale
-        )
-        head_micro_y = (
-            math.cos(elapsed * 0.1 + self.sway_offsets[2]) * 2.0 * scale
-            + math.cos(elapsed * 0.07 + self.sway_offsets[3]) * 1.0 * scale
-        )
-        body_sway_z = (
-            math.sin(elapsed * 0.07 + self.sway_offsets[1]) * 1.8 * scale
-            + math.sin(elapsed * 0.03 + self.sway_offsets[3]) * 1.2 * scale
+        if self._organic_enabled:
+            # 有机微动：用 value noise 替代 sin 叠加，去掉可预判的周期感。
+            # 不同 seed 让三个轴各走一条独立的平滑随机曲线。
+            nt = (elapsed + self._noise_phase) * 0.12
+            head_micro_x = fbm(nt, seed=1) * 4.0 * scale
+            head_micro_y = fbm(nt, seed=2) * 3.0 * scale
+            body_sway_z = fbm(nt * 0.6, seed=3) * 3.0 * scale
+        else:
+            head_micro_x = (
+                math.sin(elapsed * 0.12 + self.sway_offsets[0]) * 2.5 * scale
+                + math.sin(elapsed * 0.05 + self.sway_offsets[1]) * 1.5 * scale
+            )
+            head_micro_y = (
+                math.cos(elapsed * 0.1 + self.sway_offsets[2]) * 2.0 * scale
+                + math.cos(elapsed * 0.07 + self.sway_offsets[3]) * 1.0 * scale
+            )
+            body_sway_z = (
+                math.sin(elapsed * 0.07 + self.sway_offsets[1]) * 1.8 * scale
+                + math.sin(elapsed * 0.03 + self.sway_offsets[3]) * 1.2 * scale
+            )
+
+        # 呼吸带动身体上下起伏：与头部呼吸 breath_z 同相，注入 v_body_y。
+        breath_body_y = (
+            math.sin(elapsed * self.breath_freq * 2 * math.pi)
+            * self._breath_body_amplitude
         )
 
         # 7) 状态过渡：is_performing 时让自动化淡出
@@ -494,7 +518,7 @@ class AutoAnimator(BaseAnimator):
             breath_z + self.macro_current_params.get("v_head_z", 0.0) + head_osc_z + self.passive_sway_val
         )
         raw_output["v_body_x"] = self.macro_current_params.get("v_body_x", 0.0)
-        raw_output["v_body_y"] = self.macro_current_params.get("v_body_y", 0.0)
+        raw_output["v_body_y"] = self.macro_current_params.get("v_body_y", 0.0) + breath_body_y
         raw_output["v_body_z"] = (
             body_sway_z
             + self.macro_current_params.get("v_body_z", 0.0)

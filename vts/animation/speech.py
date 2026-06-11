@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ...constants import normalize_intent, split_emotion
 from .base import BaseAnimator
+from .noise import fbm
 
 if TYPE_CHECKING:
     from ...audio import EnvelopeTracker
@@ -58,6 +59,10 @@ class SpeechAnimator(BaseAnimator):
         self._neutral_attenuation: float = float(
             getattr(cfg, "neutral_attenuation", 0.5)
         )
+        # 有机微动开关：说话时的头部摆动用 noise 替代 sin，去机械感。
+        self._organic_enabled: bool = bool(getattr(cfg, "organic_enabled", True))
+        # 噪声相位随机起点。
+        self._noise_phase: float = time.time() % 1000
 
         # 当前状态
         self.intent: str = "IDLE"
@@ -239,21 +244,28 @@ class SpeechAnimator(BaseAnimator):
             self.target_params["v_eye_x"] += math.sin(elapsed * math.pi * 0.5) * 0.1
             self.target_params["v_eye_y"] += math.cos(elapsed * math.pi * 0.4) * 0.1
 
-        # 说话时的动态偏移：原始固定 sin 波动 + emotion=3 时的强化抖动
+        # 说话时的动态偏移：噪声微动，幅度按情绪强度放大
         dynamic_y = 0.0
         dynamic_x = 0.0
         dynamic_z = 0.0
         dynamic_body_y = 0.0
         if self.is_speaking:
             speaking_elapsed = time.time() - self.speaking_start_time
-            dynamic_y = math.sin(speaking_elapsed * math.pi * 1.2) * 3.0 - 1.5
-
-            if self.emotion_level == 3:
-                if self.emotion_type == "happy":
-                    dynamic_z = math.sin(speaking_elapsed * math.pi * 0.8) * 15.0
-                elif self.emotion_type == "angry":
-                    dynamic_x = math.sin(speaking_elapsed * math.pi * 4.0) * 1.2
-                    dynamic_z = math.sin(speaking_elapsed * math.pi * 5.0) * 1.2
+            if self._organic_enabled:
+                # 情绪越强动得越明显（level 1~3 → 1.0~2.0 倍）。
+                emo_gain = 1.0 + (self.emotion_level - 1) * 0.5
+                nt = (speaking_elapsed + self._noise_phase) * 0.5
+                dynamic_y = fbm(nt, seed=11) * 3.0 * emo_gain
+                dynamic_x = fbm(nt, seed=12) * 2.0 * emo_gain
+                dynamic_z = fbm(nt * 0.7, seed=13) * 4.0 * emo_gain
+            else:
+                dynamic_y = math.sin(speaking_elapsed * math.pi * 1.2) * 3.0 - 1.5
+                if self.emotion_level == 3:
+                    if self.emotion_type == "happy":
+                        dynamic_z = math.sin(speaking_elapsed * math.pi * 0.8) * 15.0
+                    elif self.emotion_type == "angry":
+                        dynamic_x = math.sin(speaking_elapsed * math.pi * 4.0) * 1.2
+                        dynamic_z = math.sin(speaking_elapsed * math.pi * 5.0) * 1.2
 
         # ── 音频驱动律动叠加 ────────────────────────────────
         # 把当前 TTS 音频包络读出来，按"音量 → 头部前倾 / 横向摆 / 身体律动"
