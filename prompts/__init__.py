@@ -17,13 +17,14 @@ from .builder import AnimaChatterPromptBuilder
 from .scenes import (
     EMOTION_SCHEMA_DESC,
     INTENT_SCHEMA_DESC,
-    LANGUAGE_SCHEMA_DESC,
     VOICE_SCENE_GUIDE,
     VTB_LIVE_SCENE_GUIDE,
     VTB_SCENE_GUIDE,
 )
 from .templates import (
     MODE_PROMPT_PROFILES,
+    PLAIN_TEXT_REMINDER_VTB,
+    PLAIN_TEXT_REMINDER_VOICE,
     SYSTEM_PROMPT,
     USER_PROMPT_TEMPLATE,
     ModePromptProfile,
@@ -36,10 +37,12 @@ __all__ = [
     "USER_PROMPT_TEMPLATE",
     "MODE_PROMPT_PROFILES",
     "ModePromptProfile",
+    # handle_plain_text_response 提醒文案
+    "PLAIN_TEXT_REMINDER_VOICE",
+    "PLAIN_TEXT_REMINDER_VTB",
     # action schema 通用描述
     "EMOTION_SCHEMA_DESC",
     "INTENT_SCHEMA_DESC",
-    "LANGUAGE_SCHEMA_DESC",
     # 场景文案（一般不用直接 import，留给单测 / 调试）
     "VOICE_SCENE_GUIDE",
     "VTB_LIVE_SCENE_GUIDE",

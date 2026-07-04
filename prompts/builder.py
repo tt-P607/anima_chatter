@@ -262,8 +262,14 @@ class AnimaChatterPromptBuilder:
         tmpl = get_prompt_manager().get_template("anima_chatter_system_prompt")
         if not tmpl:
             return ""
+        # 注：``<personality>`` 块的 ``{nickname}`` 是「角色人设名」，应取全局
+        # ``personality.nickname``（如"爱莉希雅"），而非 ``chat_stream.bot_nickname``
+        # ——后者是「平台账号显示名」（如抖音 adapter 默认的"抖音主播"），二者职责
+        # 不同。这里与 sub_agent prompt（plugin.py 注册时用的就是 personality.nickname）
+        # 保持一致。
+        personality_nickname = get_core_config().personality.nickname
         return await (
-            tmpl.set("nickname", chat_stream.bot_nickname)
+            tmpl.set("nickname", personality_nickname)
             .set(
                 "action_suspend_guidance",
                 AnimaChatterPromptBuilder.build_action_suspend_guidance(

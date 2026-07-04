@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import soundfile as sf  # type: ignore
-from rapidfuzz import process
+from rapidfuzz import fuzz, process
 
 from src.app.plugin_system.api.log_api import get_logger
 
@@ -49,14 +49,17 @@ class SongInfo:
     """单首歌的元数据。
 
     Attributes:
-        name: 文件名（不含扩展名）。这就是模型 schema 里看到的歌名。
-        path: 文件绝对路径。
+        name: 歌名（单文件取文件名去扩展名；子文件夹双轨取文件夹名）。
+        path: 人声 / 主音轨文件绝对路径。这一路进 VB-Cable 驱动口型。
         duration_seconds: 音频时长（秒）。无法读取时为 ``None``。
+        inst_path: 伴奏文件绝对路径（仅子文件夹双轨歌有）。这一路走系统扬声器，
+            不进 VB-Cable，避免伴奏带动口型。单轨歌为 ``None``。
     """
 
     name: str
     path: Path
     duration_seconds: float | None
+    inst_path: Path | None = None
 
 
 def _format_duration(seconds: float | None) -> str:
@@ -152,21 +155,68 @@ class SongLibrary:
             return 0
 
         new_map: dict[str, SongInfo] = {}
-        for filename in os.listdir(self._songs_dir):
-            lower = filename.lower()
-            if not lower.endswith(_SUPPORTED_FORMATS):
+        for entry in os.listdir(self._songs_dir):
+            full = self._songs_dir / entry
+            # 子文件夹 = 双轨歌（vocal + inst），文件夹名即歌名。
+            if full.is_dir():
+                info = self._scan_song_folder(full)
+                if info is not None:
+                    new_map[info.name] = info
                 continue
-            song_name = os.path.splitext(filename)[0]
-            full_path = self._songs_dir / filename
-            duration = _read_duration(full_path)
-            new_map[song_name] = SongInfo(
-                name=song_name,
-                path=full_path,
-                duration_seconds=duration,
-            )
+            # 顶层单文件 = 老格式单轨歌，照旧只播这一个文件。
+            if entry.lower().endswith(_SUPPORTED_FORMATS):
+                song_name = os.path.splitext(entry)[0]
+                new_map[song_name] = SongInfo(
+                    name=song_name,
+                    path=full,
+                    duration_seconds=_read_duration(full),
+                )
 
         self._song_map = new_map
         return len(new_map)
+
+    @staticmethod
+    def _find_track(folder: Path, *keywords: str) -> Path | None:
+        """在文件夹里按关键词找音轨文件（文件名含任一关键词，忽略大小写）。"""
+
+        for filename in os.listdir(folder):
+            lower = filename.lower()
+            if not lower.endswith(_SUPPORTED_FORMATS):
+                continue
+            if any(kw in lower for kw in keywords):
+                return folder / filename
+        return None
+
+    def _scan_song_folder(self, folder: Path) -> SongInfo | None:
+        """扫描一个歌曲子文件夹，配对 vocal + inst 两轨。
+
+        约定：文件名含 ``vocal`` / ``voice`` / ``人声`` 的是人声轨、
+        含 ``inst`` / ``伴奏`` / ``accomp`` 的是伴奏轨。
+        找不到人声轨时退化——取文件夹里第一个音频文件当人声单轨播。
+        """
+
+        vocal = self._find_track(folder, "vocal", "人声")
+        inst = self._find_track(folder, "inst", "伴奏", "accomp" ,"other")
+
+        if vocal is None:
+            # 没标 vocal：取第一个音频文件兜底当人声单轨。
+            for filename in sorted(os.listdir(folder)):
+                if filename.lower().endswith(_SUPPORTED_FORMATS):
+                    vocal = folder / filename
+                    break
+        if vocal is None:
+            return None  # 空文件夹，跳过
+
+        # 伴奏不能和人声是同一个文件
+        if inst is not None and inst == vocal:
+            inst = None
+
+        return SongInfo(
+            name=folder.name,
+            path=vocal,
+            duration_seconds=_read_duration(vocal),
+            inst_path=inst,
+        )
 
     def get_song_names(self) -> list[str]:
         """获取当前歌库的所有歌名（按文件名字母序，稳定）。"""
@@ -197,24 +247,28 @@ class SongLibrary:
         head = formatted[:max_show]
         return f"[{'、'.join(head)}...]（共 {len(formatted)} 首，仅展示前 {max_show} 首）"
 
-    def find_song(self, keyword: str) -> Path | None:
-        """按关键词查找歌曲路径。
+    def _match_song_info(self, keyword: str) -> SongInfo | None:
+        """统一的歌曲匹配核心，返回完整 :class:`SongInfo`；找不到返回 None。
 
-        匹配优先级：
+        匹配优先级（从严到松）：
         1. 精确匹配（忽略大小写）
         2. 归一化匹配（去掉括号 / 空格 / 标点）
-        3. rapidfuzz 模糊匹配（阈值 60）
+        3. **子串包含匹配**——歌名包含关键词、或关键词包含歌名。歌库歌名常带
+           歌手 / 出处前缀（如 ``三Z-STUDIO _ HOYO-MiX - 捉迷藏``），而模型 /
+           观众往往只说核心歌名（``捉迷藏``），所以子串命中最符合直觉。命中多个
+           时取归一化后最短的（最贴近"纯歌名"那条）。
+        4. rapidfuzz 模糊匹配——用 ``partial_ratio``（对"关键词是歌名子串"的场景
+           天然高分），阈值 ``>= 60``。
 
         Args:
-            keyword: 用户传的歌名关键词。
+            keyword: 用户 / 模型传的歌名关键词。
 
         Returns:
-            匹配到的文件 Path；找不到返回 None。
+            匹配到的 :class:`SongInfo`；找不到返回 None。
         """
 
         if not self._song_map:
             return None
-
         lowered = keyword.lower().strip()
         if not lowered:
             return None
@@ -222,22 +276,54 @@ class SongLibrary:
         # 1) 精确匹配
         for name, info in self._song_map.items():
             if name.lower() == lowered:
-                return info.path
+                return info
 
         # 2) 归一化匹配
         norm_keyword = _normalize(keyword)
         if norm_keyword:
             for name, info in self._song_map.items():
                 if _normalize(name) == norm_keyword:
-                    return info.path
+                    return info
 
-        # 3) rapidfuzz 模糊匹配
+        # 3) 子串包含匹配（双向）：歌名含关键词 或 关键词含歌名。
+        # 命中多条时取归一化名最短的——最接近"纯歌名"，避免误命中更长的曲目。
+        if norm_keyword:
+            candidates: list[tuple[int, SongInfo]] = []
+            for name, info in self._song_map.items():
+                norm_name = _normalize(name)
+                if not norm_name:
+                    continue
+                if norm_keyword in norm_name or norm_name in norm_keyword:
+                    candidates.append((len(norm_name), info))
+            if candidates:
+                candidates.sort(key=lambda pair: pair[0])
+                return candidates[0][1]
+
+        # 4) rapidfuzz 模糊匹配（partial_ratio 更适合子串场景，阈值 >= 60）
         names = list(self._song_map.keys())
-        result = process.extractOne(keyword, names)
-        if result is not None and result[1] > 60:
-            return self._song_map[result[0]].path
+        result = process.extractOne(keyword, names, scorer=fuzz.partial_ratio)
+        if result is not None and result[1] >= 60:
+            return self._song_map[result[0]]
 
         return None
+
+    def find_song(self, keyword: str) -> Path | None:
+        """按关键词查找歌曲路径；找不到返回 None。
+
+        匹配规则见 :meth:`_match_song_info`。
+        """
+
+        info = self._match_song_info(keyword)
+        return info.path if info is not None else None
+
+    def find_song_info(self, keyword: str) -> SongInfo | None:
+        """按关键词查找歌曲，返回完整 :class:`SongInfo`（含伴奏轨）。
+
+        匹配规则与 :meth:`find_song` 完全一致（见 :meth:`_match_song_info`），
+        只是返回整个 SongInfo 而非单 Path——双轨播放需要拿到 ``inst_path``。
+        """
+
+        return self._match_song_info(keyword)
 
     def get_random_song_path(self) -> Path | None:
         """随机选一首歌，返回路径；歌库为空返回 None。"""
@@ -245,6 +331,13 @@ class SongLibrary:
         if not self._song_map:
             return None
         return random.choice(list(self._song_map.values())).path
+
+    def get_random_song_info(self) -> SongInfo | None:
+        """随机选一首歌，返回完整 :class:`SongInfo`（含伴奏轨）；空库返回 None。"""
+
+        if not self._song_map:
+            return None
+        return random.choice(list(self._song_map.values()))
 
 
 def _normalize(text: str) -> str:

@@ -1,4 +1,4 @@
-"""anima_chatter 插件配置。
+﻿"""anima_chatter 插件配置。
 
 支持三种运行模式（详见 :mod:`plugins.anima_chatter.modes`）：
 
@@ -95,6 +95,22 @@ class AnimaChatterConfig(BaseConfig):
                 "空列表 ``[]`` 等于完全禁用 ``custom_prompt``（即便其内容非空）。"
             ),
         )
+        model_task: str = Field(
+            default="actor",
+            description="LLM 模型名称（对应 model.toml 中的 task），models 为空时使用",
+        )
+        models: list[str] = Field(
+            default=[],
+            description="指定 LLM 模型列表（对应 model.toml 中的 name）。非空时覆盖 model_task，多个模型按顺序 fallback",
+        )
+        temperature: float = Field(
+            default=0.7,
+            description="模型温度，仅在 models 非空时生效",
+        )
+        max_tokens: int = Field(
+            default=8000,
+            description="最大输出 token 数，仅在 models 非空时生效",
+        )
 
     @config_section("tts", title="TTS 设置")
     class TTSSection(SectionBase):
@@ -151,6 +167,18 @@ class AnimaChatterConfig(BaseConfig):
                 "vtb / vtb_live 模式下用于本地播放 TTS 的输出设备，"
                 "格式为 '设备名@驱动名'。通常指向 VB-Cable Input，"
                 "使虚拟形象与直播软件能听到同一份音频。"
+            ),
+        )
+        inst_output_device: str = Field(
+            default="",
+            description=(
+                "双轨翻唱时**伴奏**的专用输出设备，格式 '设备名@驱动名' 或纯设备名。"
+                "留空则伴奏走系统默认输出。\n"
+                "用途：人声走上面的 VB-Cable 驱动口型，伴奏单独送到这个设备——"
+                "把它指到一个专门给直播软件采集的设备（比如另一个虚拟声卡，或某个"
+                "显示器/外置扬声器），就能让伴奏单独进直播流而不经过 VB-Cable，"
+                "避免人声重复采集。\n"
+                "仅 vtb / vtb_live 模式的双轨歌伴奏路使用；单轨歌 / TTS 不受影响。"
             ),
         )
 
@@ -239,12 +267,13 @@ class AnimaChatterConfig(BaseConfig):
             ),
         )
         loudness_target_dbfs: float = Field(
-            default=-20.0,
+            default=-14.0,
             description=(
                 "全局响度目标（dBFS）。AudioPlayer 在播放任何音频（TTS / 唱歌 / "
                 "其它）前，会按 RMS 把响度统一拉到这个值——不同 TTS 生成结果"
                 "和翻唱歌曲音量再不齐也会被拉齐，直播间观众听感一致。"
-                "推荐 -20 ~ -16（直播 / 流媒体常用）。"
+                "默认 -14：比直播常用的 -20/-16 更响，确保送进 VB-Cable 的电平"
+                "足够高、VTS 麦克风口型能把嘴张开。觉得太吵可回调到 -16 ~ -20。"
                 "设为 0 关闭归一化，按原音量播放。"
             ),
         )

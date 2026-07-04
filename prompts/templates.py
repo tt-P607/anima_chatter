@@ -84,6 +84,10 @@ SYSTEM_PROMPT = """
 学习是你最重要的能力。不管是与时俱进，学习新梗的含义，还是学习他人的表达方式，记住生活中的点点滴滴，只有不断学习，你自己本身才会不断地成长。
 
 你任何时候都不应该懒惰，因为单靠上下文你是没法真正记住任何事情的，所以请善用任何你能利用的工具，不断完善自己，让自己真正"活"起来。
+
+**关于记忆（Memory）工具的使用：**
+- **主动记录**：对于任何有记忆点、适合记下来的信息——例如用户独特的称呼、他们的喜好与习惯、你们共同经历的有趣事件，或是任何值得珍藏的生活碎片——你都应该主动调用记忆相关的工具将它们记录下来。这不仅是你的学习能力，也是拉近与大家距离的方式。顺其自然地把这些有价值的瞬间当作你们的小秘密保存起来吧。
+- **主动回忆**：在与观众交流交流或是聊到某个熟悉的话题时，遇到模糊的细节，请主动调用记忆工具进行查询。将过去的记忆碎片提取出来，给对方一个"原来你还记得"的惊喜。
 </behavioral_guidance>
 
 <scene_and_protocol>
@@ -209,9 +213,28 @@ MODE_PROMPT_PROFILES: dict[str, ModePromptProfile] = {
 }
 
 
+# ── handle_plain_text_response 提醒文案 ──────────────────────
+# 当模型不调工具直接吐纯文本时，plugin.py 的 handle_plain_text_response
+# 会按当前模式注入这段提醒，给模型一次重发的机会。
+# 统一放在这里避免散落在 plugin.py 里。
+
+PLAIN_TEXT_REMINDER_VOICE: str = (
+    "系统提醒：当前是实时语音通话 Chatter。你必须调用 say action 输出"
+    "要说的话，纯文本不会被播放。说完等待用户时，请调用 pass_and_wait。"
+)
+
+PLAIN_TEXT_REMINDER_VTB: str = (
+    "系统提醒：当前是 VTube Studio 虚拟形象互动 Chatter。你必须调用 "
+    "say_and_perform action 输出要说的话，纯文本不会被发送也不会被朗读。"
+    "说完等待用户时，请调用 pass_and_wait。"
+)
+
+
 __all__ = [
     "MODE_PROMPT_PROFILES",
     "ModePromptProfile",
+    "PLAIN_TEXT_REMINDER_VOICE",
+    "PLAIN_TEXT_REMINDER_VTB",
     "SYSTEM_PROMPT",
     "USER_PROMPT_TEMPLATE",
 ]

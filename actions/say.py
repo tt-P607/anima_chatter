@@ -15,9 +15,9 @@ from src.core.components.base.action import BaseAction
 
 # call_state 移至方法内局部延迟导入，以防模块初始化时循环导入
 from ..config import AnimaChatterConfig
+from ._tts_schema import inject_tts_params
 from ..heartbeat import feed_watchdog_during
 from ..markers import parse_speech_segments
-from ..prompts.scenes import LANGUAGE_SCHEMA_DESC
 from ..tts import TTSRequest, _retry_empty_audio, build_tts_backend
 
 
@@ -38,6 +38,12 @@ class SayAction(BaseAction):
     )
     chatter_allow = ["anima_chatter"]
     dependencies = ["asr_adapter_anima:adapter:asr_adapter_anima"]
+
+    @classmethod
+    def to_schema(cls) -> dict[str, Any]:
+        """动态注入 TTS Provider capabilities 定义的 TTS 参数。"""
+
+        return inject_tts_params(super().to_schema())
 
     async def go_activate(self) -> bool:
         """voice 模式专用 action 的可见性。
@@ -63,15 +69,16 @@ class SayAction(BaseAction):
             str,
             "要通过 TTS 说出的内容。注意：跨语言表达必须拆分为多次 Action 调用，每轮调用仅包含一种成句语言并设置对应的 language 参数。",
         ],
-        style: Annotated[
-            str,
-            "TTS 语音风格。可选：default（默认中性，绝大多数场景用这个）、"
-            "活泼（俏皮明亮，开心调皮时用）、难过（柔软低沉，共情失落时用）。"
-            "切风格只在情绪明显起伏时用，平时保持 default。",
-        ] = "default",
-        language: Annotated[str, LANGUAGE_SCHEMA_DESC] = "zh",
+        **tts_params: Any,
     ) -> tuple[bool, str]:
-        """执行语音播放动作。"""
+        """执行语音播放动作。
+
+        Args:
+            content: 要通过 TTS 说出的内容。
+            **tts_params: 动态接收所有 TTS 参数（style/language/speed/effects 等）。
+                参数列表完全由 TTS Provider 的 get_capabilities() 定义，
+                anima_chatter 不预设任何 TTS 参数。
+        """
 
         plugin_config = getattr(self.plugin, "config", None)
         split_enabled = True
@@ -109,12 +116,13 @@ class SayAction(BaseAction):
 
         backend = build_tts_backend(plugin_config, logger)
 
-        # 把 style / language 透传给 TTS provider：通过 TTSRequest.markers 字段。
-        # 详见 say_and_perform.py 同名注释。
+        # 把所有 TTS 参数透传给 TTS provider：通过 TTSRequest.markers 字段。
+        # markers 现在包含所有动态参数（不仅是 style/language）。
         def _build_markers_for_seg(seg: Any) -> dict[str, Any]:
             base = dict(getattr(seg, "markers", None) or {})
-            base.setdefault("style", style)
-            base.setdefault("language", language)
+            # 合并所有 tts_params 到 markers，segment 自带的优先级更高
+            for key, value in tts_params.items():
+                base.setdefault(key, value)
             return base
 
         async def process_segment(seg: Any, idx: int):

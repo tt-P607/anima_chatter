@@ -12,6 +12,58 @@
 
 from __future__ import annotations
 
+from ..constants import INTENT_REGISTRY
+
+
+# ── intent 清单生成（从 INTENT_REGISTRY 派生，避免三处文案不同步） ──
+
+def _format_intent_list(field: str) -> str:
+    """从 :data:`INTENT_REGISTRY` 按 group 分组生成 intent 清单文案。
+
+    Args:
+        field: :class:`IntentMeta` 的字段名（``"desc_vtb"`` / ``"desc_live"``），
+            决定每个 intent 后面跟哪条描述。
+
+    Returns:
+        渲染好的 intent 清单段落（含标题 + 分组 + 条目），可直接拼进场景 prompt。
+    """
+
+    lines: list[str] = [
+        "# intent 参数（动作意图，必填）",
+        f"共 {len(INTENT_REGISTRY)} 个，按用法分组：",
+        "",
+    ]
+    current_group = ""
+    for meta in INTENT_REGISTRY:
+        if meta.group != current_group:
+            if current_group:
+                lines.append("")
+            lines.append(f"【{meta.group}】")
+            current_group = meta.group
+        desc = getattr(meta, field)
+        lines.append(f"- {meta.name}（{desc}）")
+    return "\n".join(lines)
+
+
+_INTENT_LIST_VTB: str = _format_intent_list("desc_vtb")
+_INTENT_LIST_LIVE: str = _format_intent_list("desc_live")
+
+
+def _build_intent_schema_desc() -> str:
+    """从 :data:`INTENT_REGISTRY` 生成 schema 用的精简一句话表。
+
+    每个 intent 只列 ``name（desc_general）``，用 ``/`` 分隔，单行紧凑——
+    详细说明在场景 prompt 里给，schema 只需要让模型知道有哪些可选值。
+    """
+
+    items = " / ".join(f"{m.name}（{m.desc_general}）" for m in INTENT_REGISTRY)
+    return (
+        "动作意图，决定头部姿态 + 眼神方向。"
+        f"从 {len(INTENT_REGISTRY)} 个里选一个（详见 system 提示词的 intent 段）：\n"
+        f"{items}。\n"
+        "不确定时填 NARRATING；只在情绪到位时换其他值。"
+    )
+
 
 # ── 共享：emotion 协议（VTB / VTB_LIVE 同款，只是建议用法略不同） ──
 
@@ -32,69 +84,6 @@ _EMOTION_PROTOCOL_LIVE = (
     + "\n- 例子：`happy:2`（开心微笑）、`sad:2`（共情低落）、`surprised:2`（惊讶）、`neutral:1`（平静叙述）\n"
     + '- 注意：**直播场景下慎用 angry**——除非话题真的需要"不满"的情绪，平时哪怕弹幕不太友好，最多用 ``neutral:1`` 或 ``sad:1`` 带过即可。'
 )
-
-
-# ── 共享：intent 18 项清单（按用法分组） ──
-
-_INTENT_LIST_VTB = """# intent 参数（动作意图，必填）
-共 18 个，按用法分组：
-
-【基础姿态】
-- IDLE（静止）
-- NARRATING（叙述，默认）
-- THINKING（思考，头微抬眼神上飘）
-- CONFUSED（困惑，歪头眯眼）
-
-【高表现力情绪】
-- EXCITED（兴奋/赞同，前倾抬头眼神发亮）
-- SURPRISED(惊讶/意外，大抬头瞪眼)
-
-【眼神方向】
-- PEEK_LEFT / PEEK_RIGHT（偷瞄左 / 右）
-- LOOKAWAY（害羞回避，左下看）
-- STARE_DOWN（低头盯 / 沮丧）
-- DREAMY_GAZE（神游远眺）
-
-【态度倾向】
-- PROUD_LIFT（得意抬头）
-- WORRIED_TILT（担心歪头）
-- SHY_DOWN（害羞低头偏侧）
-- ATTENTIVE（认真专注）
-
-【调皮 / 紧张】
-- PLAYFUL_TILT（调皮明显歪头）
-- MISCHIEF（坏笑斜眼）
-- SCARED_SHRINK（害怕收身）"""
-
-_INTENT_LIST_LIVE = """# intent 参数（动作意图，必填）
-共 18 个，按用法分组：
-
-【基础姿态】
-- IDLE（静止，听弹幕但不说话）
-- NARRATING（默认叙述 / 回应弹幕）
-- THINKING（思考，被问到难题）
-- CONFUSED（困惑，看不懂梗或弹幕）
-
-【高表现力情绪】
-- EXCITED（兴奋/赞同，看到精彩弹幕）
-- SURPRISED（惊讶/意外，被弹幕逗到或被打赏）
-
-【眼神方向】
-- PEEK_LEFT / PEEK_RIGHT（偷瞄左 / 右，回应"右边那位"这种弹幕方位词）
-- LOOKAWAY（害羞回避，被夸了不好意思）
-- STARE_DOWN（低头沉思 / 落寞）
-- DREAMY_GAZE（神游远眺，话题感想）
-
-【态度倾向】
-- PROUD_LIFT（得意抬头，被吹捧时玩笑式自夸）
-- WORRIED_TILT（担心歪头，关心观众情绪）
-- SHY_DOWN（害羞低头，被表白 / 大额 SC 时）
-- ATTENTIVE（认真专注，听观众讲故事）
-
-【调皮 / 紧张】
-- PLAYFUL_TILT（调皮歪头，玩笑话）
-- MISCHIEF（坏笑斜眼，黑色幽默）
-- SCARED_SHRINK（害怕收身，遇到吓人话题）"""
 
 
 # ── 共享：emotion / intent 搭配建议 ──
@@ -142,27 +131,25 @@ content 里可以用 ``[motion:NAME]...[/motion]`` 在一段话中**临时切换
 
 # ── 共享：TTS 标点规范（VTB / VTB_LIVE 都要） ──
 
-_TTS_PUNCTUATION_PROTOCOL = """**标点规范（TTS 必读，极其重要）**：你写的文本会**逐字送进 TTS 引擎**，TTS 靠**规范标点**判断句子边界、停顿位置和语调起伏。**音符 / 波浪号 / emoji 不会被识别为停顿点**——只是当作普通字符跳过去。
-- **必须用**：`，` `。` `！` `？` `……` `、` 这些是 TTS 唯一能识别的"分句信号"
-- **绝对不要替代**：``♪`` ``~`` ``～`` ``♡`` ``☆`` 这些**不是**标点，**不能**用来代替逗号 / 句号
-  - ❌ 错误：``大家好呀♪今天来聊聊~`` → TTS 会把 ``呀♪今天`` 当成连续一句没断点，听起来就是 "大家好呀今天来聊聊" 一团粘在一起
-  - ✅ 正确：``大家好呀，今天来聊聊。`` → TTS 在逗号 / 句号处停顿，自然分句
-- **音符 / 波浪号**只能**贴在标点之后**偶尔点缀，**不能取代标点**。
-- **句末必须有标点**：每段结尾都要 `。` `！` `？` 收尾，不能光留个 `~` 或 `♪` 当结束。
-- 写得情绪化没问题，但**情绪靠词语和强度等级（emotion 参数）**表达，不是靠 ♪ 堆。"""
+_TTS_PUNCTUATION_PROTOCOL = """# 标点规范（TTS 极其重要）
+你的文本会**逐字送进 TTS**，TTS 靠**标点**判断断句与停顿——没有标点的文字连成一片听不清。
+- **可用标点**：`，` `。` `！` `？` `……` `、` `—` `~` — 这些是 TTS 识别的有效停顿 / 分句信号。
+- **不要用**非标准符号替代标点——emoji、颜文字、特殊装饰符 TTS 一律跳过，不产生停顿。"""
+
+
+# ── 共享：多语言分段准则（VTB / VTB_LIVE 都要） ──
+
+_MULTILANGUAGE_PROTOCOL = """# 多语言准则
+- **非必要不要用 ``auto`` 语言模式**——自动识别准确率不如指定语言，且可能导致语码切换不自然。
+- **需要切换语言时拆分为多次调用**：每次调用只包含一种语言的文本，用对应的 ``language`` 参数。
+  - 例如先说中文再说日语 → 拆成两次调用：第一次 ``language=all_zh`` + 中文文本，第二次 ``language=all_ja`` + 日语文本。
+- 多次调用的音频会按顺序自动播放 / 拼接，不需要你手动处理。"""
 
 
 # ── action 参数公共描述（schema 注入用） ──
 
-# 18 个 intent 的精简一句话表，专供 ``say_and_perform`` 等 action 的 schema
-# 描述。详细说明在场景 prompt 里给，schema 只列名字 + 一句口诀即可。
-INTENT_SCHEMA_DESC = """动作意图，决定头部姿态 + 眼神方向。从 18 个里选一个（详见 system 提示词的 intent 段）：
-NARRATING（默认叙述）/ IDLE（静止）/ THINKING（思考）/ CONFUSED（困惑）/
-EXCITED（兴奋）/ SURPRISED（惊讶）/
-PEEK_LEFT / PEEK_RIGHT（偷瞄左右）/ LOOKAWAY（害羞回避）/ STARE_DOWN（低头）/ DREAMY_GAZE（神游）/
-PROUD_LIFT（得意）/ WORRIED_TILT（担心）/ SHY_DOWN（害羞低头）/ ATTENTIVE（专注听）/
-PLAYFUL_TILT（调皮歪头）/ MISCHIEF（坏笑）/ SCARED_SHRINK（害怕）。
-不确定时填 NARRATING；只在情绪到位时换其他值。"""
+# intent schema 描述（精简版）——从 :data:`INTENT_REGISTRY` 派生。
+INTENT_SCHEMA_DESC: str = _build_intent_schema_desc()
 
 # emotion schema 描述（精简版）。
 EMOTION_SCHEMA_DESC = (
@@ -171,16 +158,10 @@ EMOTION_SCHEMA_DESC = (
     "默认 ``neutral:1``；详细搭配建议见 system 提示词。"
 )
 
-# language schema 描述（say / say_and_perform 共用）。
-LANGUAGE_SCHEMA_DESC = """朗读文本的语言代码，决定 TTS 引擎选择。
-
-【跨语言分段准则】
-1. **单次调用单一语言**：`language` 参数作用于单次 Action 调用的全部内容。严禁在一次调用中混合多种成句语言。
-2. **多语言拆分策略**：若回复涉及多种语言切换，必须按语言类型拆分为多次 Action 调用，每轮调用指定唯一的 `language`。
-3. **纯语言模式优先**：对于纯粹的单语言文本，必须优先使用 `all_zh` / `all_ja` / `all_yue` / `all_ko` 以保证音色稳定性。
-4. **混合模式适用场景**：`zh` / `ja` / `en` 等混合模式仅限用于主语言中嵌入少量外文专有名词。
-5. **发音导向原则**：必须根据文本的实际朗读发音（而非文字形式）选择语言代码（如粤语汉字选 `yue` 或 `all_yue`）。
-6. **限制自动识别**：`auto` 或 `auto_yue` 仅作为未知语种的最终兜底，不得作为常态化多语言处理手段。"""
+# 注意：language 和 style 参数的实际描述由 TTS Provider 通过
+# ``get_capabilities()`` 动态注入（见 SayAction / SayAndPerformAction 的
+# ``to_schema`` 覆写）。Annotated 里的 description 仅作为 schema 序列化的
+# 类型元数据，不会展示给模型——``to_schema`` 会用 TTS 真实能力覆盖它。
 
 
 # ── voice 模式 ──
@@ -226,6 +207,8 @@ VTB_SCENE_GUIDE = f"""<vtb_scene>
   - 回复内容也会**被群里所有人看到**：不要假装在做"只能听见的旁白"，文字与声音是同一份。
   - 如果当前是群聊，要意识到这是公开互动；不要无视他人也不要逐条点评所有人。
 - {_TTS_PUNCTUATION_PROTOCOL}
+
+{_MULTILANGUAGE_PROTOCOL}
 </vtb_scene>
 
 <tool_protocol>
@@ -344,71 +327,69 @@ _DANMAKU_LINE_FORMAT_NOTE = (
 
 
 def _build_memory_id_section(sources: list[str]) -> str:
-    """生成"关于直播间的记忆 / 工具调用"段落。"""
+    """生成"关于直播间的记忆 / 工具调用"段落。
+
+    三条分支共享 ``_DANMAKU_LINE_FORMAT_NOTE``（弹幕行格式说明）和"不要写 ``live``"警告，
+    区别在于 platform 信息的详细程度：无平台→通用兜底；单平台→给出具体 field 名；多平台→逐平台列映射。
+    """
+
+    _NO_LIVE_WARNING = (
+        "- **不要写** envelope 顶层那个统一的 ``live``——它只是 stream 合并用的虚拟标识，"
+        "没有跨平台用户的语义；写就写 ``<来源平台>`` 标签里的真实值。"
+    )
 
     if not sources:
         return (
             "# 关于直播间的记忆 / 工具调用\n"
-            "- 你在的是**直播间**，对话方是直播间观众。如果你有记忆类工具（如 booku），"
-            "里面要求的 ``platform:id`` 形式从**弹幕行**直接拼出来。\n"
+            "- 你在的是**直播间**，对话方是直播间观众。记忆类工具的 ``platform:id`` 从弹幕行拼出来。\n"
             f"- {_DANMAKU_LINE_FORMAT_NOTE}\n"
-            "- **不要写** envelope 顶层那个统一的 ``live`` —— 它只是 stream 合并用的虚拟标识，"
-            "没有跨平台用户的语义；要写就写 ``<来源平台>`` 标签里的真实值。"
+            f"{_NO_LIVE_WARNING}"
         )
 
     if len(sources) == 1:
         src = sources[0]
         meta = _LIVE_SOURCE_META.get(src)
         if meta is None:
-            label = src
-            field_desc = "观众 ID"
-            hint = "看弹幕行 ``[xxx]`` 那串"
+            placeholder = "看弹幕行 ``[xxx]`` 那串作为观众 ID。"
         else:
-            label = meta["label"]
-            field_desc = meta["user_id_field"]
-            hint = meta["user_id_hint"]
+            placeholder = (
+                f"``[观众ID]`` 是该观众的 ``{meta['user_id_field']}``"
+                f"（{meta['user_id_hint']}）。``person_id`` 写 ``{src}:观众ID``。"
+            )
+        label = meta["label"] if meta else src
         return (
             "# 关于直播间的记忆 / 工具调用\n"
-            f"- 你在的是 **{label}直播间**。如果你有记忆类工具（如 booku），"
-            "里面要求的 ``platform:id`` 形式从**弹幕行**直接拼出来。\n"
+            f"- 你在的是 **{label}直播间**。记忆类工具的 ``platform:id`` 从弹幕行拼出来。\n"
             f"- {_DANMAKU_LINE_FORMAT_NOTE}\n"
-            f"- 本次部署唯一的来源是 ``{src}``，所以你看到的弹幕行里 ``<来源平台>`` 永远是 ``<{src}>``，"
-            f"``[观众ID]`` 是该观众的 ``{field_desc}``（{hint}）。``person_id`` 写 ``{src}:观众ID``。\n"
-            "- **不要写** envelope 顶层那个统一的 ``live`` —— 它只是 stream 合并用的虚拟标识，"
-            "没有跨平台用户的语义。"
+            f"- 来源固定为 ``{src}``，``<来源平台>`` 永远是 ``<{src}>``。{placeholder}\n"
+            f"{_NO_LIVE_WARNING}"
         )
 
-    # 多平台
+    # 多平台：逐平台列映射
     bullet_lines: list[str] = []
     for src in sources:
         meta = _LIVE_SOURCE_META.get(src)
         if meta is None:
-            bullet_lines.append(
-                f"  - 看到 ``<{src}>[xxx]`` → ``person_id`` 写 ``{src}:xxx``。"
-            )
+            bullet_lines.append(f"  - ``<{src}>[xxx]`` → ``person_id`` 写 ``{src}:xxx``。")
         else:
             bullet_lines.append(
-                f"  - 看到 ``<{src}>[xxx]`` → 这是 ``{meta['user_id_field']}``"
+                f"  - ``<{src}>[xxx]`` → ``{meta['user_id_field']}``"
                 f"（{meta['user_id_hint']}）→ ``person_id`` 写 ``{src}:xxx``。"
             )
     bullet_text = "\n".join(bullet_lines)
     return (
         "# 关于直播间的记忆 / 工具调用\n"
-        "- 你在的是**直播间**，本次部署同时接入了多个直播平台。如果你有记忆类工具（如 booku），"
-        "里面要求的 ``platform:id`` 形式从**弹幕行**直接拼出来。\n"
+        "- 本次部署同时接入了多个直播平台。记忆类工具的 ``platform:id`` 从弹幕行拼出来。\n"
         f"- {_DANMAKU_LINE_FORMAT_NOTE}\n"
-        "- 本次部署对应关系：\n"
+        "- 对应关系：\n"
         f"{bullet_text}\n"
-        "- **不要写** envelope 顶层那个统一的 ``live`` —— 它只是 stream 合并用的虚拟标识，"
-        "没有跨平台用户的语义。\n"
-        "- **同一个人在不同直播平台是不同 ID**：每个平台的 ``platform:id`` 命名空间相互独立，"
+        f"{_NO_LIVE_WARNING}\n"
+        "- **同一个人在不同直播平台是不同 ID**——每个平台的 ``platform:id`` 命名空间相互独立，"
         "哪怕昵称相同也要按各自的 ID 去查。"
     )
 
 
-# 直播 TTS 安全代称表：固定常量，不随源平台元数据变；写在 prompt 里就够。
-# 加新平台时在这里加一行，对应平台的 ``label`` 与"嘴上代称"。
-# 直播 TTS 安全代称表：固定常量，仅在多平台同播时引用。
+# 直播 TTS 安全代称表：固定常量，仅在多平台同播时注入。
 # 加新平台时在这里加一行，对应平台的 ``label`` 与"嘴上代称"。
 _TTS_SAFE_ALIAS_TABLE = (
     '- "B 站" → 嘴上说 **"某站"**；\n'
@@ -418,65 +399,49 @@ _TTS_SAFE_ALIAS_TABLE = (
 
 
 def _build_spoken_alias_section(sources: list[str]) -> str:
-    """生成"TTS 念出竞品平台名时用代称"的提醒段。
+    """生成"TTS 念竞品平台名用代称"提示段。
 
-    **仅在多平台同播时**注入：在 A 平台直播间嘴上念出 B 平台品牌名容易触发
-    A 平台的关键词小限流。单平台 / 无平台时这段不存在——单平台部署没有
-    "竞品名"问题，强加这条只会让模型分心。
-
-    这一段**纯 prompt 文案**，只规范 TTS 朗读层面的称呼；和事实标识层面的
-    ``platform:id``（写记忆、调工具）完全独立，不会替换 ``person_id`` 里的
-    真实平台名。
+    **仅在多平台同播时**注入——单平台没有"竞品名"问题，强加只会让模型分心。
+    纯 TTS 朗读层面的称呼规范，不影响 ``person_id`` 标识符。
     """
 
     if len(sources) < 2:
         return ""
 
     return (
-        "# TTS 念出竞品平台名时务必用代称（多平台同播限流防御）\n"
-        "**本次同时接入了多个直播平台**——在 A 平台的直播间里念出 B 平台的"
-        "品牌名容易触发 A 平台的关键词小限流（评论流推荐降权等）。所以："
-        "**当你在 ``say_and_perform.content`` 里需要点出某条弹幕来自哪个平台时**，"
-        "用模糊代称而不是品牌名：\n"
-        f"{_TTS_SAFE_ALIAS_TABLE}\n"
-        "\n"
-        "**什么时候要换**：\n"
-        '- 回应弹幕时要明确指出来源平台（"刚才某站那位说……"），用代称而非品牌名。\n'
-        '- 转述观众弹幕里写的竞品名（弹幕原文有 "B 站" / "抖音"），念出来时换成代称。\n'
-        "- 平台特有功能（SC / 上舰 / 抖币 / 定制礼物等）能不点名就不点名，"
-        '用"那位送礼物的""那位开通舰长的"等中性说法。\n'
-        "\n"
-        "**这条规则只管 TTS 朗读，不影响标识符**：\n"
-        "- 调记忆 / 工具时 ``person_id`` 等参数该写 ``bilibili_live:xxx`` / ``douyin_live:xxx`` "
-        "就**严格写真实平台名**，**不要**改成 ``某站:xxx`` 这种——那样工具会查不到。\n"
-        "- 弹幕行里的 ``<source_platform>`` 标签是给你看的事实，不是要你念出来的内容。"
+        "# TTS 念竞品平台名用代称（多平台同播限流防御）\n"
+        "在 A 平台直播间念出 B 平台品牌名可能触发关键词限流。所以 `say_and_perform.content` "
+        f"里需要指出弹幕来源时用模糊代称：\n{_TTS_SAFE_ALIAS_TABLE}\n\n"
+        '- 平台特有功能（SC / 上舰 / 抖币）能不点名就不点名，用「那位送礼物 / 开舰长的」。\n'
+        "- **只管朗读**：调工具时 ``person_id`` 仍严格写 ``bilibili_live:xxx`` 等真实平台名，"
+        "``<source_platform>`` 标签是给你看的事实，不是要念出来的。"
     )
 
 
 def _build_cross_platform_section(sources: list[str]) -> str:
-    """跨平台找人技巧段落。"""
+    """跨平台 / 跨群组找人技巧段落。
+
+    单平台时讲"直播间 ID 与群聊 qq:号码 是两套命名空间"；
+    多平台时讲"同一个人在不同直播平台也是不同 ID"。两边共享三步找人法。
+    """
+
+    _STEPS = """1. **观众报名字 / 自称**（"我是XX" / "群里那个XX" / 昵称）：``memory_command search "<关键词>"`` 走语义检索，跨平台命中绰号 / 特征 / 名字。
+2. **观众报原平台账号**（qq 号 / 手机号）：``memory_command grep --field=metadata,content "<账号>"`` 精确匹配。
+3. **确认是同一个人后**：调 ``memory_command update`` 把当前平台的 ``platform:<id>`` 加进那条记忆的 ``relation_aliases``，下次直接命中不用再绕语义检索。"""
 
     if len(sources) <= 1:
         return (
             "## 跨群组找人（关键技巧）\n"
-            "直播间的观众 ID 和群聊里以前记下的平台用户标识（如 ``qq:号码``）是**两套命名空间**——"
-            "直接用直播间 ID 当 ``person_id`` 查，**只能查到这位观众在该平台留下的记忆**，"
-            "外部群组里那条记忆是查不到的。跨群组找人按这套用：\n"
-            "\n"
-            '1. **观众报名字 / 自称（"我是XX"/"群里那个XX"/昵称）时**：用 ``memory_command search "<对方说的关键词>"`` 走语义检索。能跨平台命中任何提到这个名字、特征、绰号的记忆，是最有效的兜底。\n'
-            '2. **观众报原平台账号时**：用 ``memory_command grep --field=metadata,content "<账号/号码>"`` 精确匹配，召回所有提过该标识的条目。\n'
-            "3. **跨平台确认到同一个人之后**：调 ``memory_command update`` 把当前平台的 ``platform:<id>`` 加进那条记忆的 ``relation_aliases`` 里。"
+            "直播间观众 ID 和群聊里的平台用户标识（如 ``qq:号码``）是**两套命名空间**——"
+            "直接用直播间 ID 查只能查到该平台留下的记忆，外部群组那条查不到。\n\n"
+            f"{_STEPS}"
         )
 
     return (
         "## 跨平台找人（关键技巧）\n"
-        "本次部署接入了多个直播平台，**同一个人在不同平台是不同 ID**——直接用某平台的 ID 当 ``person_id`` 查，"
-        "**只能查到这位观众在该平台留下的记忆**，另一个直播平台或外部群组里的记忆是查不到的。跨平台找人按这套用：\n"
-        "\n"
-        '1. **观众报名字 / 自称（"我是XX"/"群里那个XX"/昵称）时**：用 ``memory_command search "<对方说的关键词>"`` 走语义检索。能跨平台命中任何提到这个名字、特征、绰号的记忆，是最有效的兜底。\n'
-        '2. **观众报原平台账号时**：用 ``memory_command grep --field=metadata,content "<账号/号码>"`` 精确匹配，召回所有提过该标识的条目。\n'
-        '3. **观众 ID 看着就是别名／昵称**（比如他直播间名叫"数绵羊的小恐龙"，群里也常这么自称）：先 ``search`` 关键词，再用结果里的 ``person_id`` 去定位真正那个人。\n'
-        "4. **跨平台确认到同一个人之后，主动维护 alias**：调 ``memory_command update`` 把当前平台的 ``platform:<id>`` 加进那条记忆的 ``relation_aliases`` 里，下次他再来时就能直接通过 person_id 命中，不需要再绕语义检索。"
+        "本次部署接入了多个直播平台，**同一个人在不同平台是不同 ID**——"
+        "用某平台的 ID 当 ``person_id`` 查只能查到该平台的记忆，其它平台 / 群组的查不到。\n\n"
+        f"{_STEPS}"
     )
 
 
@@ -499,43 +464,36 @@ def build_vtb_live_scene_guide(active_sources: frozenset[str] | set[str] | None 
     spoken_alias_section = _build_spoken_alias_section(sources)
 
     return f"""<vtb_live_scene>
-**重要：你正在以 VTube Studio 虚拟形象的身份做直播**，当前消息可能来自**多个来源**的观众。
+**你正在以 VTube Studio 虚拟形象做直播**，消息可能来自多个来源的观众。
 
-- 消息来源可能包括：
+- 消息来源：
   {sources_intro_block}
-  2. **群组消息**（如 QQ 群等，platform=qq）：你的群组朋友 / 粉丝群也可能在直播期间互动。
-  3. **私聊**（chat_type=private）：单个观众/朋友的私聊。
-  对你来说**统一处理**——所有这些都视为"看直播 / 关注你的人"在和你说话，回应风格一致。
-- 直播间的传播链路：
-  1. **TTS 朗读**：你的回复会被 TTS 念出来，从虚拟形象的"嘴"传到直播间，**直播间观众只能听到声音**。
-  2. **VTube Studio 表演**：嘴型、表情、头部姿态、身体晃动按你给的 `emotion` 和 `intent` 同步表演。
-  3. **文字回到原会话**：如果消息来自外部平台群聊或私聊，你的回复会**同时**作为文字发回那条消息所在的会话。
-- 关键差异（与普通群聊不一样的地方）：
-  - **直播间弹幕场景下你的回复不会变成弹幕**，第三方 Bot 不允许直接出弹幕。直播间观众只能听 TTS。
-  - **不要说"刚才那位说……"或"如上所述"** 这种依赖文字看回引用的措辞——要把弹幕意思**简短概括**（比如"刚才有人在问 XX"、"看到弹幕在聊 YY"），让只听声音的观众也能跟上。**不要逐字复述弹幕原文**，那听起来像在念屏，很怪。
-  - **观众绝大多数是陌生人**，可能刚进直播间、不知道前情；不要假设大家都认识你或互相熟悉。
-  - 群组朋友 / 粉丝可能跟你更熟，可以稍微亲近一点称呼，但**直播间观众也在听**——不能太私密，让陌生观众听了尴尬。{multi_source_note}
+  2. **群组消息**（platform=qq 等）：粉丝群在直播期间互动。
+  3. **私聊**（chat_type=private）：单个观众/朋友私聊。
+  统一处理——都视为"看直播 / 关注你的人"在跟你说话。
+- 传播链路：你的回复 → **TTS 朗读**（直播间观众只听得见声音）→ **VTube Studio 表演**（嘴型 / 表情 / 姿态按 `emotion` + `intent` 同步）→ 如果消息来自外部群聊 / 私聊，**同时**把文字发回原会话。
+- 与普通群聊的关键差异：**直播间观众只能听 TTS，看不到你的文字**——所以**简短概括弹幕意思**（"刚才有人在问 XX"），不要逐字复述，不要用"如上所述"这种依赖文字回看的措辞。观众多为陌生人，不假设互相熟悉；群组朋友可亲近些但别太私密（直播间在听）。{multi_source_note}
 
 # 弹幕节奏与回应策略
-- **是否回弹幕完全由你自己决定**——没有外部过滤器替你筛。这意味着每条飘进来的弹幕系统都会送到你面前，但**这绝不代表条条都得回**。
-- 弹幕飘得快是常态，**真正值得开口的时机不多**。挑下面这几类回：
-  1. **明确@你的、问你问题的、要你做某件事的**（最优先）。
-  2. **有趣的话题或你能自然接话的发言**。
-  3. **舰长 / 提督 / 总督**（``user_role == OPERATOR`` 或 ``additional_config.guard_level > 0``）说的话，礼节上可以稍微多照顾一点。
-  4. **多条弹幕在聊同一件事时**，可以合起来用**一句话概括 + 回应**（比如"看你们都在聊 XX 那我说说看法……"），不要逐条点评。
-- **不想回 / 不知道说啥 / 刚说完一段还在喘 → 直接调用 ``pass_and_wait`` 沉默几秒**。直播里 **适度的安静很正常**，比硬挤话说更自然，模型最容易犯的错就是"为了回而回"。
-- 不要点名感谢每位发言的观众，不要"感谢小爱发的弹幕、感谢小明发的弹幕"这种刷屏式回应。
-- 一次回复**只挑一两条最值得的回**，剩下的让它过去；下一批弹幕来时再判断要不要开口。
+- **没有外部过滤器**——每条弹幕都送你面前，但**绝不条条都回**。挑这几类开口：
+  1. 明确@你 / 问你 / 要你做事的（最优先）。
+  2. 有趣话题或能自然接话的。
+  3. 舰长 / 提督 / 总督（``user_role == OPERATOR`` 或 ``guard_level > 0``），礼节上多照顾一点。
+  4. 多条弹幕聊同一件事 → **一句话概括 + 回应**，别逐条点评。
+- **不值得回 / 刚说完在喘 → ``pass_and_wait`` 沉默几秒**。适度安静比硬挤话自然，模型最容易犯的错就是"为了回而回"。
+- 一次只挑一两条最值得的回，不要点名感谢每位发言者。
 
 # 直播间礼仪与禁忌
-- **称呼观众**：可以叫"大家"、"各位"、"屏幕前的朋友"；少用具体昵称（除非那条弹幕真的是直接对你说的）。
-- **新人友好**：随时可能有新观众进来，话题切换时可以简单交代上下文。
-- **梗 / 表情 / 颜文字读不顺时**，可以委婉表达"这个梗我没太看懂"或"这串符号读出来怪怪的"，**不要硬念**。
-- **回避**：政治、宗教、地域攻击、未成年充值/打赏诱导、隐私窥探、平台敏感词。这些就算被弹幕带节奏也不要接。
-- **遇到攻击性 / 阴阳怪气的弹幕**：礼貌带过或直接忽略，不要正面对线。
+- 称呼用"大家 / 各位 / 屏幕前的朋友"，少用具体昵称（除非那条弹幕直接对你说的）。
+- 话题切换时简单交代上下文（随时有新观众进来）。
+- 梗 / 颜文字念不顺时委婉说"这个没太看懂"或"这串符号怪怪的"，**不要硬念**。
+- 回避：政治、宗教、地域攻击、未成年充值诱导、隐私窥探、平台敏感词。被带节奏也不接。
+- 遇到攻击 / 阴阳怪气：礼貌带过或忽略，不正面对线。
 
-# 标点规范（TTS 必读，极其重要）
+# 标点规范
 {_TTS_PUNCTUATION_PROTOCOL}
+
+{_MULTILANGUAGE_PROTOCOL}
 
 {spoken_alias_section}
 
@@ -547,8 +505,7 @@ def build_vtb_live_scene_guide(active_sources: frozenset[str] | set[str] | None 
 </vtb_live_scene>
 
 <tool_protocol>
-你必须通过 say_and_perform action 输出要说的话，不要直接输出纯文本。
-say_and_perform 的 content 可以包含 [wait:0.5] 这样的停顿标记。
+通过 say_and_perform action 输出要说的话，不要直接输出纯文本。content 可以包含 [wait:0.5] 停顿标记。
 
 {_EMOTION_PROTOCOL_LIVE}
 
@@ -557,9 +514,7 @@ say_and_perform 的 content 可以包含 [wait:0.5] 这样的停顿标记。
 {_INTENT_USAGE_LIVE}
 
 # pass_and_wait
-说完一段、或者本轮不打算回弹幕时，**必须**调用 ``pass_and_wait`` 把自己沉默下来。
-直播里"该说的说完，不刷屏"是常态。
-具体的 emotion / intent / language 取值范围与拆分规则见 say_and_perform 工具自身的 schema 描述。
+说完一段或本轮不回弹幕时，**必须**调用 ``pass_and_wait`` 沉默下来。具体取值范围见工具 schema。
 
 {_INLINE_MOTION_PROTOCOL}
 </tool_protocol>"""
@@ -574,7 +529,6 @@ VTB_LIVE_SCENE_GUIDE = build_vtb_live_scene_guide(None)
 __all__ = [
     "EMOTION_SCHEMA_DESC",
     "INTENT_SCHEMA_DESC",
-    "LANGUAGE_SCHEMA_DESC",
     "VOICE_SCENE_GUIDE",
     "VTB_LIVE_SCENE_GUIDE",
     "VTB_SCENE_GUIDE",

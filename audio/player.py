@@ -52,20 +52,28 @@ class AudioPlayer:
         output_device: str = "",
         *,
         loudness_target_dbfs: float | None = -20.0,
+        inst_output_device: str = "",
     ) -> None:
         """初始化音频播放器。
 
         Args:
-            output_device: ``设备名@驱动`` 或纯设备名；为空则使用系统默认。
+            output_device: 人声 / TTS 的输出设备，``设备名@驱动`` 或纯设备名；
+                为空则使用系统默认。通常指向 VB-Cable，驱动 VTS 口型。
             loudness_target_dbfs: 目标 RMS 响度（dBFS）。所有播放的音频会被
                 统一拉到这个响度——TTS 自带的音量 / 翻唱歌曲音量 / 其它任何
                 走 :meth:`play_audio` 的内容都按这个值归一化。
                 推荐值 ``-20`` ~ ``-16``（直播 / 流媒体常用）。设为 ``None``
                 关闭归一化，按原始音量播放。
+            inst_output_device: 双轨翻唱时**伴奏**的专用输出设备，``设备名@驱动``
+                或纯设备名；为空则走系统默认输出。用于把伴奏单独送到一个给直播
+                软件采集的设备（与人声的 VB-Cable 分开），方便伴奏进直播流而不
+                经过 VB-Cable。仅 :meth:`play_dual` 的伴奏路使用。
         """
 
         self.output_device_name: str = (output_device or "").strip()
         self.output_device_id: int | None = None
+        self.inst_output_device_name: str = (inst_output_device or "").strip()
+        self.inst_output_device_id: int | None = None
         self.loudness_target_dbfs: float | None = loudness_target_dbfs
         self._play_lock = asyncio.Lock()
         # 主路径（WASAPI + latency=high）一旦失败，记住后续直接走 MME 备用路径，
@@ -79,6 +87,29 @@ class AudioPlayer:
         self.envelope_tracker = EnvelopeTracker()
 
         self._resolve_device()
+        self._resolve_inst_device()
+
+    def _resolve_inst_device(self) -> None:
+        """解析伴奏专用输出设备 id；为空或找不到时退回系统默认（None）。"""
+
+        if not self.inst_output_device_name:
+            logger.info("未配置伴奏专用输出设备，双轨伴奏将走系统默认输出。")
+            self.inst_output_device_id = None
+            return
+
+        device_id = self._find_device_id(self.inst_output_device_name)
+        if device_id is None:
+            logger.warning(
+                f"未找到伴奏输出设备 '{self.inst_output_device_name}'，"
+                "双轨伴奏将退回系统默认输出。"
+            )
+            self.inst_output_device_id = None
+            return
+
+        logger.info(
+            f"已锁定伴奏输出设备: {self.inst_output_device_name} (ID: {device_id})"
+        )
+        self.inst_output_device_id = device_id
 
     def update_output_device(self, output_device: str) -> None:
         """运行时更新目标设备并重新解析。"""
@@ -136,6 +167,36 @@ class AudioPlayer:
 
         logger.info(f"已锁定输出设备: {self.output_device_name} (ID: {device_id})")
         self.output_device_id = device_id
+
+    def _reset_audio_backend(self) -> None:
+        """重新初始化 PortAudio 后端，强制刷新设备拓扑。
+
+        设备热拔插（拔出蓝牙音箱 / USB 耳机等）后，PortAudio 在进程启动时
+        枚举的设备列表会过期、底层句柄进入错误状态——表现为 ``sd.play`` 抛
+        PortAudioError 或 ``MME error``，且单纯重新 ``query_devices`` 也救不
+        回来（句柄本身已坏）。``sd._terminate()`` + ``sd._initialize()`` 会强制
+        PortAudio 卸载并重新枚举整个设备拓扑，等价于"软重启音频子系统"，
+        让进程在不重启的前提下重新感知当前可用设备。
+
+        重置后所有缓存的 device id 全部作废，这里顺带清空 fallback 状态并
+        重新解析配置中的目标设备，供下一次播放使用。
+        """
+
+        try:
+            sd._terminate()  # type: ignore[attr-defined]
+            sd._initialize()  # type: ignore[attr-defined]
+        except Exception as exc:
+            logger.error(f"重新初始化 PortAudio 失败: {exc}")
+            return
+
+        # 句柄重建后旧 device id 全部失效，强制下次播放重新解析。
+        self._prefer_fallback = False
+        self._fallback_device_id = None
+        self.output_device_id = None
+        self.inst_output_device_id = None
+        self._resolve_device()
+        self._resolve_inst_device()
+        logger.info("已重新初始化 PortAudio 音频后端（设备拓扑已刷新）。")
 
     @staticmethod
     def _read_attr(obj: Any, key: str, default: Any) -> Any:
@@ -240,25 +301,413 @@ class AudioPlayer:
                 )
 
                 loop = asyncio.get_running_loop()
+                # 设备热拔插（拔蓝牙 / USB 耳机）会让本次播放失败。失败后重新
+                # 初始化 PortAudio 刷新设备拓扑，再用**同一段音频**重试一次，
+                # 避免这一条语音被直接丢掉。
+                played = False
                 try:
-                    await loop.run_in_executor(None, self._play_sync, data, samplerate)
+                    played = await loop.run_in_executor(
+                        None, self._play_sync, data, samplerate
+                    )
+                    if not played:
+                        logger.warning(
+                            "首次播放失败，重新初始化音频后端后重试同一段音频…"
+                        )
+                        await loop.run_in_executor(None, self._reset_audio_backend)
+                        played = await loop.run_in_executor(
+                            None, self._play_sync, data, samplerate
+                        )
                 finally:
                     # 不论播放成功失败，都把 tracker 清空，避免 SpeechAnimator
                     # 卡在最后一帧的包络值上。
                     self.envelope_tracker.end()
-                logger.info("音频播放完成。")
+                if played:
+                    logger.info("音频播放完成。")
+                else:
+                    logger.error("重试后仍无法播放该段音频，已跳过。")
             except Exception as exc:
                 # 异常路径下也要确保 tracker 清干净。
                 self.envelope_tracker.end()
                 logger.error(f"播放音频时发生错误: {exc}")
 
-    def _play_sync(self, data: Any, samplerate: int) -> None:
+    async def play_dual(self, vocal_data: bytes, inst_data: bytes) -> None:
+        """双轨同步播放：人声进 VB-Cable（驱动口型），伴奏进系统扬声器。
+
+        用于完整翻唱——伴奏不进 VB-Cable，VTS uLipSync 只听到人声，嘴只跟人声
+        动，伴奏不会带动口型。
+
+        **响度归一化**：若 ``self.loudness_target_dbfs`` 非 ``None``，两轨会
+        基于**混合后的 RMS** 计算统一增益并同时应用，保留 DAW 调好的人声/伴奏
+        相对比例（与"各自独立归一化"不同）。关闭归一化时保持原电平。
+
+        **对齐策略（关键）**：两路必须**采样级**精准对齐（像 AU 里那样），
+        不只是"同时调用 write"。难点在于人声走 VB-Cable（MME，输出延迟约
+        80~150ms）、伴奏走系统默认（WASAPI，延迟约 10~30ms），即使两路在同一
+        瞬间 ``write()``，声音真正落到输出的时刻也差几十毫秒——这就是"略微延迟"
+        的根因。做法是：
+        1. **预处理全部完成**——解码、归一化、重采样、通道适配在调用方线程里
+           做完，executor 线程拿到的就是"可直接 write 的最终 PCM"。
+        2. **两路 ``OutputStream`` 各自打开后读 ``stream.latency``**——这是
+           PortAudio 报告的该流实际输出延迟（秒）。
+        3. **延迟补偿（核心）**——两路交换 latency 后，给延迟**较低**的那一路
+           在 PCM 前面补 ``round((高延迟 - 低延迟) × 采样率)`` 个静音帧，让两路
+           "可听起点"对齐到采样级，残余误差 < 1 帧（亚毫秒，人耳无法分辨）。
+        4. **threading.Barrier(2) 同步起跑**——补偿后两条线程在 ``stream.write()``
+           之前 ``barrier.wait()``，最后释放的瞬间同时进入 PortAudio 写入。
+
+        与单轨 ``play_audio`` 的关键区别：放弃 ``sd.play()`` 全局单例机制，
+        改用显式 ``OutputStream`` 上下文，否则两路并发互相 abort（表现为
+        "只听到一路"）。VB-Cable 这条放弃 WASAPI 协商，直接走 MME device id
+        以避开 ``sd.play`` 路径里的 fallback 复杂度。
+
+        **统一归一化（关键）**：人声 + 伴奏**作为一个整体**计算一个共用增益，
+        再把同一个增益系数同时乘到两轨上。这样整体响度被拉到 ``loudness_target_dbfs``
+        统一目标（和单轨 ``play_audio`` 听感一致），又因为乘的是同一个数，AU 等
+        DAW 导出时调好的人声/伴奏相对比例被**完整保留**——不会像"各自独立归一化"
+        那样把混音平衡抹平。``loudness_target_dbfs`` 为 ``None`` 时跳过归一化，
+        原样播放。某一轨缺失退回单轨 ``play_audio`` 时按单轨全局响度归一化。
+        """
+
+        if not vocal_data:
+            logger.warning("play_dual 人声为空，退回单轨伴奏播放。")
+            if inst_data:
+                await self.play_audio(inst_data)
+            return
+        if not inst_data:
+            logger.warning("play_dual 伴奏为空，退回单轨人声播放。")
+            await self.play_audio(vocal_data)
+            return
+
+        # 设备热拔插会让双轨播放失败；失败后重新初始化 PortAudio 刷新设备
+        # 拓扑再重试整段，避免这次翻唱被直接丢掉。_play_dual_once 自带锁，
+        # 两次调用顺序获取 / 释放，不会死锁。
+        played = await self._play_dual_once(vocal_data, inst_data)
+        if not played:
+            logger.warning("双轨播放失败，重新初始化音频后端后重试整段…")
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._reset_audio_backend)
+            played = await self._play_dual_once(vocal_data, inst_data)
+        if not played:
+            logger.error("重试后双轨播放仍失败，已跳过该段翻唱。")
+
+    async def _play_dual_once(self, vocal_data: bytes, inst_data: bytes) -> bool:
+        """执行一次双轨同步播放，返回两路是否都成功写入。
+
+        从 :meth:`play_dual` 主体抽出以支持设备热拔插失败后的重试；自带
+        ``_play_lock``，保证与单轨 :meth:`play_audio` 串行。
+        """
+
+        async with self._play_lock:
+            try:
+                # 解码 vocal + inst（尚未设备适配）
+                vocal, v_sr = self._decode_only(vocal_data)
+                inst, i_sr = self._decode_only(inst_data)
+
+                # ── 0. 统一归一化（若启用）——在设备适配前，基于混合 RMS 算增益 ──
+                if self.loudness_target_dbfs is not None:
+                    try:
+                        from .loudness import normalize_dual_tracks
+
+                        # 两轨采样率必须一致才能混合计算 RMS；不一致时先对齐到人声采样率
+                        if v_sr != i_sr:
+                            logger.warning(
+                                f"人声({v_sr}Hz) 与伴奏({i_sr}Hz) 采样率不一致，"
+                                f"归一化前先对齐到 {v_sr}Hz"
+                            )
+                            inst, i_sr = self._resample(inst, i_sr, v_sr)
+
+                        # 通道数也要对齐（mono 变 stereo 或反之）
+                        v_channels = 1 if vocal.ndim == 1 else vocal.shape[1]
+                        i_channels = 1 if inst.ndim == 1 else inst.shape[1]
+                        if v_channels != i_channels:
+                            target_ch = max(v_channels, i_channels)
+                            vocal = self._adapt_channels(vocal, target_ch)
+                            inst = self._adapt_channels(inst, target_ch)
+
+                        vocal, inst = normalize_dual_tracks(
+                            vocal,
+                            inst,
+                            target_dbfs=self.loudness_target_dbfs,
+                        )
+                        logger.debug(
+                            f"双轨统一归一化完成（目标 {self.loudness_target_dbfs:.1f} dBFS）"
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(f"双轨归一化失败，使用原电平: {exc}")
+
+                # ── 1. 解析人声目标设备（VB-Cable）+ 采样率/通道预适配 ──
+                vocal_device_id = self._resolve_fallback_device_id()
+                if vocal_device_id is None:
+                    # 找不到 MME 备用 device id，退回原 _play_sync 路径（带 fallback 链）
+                    logger.warning(
+                        "play_dual 解析 VB-Cable MME device 失败，人声退回 _play_sync 路径"
+                    )
+                    vocal_data_final, vocal_sr_final = vocal, v_sr
+                    vocal_channels = 1 if vocal.ndim == 1 else int(vocal.shape[1])
+                    use_legacy_vocal = True
+                else:
+                    use_legacy_vocal = False
+                    try:
+                        vocal_dev_info = sd.query_devices(vocal_device_id)
+                        v_target_rate = int(
+                            float(self._read_attr(vocal_dev_info, "default_samplerate", 44100))
+                        )
+                        v_target_channels = int(
+                            self._read_attr(vocal_dev_info, "max_output_channels", 2) or 2
+                        )
+                        if abs(v_sr - v_target_rate) > 10:
+                            vocal, v_sr = self._resample(vocal, v_sr, v_target_rate)
+                        vocal = self._adapt_channels(vocal, v_target_channels)
+                    except Exception as exc:
+                        logger.warning(f"人声路径采样率/通道适配失败: {exc}")
+                    vocal_data_final, vocal_sr_final = vocal, v_sr
+                    vocal_channels = 1 if vocal.ndim == 1 else int(vocal.shape[1])
+
+                # ── 2. 解析伴奏目标设备（专用设备或系统默认）+ 采样率/通道预适配 ──
+                # inst_output_device_id 为 None 时走系统默认（query kind="output"），
+                # 否则查指定设备——把伴奏送到给直播采集的专用设备，与人声的 VB-Cable
+                # 分开。
+                inst_device_id = self.inst_output_device_id
+                try:
+                    if inst_device_id is None:
+                        inst_dev = sd.query_devices(kind="output")
+                    else:
+                        inst_dev = sd.query_devices(inst_device_id)
+                    i_target_rate = int(
+                        float(self._read_attr(inst_dev, "default_samplerate", 44100))
+                    )
+                    i_target_channels = int(
+                        self._read_attr(inst_dev, "max_output_channels", 2) or 2
+                    )
+                    if abs(i_sr - i_target_rate) > 10:
+                        inst, i_sr = self._resample(inst, i_sr, i_target_rate)
+                    inst = self._adapt_channels(inst, i_target_channels)
+                except Exception as exc:
+                    logger.warning(f"伴奏路径采样率/通道适配失败: {exc}")
+                inst_channels = 1 if inst.ndim == 1 else int(inst.shape[1])
+
+                # ── 3. 起播前算 envelope 喂 tracker（驱动 uLipSync 之外的内部口型估计）──
+                envelope = compute_envelope(
+                    vocal_data_final, vocal_sr_final, hop_seconds=_ENVELOPE_HOP_SECONDS
+                )
+                self.envelope_tracker.begin(envelope, _ENVELOPE_HOP_SECONDS)
+
+                inst_target_desc = (
+                    f"专用设备[{inst_device_id}]"
+                    if inst_device_id is not None
+                    else "系统扬声器"
+                )
+                logger.info(
+                    f"双轨同步播放：人声 {len(vocal_data_final)}@{vocal_sr_final}Hz "
+                    f"({vocal_channels}ch) → VB-Cable[{vocal_device_id}]，"
+                    f"伴奏 {len(inst)}@{i_sr}Hz ({inst_channels}ch) → {inst_target_desc}"
+                )
+
+                # ── 4. 两阶段 Barrier：先交换 latency 做延迟补偿，再同步起跑 ──
+                # latency_barrier：两路 stream 打开后在此汇合，交换各自的实际
+                #   输出延迟（stream.latency）。
+                # start_barrier：补偿（补静音帧）完成后在此汇合，对齐 write 起跑。
+                import threading
+
+                latency_barrier = threading.Barrier(2)
+                start_barrier = threading.Barrier(2)
+                # 共享延迟交换区：{"vocal": 秒, "inst": 秒}。两条线程各写一格，
+                # 在 latency_barrier 之后两格都已就绪，可安全读取。
+                latencies: dict[str, float] = {}
+                # 两路播放成功标记；任一路失败则整段判失败，交由 play_dual 重试。
+                results: dict[str, bool] = {"vocal": False, "inst": False}
+
+                def _stream_output_latency(stream: Any) -> float:
+                    """取 OutputStream 的输出延迟（秒）。
+
+                    纯输出流 ``stream.latency`` 是单个 float；双工流是
+                    ``(input, output)`` 二元组——取后者。异常时返回 0。
+                    """
+
+                    lat = getattr(stream, "latency", 0.0)
+                    if isinstance(lat, (tuple, list)):
+                        lat = lat[-1] if lat else 0.0
+                    try:
+                        return float(lat)
+                    except (TypeError, ValueError):
+                        return 0.0
+
+                def _pad_leading_silence(data: Any, sr: int, seconds: float) -> Any:
+                    """在 PCM 头部补 ``round(seconds × sr)`` 帧静音，对齐可听起点。"""
+
+                    frames = int(round(max(0.0, seconds) * sr))
+                    if frames <= 0:
+                        return data
+                    if data.ndim == 1:
+                        pad = np.zeros(frames, dtype=data.dtype)
+                    else:
+                        pad = np.zeros((frames, data.shape[1]), dtype=data.dtype)
+                    return np.concatenate([pad, data], axis=0)
+
+                def _play_vocal_synced() -> None:
+                    if use_legacy_vocal:
+                        # fallback：无法读 stream.latency 做补偿，只能近似同步起跑。
+                        # 让两路 barrier 都不挂死：补偿阶段直接放行。
+                        try:
+                            latencies["vocal"] = 0.0
+                            latency_barrier.wait()
+                            start_barrier.wait()
+                        except threading.BrokenBarrierError:
+                            return
+                        results["vocal"] = self._play_sync(
+                            vocal_data_final, vocal_sr_final
+                        )
+                        return
+                    try:
+                        with sd.OutputStream(
+                            samplerate=vocal_sr_final,
+                            channels=vocal_channels,
+                            device=vocal_device_id,
+                            latency="high",
+                        ) as stream:
+                            # 阶段一：读本路实际输出延迟，交换。
+                            latencies["vocal"] = _stream_output_latency(stream)
+                            latency_barrier.wait()
+                            # 延迟补偿：本路延迟低于对方时，头部补静音对齐。
+                            other = float(latencies.get("inst", 0.0))
+                            data = vocal_data_final
+                            if other > latencies["vocal"]:
+                                data = _pad_leading_silence(
+                                    data, vocal_sr_final, other - latencies["vocal"]
+                                )
+                            # 阶段二：对齐 write 起跑。
+                            start_barrier.wait()
+                            stream.write(data)
+                            results["vocal"] = True
+                    except threading.BrokenBarrierError:
+                        return
+                    except Exception as exc:
+                        logger.error(f"人声同步播放失败: {exc}")
+                        for b in (latency_barrier, start_barrier):
+                            try:
+                                b.abort()
+                            except Exception:
+                                pass
+
+                def _play_inst_synced() -> None:
+                    try:
+                        with sd.OutputStream(
+                            samplerate=i_sr,
+                            channels=inst_channels,
+                            device=inst_device_id,
+                            latency="high",
+                        ) as stream:
+                            # 阶段一：读本路实际输出延迟，交换。
+                            latencies["inst"] = _stream_output_latency(stream)
+                            latency_barrier.wait()
+                            # 延迟补偿：本路延迟低于对方时，头部补静音对齐。
+                            other = float(latencies.get("vocal", 0.0))
+                            data = inst
+                            if other > latencies["inst"]:
+                                data = _pad_leading_silence(
+                                    data, i_sr, other - latencies["inst"]
+                                )
+                            # 阶段二：对齐 write 起跑。
+                            start_barrier.wait()
+                            stream.write(data)
+                            results["inst"] = True
+                    except threading.BrokenBarrierError:
+                        return
+                    except Exception as exc:
+                        logger.error(f"伴奏同步播放失败: {exc}")
+                        for b in (latency_barrier, start_barrier):
+                            try:
+                                b.abort()
+                            except Exception:
+                                pass
+
+                loop = asyncio.get_running_loop()
+                try:
+                    await asyncio.gather(
+                        loop.run_in_executor(None, _play_vocal_synced),
+                        loop.run_in_executor(None, _play_inst_synced),
+                    )
+                finally:
+                    self.envelope_tracker.end()
+                logger.info("双轨播放完成。")
+                return bool(results["vocal"] and results["inst"])
+            except Exception as exc:
+                self.envelope_tracker.end()
+                logger.error(f"双轨播放时发生错误: {exc}")
+                return False
+
+    def _decode_and_normalize(self, audio_data: bytes) -> tuple[Any, int]:
+        """解码 bytes → float32 PCM 并按统一目标做响度归一化。"""
+
+        with io.BytesIO(audio_data) as buf:
+            data, samplerate = sf.read(buf)
+        if data.dtype != np.float32:
+            data = data.astype(np.float32)
+        if self.loudness_target_dbfs is not None:
+            from .loudness import normalize_audio_array
+
+            data = normalize_audio_array(data, target_dbfs=self.loudness_target_dbfs)
+        return data, samplerate
+
+    def _decode_only(self, audio_data: bytes) -> tuple[Any, int]:
+        """仅解码 bytes → float32 PCM，**不做**任何响度归一化。
+
+        双轨翻唱专用：人声 / 伴奏的相对音量比由 AU（或其它 DAW）导出时就调
+        好了。如果两轨各自独立归一化会把这个精心调好的混音比例抹平，导致
+        听感和 DAW 里不一致。这里原样保留导出电平，最贴近原始混音。
+        """
+
+        with io.BytesIO(audio_data) as buf:
+            data, samplerate = sf.read(buf)
+        if data.dtype != np.float32:
+            data = data.astype(np.float32)
+        return data, samplerate
+
+    def _play_sync_default(self, data: Any, samplerate: int) -> None:
+        """把伴奏同步播到系统默认输出设备（device=None），不做口型相关处理。
+
+        伴奏只给观众听，不进 VB-Cable，所以无需 envelope、无需虚拟声卡 fallback
+        那套逻辑。
+
+        **不能用 ``sd.play()``**：它在 sounddevice 内部用全局 ``_last_stream``
+        单例，``play_dual`` 里两路并发调用会互相 abort，最后只有一路活下来
+        （表现为"只听到人声没有伴奏"）。这里改用显式 ``sd.OutputStream``
+        阻塞写入——每个 stream 是独立对象，两路并发互不干扰。
+        """
+
+        try:
+            # 通道适配：默认设备一般是 stereo，mono 数据需要扩展。
+            try:
+                default_dev = sd.query_devices(kind="output")
+                target_channels = int(
+                    self._read_attr(default_dev, "max_output_channels", 2) or 2
+                )
+            except Exception:
+                target_channels = 2
+            data = self._adapt_channels(data, target_channels)
+
+            channels = 1 if data.ndim == 1 else int(data.shape[1])
+            with sd.OutputStream(
+                samplerate=samplerate,
+                channels=channels,
+                device=None,
+                latency="high",
+            ) as stream:
+                stream.write(data)
+        except Exception as exc:
+            logger.error(f"伴奏播放到系统默认设备失败: {exc}")
+
+    def _play_sync(self, data: Any, samplerate: int) -> bool:
         """同步播放，包含设备适配 + 主路径/MME 备用路径。
 
         **每次播放前重新解析 device id** ——sounddevice 的 device id 在 Windows
         上不是稳定的（拔插任何 USB 音频 / VB-Cable / 蓝牙耳机都会让 id 重新分
         配），缓存的 id 会过期触发 ``MME error 2: 使用的设备标识号已超出本地
         系统范围``。这一段无开销（``sd.query_devices`` 在 Windows 上 < 1ms）。
+
+        Returns:
+            ``True`` 表示某条路径成功播放完成；``False`` 表示所有路径（含终极
+            回退到系统默认设备）都失败——调用方据此决定是否重置音频后端并重试。
         """
 
         # 1) 每次播放前重新解析 device id——避免缓存过期。
@@ -302,7 +751,7 @@ class AudioPlayer:
                     latency="high",
                 )
                 sd.wait()
-                return
+                return True
             except Exception as exc:
                 logger.error(f"MME 备用路径播放失败: {exc}")
                 # 保留 _prefer_fallback=True；继续走最终回退。
@@ -326,7 +775,7 @@ class AudioPlayer:
                     extra_settings=extra_settings,
                 )
                 sd.wait()
-                return
+                return True
             except Exception as exc:
                 # 对虚拟声卡（VB-Cable）来说，WASAPI 失败是**预期行为**（见
                 # _resolve_device 的说明），不是真正的错误——降级为 WARNING，
@@ -353,7 +802,7 @@ class AudioPlayer:
                             latency="high",
                         )
                         sd.wait()
-                        return
+                        return True
                     except Exception as exc2:
                         logger.error(f"MME 备用路径首次切换播放也失败: {exc2}")
 
@@ -362,8 +811,10 @@ class AudioPlayer:
             logger.warning("尝试终极回退：系统默认输出设备")
             sd.play(data, samplerate, device=None, latency="high")
             sd.wait()
+            return True
         except Exception as exc:
             logger.error(f"所有播放尝试均告失败: {exc}")
+            return False
 
     def _build_extra_settings(self, device_id: int | None) -> Any:
         """根据目标设备的 host API 构造 sounddevice ``extra_settings``。

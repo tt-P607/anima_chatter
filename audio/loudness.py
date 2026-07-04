@@ -187,7 +187,84 @@ def normalize_audio_bytes(
         return audio_bytes
 
 
+def normalize_dual_tracks(
+    vocal_data: np.ndarray,
+    inst_data: np.ndarray,
+    *,
+    target_dbfs: float = -14.0,
+    peak_ceiling: float = -1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """双轨统一归一化：基于混合 RMS 计算一个增益，同时应用到人声和伴奏。
+
+    用途：翻唱双轨（人声 + 伴奏）整体拉到目标响度，又保持 DAW 调好的人声/伴奏
+    相对比例不变——与"各自独立归一化"（会抹平比例）相反。
+
+    Args:
+        vocal_data: 人声轨 numpy 数组（float32，归一化范围 [-1, 1]）。
+        inst_data: 伴奏轨 numpy 数组（float32，与人声轨 shape 一致）。
+        target_dbfs: 目标响度（dBFS）。默认 -14.0。
+        peak_ceiling: 峰值软限幅阈值（dBFS）。默认 -1.0。
+
+    Returns:
+        ``(normalized_vocal, normalized_inst)`` 元组——两轨应用了**同一增益**。
+
+    Notes:
+        - 两轨采样率和声道数必须一致；帧数（时长）允许微小差异——
+          用重叠部分（较短长度）算混合 RMS 和峰值，增益应用到各自完整长度。
+        - 混合后的 RMS 计算方式：把两轨**直接相加**（模拟混音台推子全开）后计算 RMS。
+        - 若混合后波形过载（峰值超 [-1, 1]），增益计算时会自动考虑 peak_ceiling。
+        - 归一化后两轨**独立输出**到不同设备，不会重复叠加——只是用混合 RMS 统一拉电平。
+    """
+    # 声道数必须一致（shape[1] 或 ndim）
+    if vocal_data.ndim != inst_data.ndim:
+        raise ValueError(
+            f"vocal 与 inst 维度必须一致：vocal={vocal_data.ndim}D, inst={inst_data.ndim}D"
+        )
+    if vocal_data.ndim > 1 and vocal_data.shape[1] != inst_data.shape[1]:
+        raise ValueError(
+            f"vocal 与 inst 声道数必须一致：vocal={vocal_data.shape[1]}, "
+            f"inst={inst_data.shape[1]}"
+        )
+
+    # 帧数允许微小差异：用重叠部分算 RMS / 峰值，增益应用到完整长度
+    v_frames = vocal_data.shape[0]
+    i_frames = inst_data.shape[0]
+    if v_frames != i_frames:
+        min_frames = min(v_frames, i_frames)
+        v_overlap = vocal_data[:min_frames]
+        i_overlap = inst_data[:min_frames]
+    else:
+        v_overlap, i_overlap = vocal_data, inst_data
+
+    # 把两轨直接相加模拟混音（推子全开），基于混合波形算 RMS
+    mixed = v_overlap + i_overlap
+    rms = float(np.sqrt(np.mean(mixed**2)))
+    if rms < 1e-9:
+        # 双轨都静音 → 不加增益直接返回
+        return vocal_data, inst_data
+
+    # 目标增益：让混合 RMS 达到 target_dbfs
+    current_dbfs = 20 * np.log10(rms)
+    target_gain_db = target_dbfs - current_dbfs
+    gain = 10 ** (target_gain_db / 20.0)
+
+    # 峰值限幅：检查混合波形应用 gain 后是否过载
+    mixed_peak = float(np.max(np.abs(mixed)))
+    if mixed_peak > 1e-9:
+        peak_after_gain = mixed_peak * gain
+        peak_after_gain_db = 20 * np.log10(peak_after_gain)
+        if peak_after_gain_db > peak_ceiling:
+            # 降增益让峰值刚好不超 peak_ceiling
+            gain = 10 ** (peak_ceiling / 20.0) / mixed_peak
+
+    # 同一增益应用到两轨
+    normalized_vocal = (vocal_data * gain).astype(np.float32)
+    normalized_inst = (inst_data * gain).astype(np.float32)
+    return normalized_vocal, normalized_inst
+
+
 __all__ = [
     "normalize_audio_array",
     "normalize_audio_bytes",
+    "normalize_dual_tracks",
 ]

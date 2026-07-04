@@ -64,6 +64,8 @@ from .constants import CHATTER_SIGNATURE
 from .modes import ChatterMode
 from .prompts import (
     MODE_PROMPT_PROFILES,
+    PLAIN_TEXT_REMINDER_VTB,
+    PLAIN_TEXT_REMINDER_VOICE,
     SYSTEM_PROMPT,
     USER_PROMPT_TEMPLATE,
     AnimaChatterPromptBuilder,
@@ -194,10 +196,11 @@ class AnimaChatter(BaseChatter):
     async def _build_system_prompt(self, chat_stream: ChatStream) -> str:
         """根据 platform 自动选择 voice / vtb 场景的系统提示词。"""
 
-        # 仅在 plugin 上下文里能拿到 vts_performer；
+        # 仅在 plugin 上下文里能拿到当前活动表演器（VTS）；
         # 没有时返回空 dict，builder 会跳过额外注入逻辑。
         expression_hints: dict[str, str] = {}
-        performer = getattr(self.plugin, "vts_performer", None)
+        get_active = getattr(self.plugin, "get_active_performer", None)
+        performer: Any = get_active() if callable(get_active) else None
         if performer is not None and hasattr(performer, "get_expression_hints"):
             try:
                 expression_hints = performer.get_expression_hints()
@@ -265,6 +268,7 @@ class AnimaChatter(BaseChatter):
         history_text: str,
         unread_lines: str,
         extra: str = "",
+        clean_mode: bool = False,
     ) -> str:
         """构建用户提示词（按模式选择不同模板）。
 
@@ -273,10 +277,16 @@ class AnimaChatter(BaseChatter):
         在 timer 唤醒等路径不会被调到，这里是兜底入口。通过门后立即调
         :func:`pipeline_state.reset_round` 标记新一轮——下次 reserve 会在
         队列尾加 silence_gap，避免新一轮音频接得太急。
+
+        Args:
+            clean_mode: 是否生成清洁模式 prompt（去掉某些注入内容）。
+                anima_chatter 目前不使用此模式，参数仅为与 default_chatter
+                Session 协议兼容而保留。
         """
 
         # 流水线门已经移到 fetch_unreads——这里不再 wait_gate，避免重复阻塞。
         # _build_user_prompt 本身只构造提示词，不再插入流水线逻辑。
+        _ = clean_mode  # anima_chatter 不使用 clean_mode
         mode = self._resolve_mode(chat_stream)
         return await AnimaChatterPromptBuilder.build_user_prompt(
             chat_stream,
@@ -410,6 +420,10 @@ class AnimaChatter(BaseChatter):
             "create_agent",
             "get_agent",
             "kill_agent",
+            # 屏蔽 singing_plugin 的 sing_a_song：anima 接管的流（voice/vtb/
+            # vtb_live）统一用自己的 sing_song 双轨翻唱，避免两个唱歌动作并存
+            # 让模型混淆、也避免 singing_plugin 走 QQ 语音链路与直播本地播放冲突。
+            "action-sing_a_song",
         }
 
         registry = ToolRegistry()
@@ -693,16 +707,9 @@ class AnimaChatter(BaseChatter):
             platform = ""
 
         if platform == "local_asr":
-            reminder = (
-                "系统提醒：当前是实时语音通话 Chatter。你必须调用 say action 输出"
-                "要说的话，纯文本不会被播放。说完等待用户时，请调用 pass_and_wait。"
-            )
+            reminder = PLAIN_TEXT_REMINDER_VOICE
         else:
-            reminder = (
-                "系统提醒：当前是 VTube Studio 虚拟形象互动 Chatter。你必须调用 "
-                "say_and_perform action 输出要说的话，纯文本不会被发送也不会被朗读。"
-                "说完等待用户时，请调用 pass_and_wait。"
-            )
+            reminder = PLAIN_TEXT_REMINDER_VTB
 
         if retry_count < max(0, retry_limit):
             return {"action": "retry", "reminder_text": reminder}
@@ -753,6 +760,63 @@ class AnimaChatter(BaseChatter):
                 return
             except Exception as exc:  # noqa: BLE001
                 logger.debug(f"通话超时 watchdog 异常（继续）: {exc}")
+
+    # ── LLM Request ──────────────────────────────────────────
+
+    def create_request(
+        self,
+        task: str = "actor",
+        request_name: str = "",
+        with_reminder: Any | None = None,
+    ) -> Any:
+        """重写以支持自定义回复模型（类似 kokoro_flow_chatter）。"""
+
+        from src.kernel.llm import LLMRequest, LLMContextManager, ReminderSourceSpec
+        from src.app.plugin_system.api.llm_api import get_model_set_by_name, get_model_set_by_task
+        from src.core.utils.context_compression import default_chat_context_compression_handler
+
+        config = self._get_plugin_config()
+        model_set = None
+
+        if config and config.plugin.models:
+            # 使用 models 列表
+            parts = []
+            for model_name in config.plugin.models:
+                m_set = get_model_set_by_name(
+                    model_name,
+                    temperature=config.plugin.temperature,
+                    max_tokens=config.plugin.max_tokens,
+                )
+                if m_set:
+                    parts.extend(m_set)
+            if parts:
+                model_set = parts
+
+        if not model_set:
+            # fallback 到 model_task，如果都没配则使用传进来的 task（默认 actor）
+            task_name = config.plugin.model_task if config else task
+            model_set = get_model_set_by_task(task_name)
+
+        reminder_sources = None
+        if with_reminder is not None:
+            reminder_sources = [
+                ReminderSourceSpec(
+                    bucket=str(with_reminder),
+                    wrap_with_system_tag=True,
+                )
+            ]
+
+        context_manager = LLMContextManager(
+            context_compression_handler=default_chat_context_compression_handler,
+            reminder_sources=reminder_sources,
+        )
+
+        return LLMRequest(
+            model_set=model_set,
+            request_name=request_name or self.chatter_name,
+            meta_data={"stream_id": self.stream_id},
+            context_manager=context_manager,
+        )
 
     # ── execute() ───────────────────────────────────────────
 
@@ -885,6 +949,9 @@ class AnimaChatterPlugin(BasePlugin):
     vts_performer: VTSPerformer | None = None
     # 直播清唱歌库；扫描 plugins/anima_chatter/songs/ 目录下的清唱文件。
     song_library: Any = None
+    # TTS Provider 能力元数据缓存；on_plugin_loaded 时从 tts_http_server /status 查询。
+    # 为 None 表示未获取到（TTS 服务未启动 / 老 provider 不支持），Action 回退到默认描述。
+    tts_capabilities: Any = None
 
     async def on_plugin_loaded(self) -> None:
         """注册提示词模板，并按配置初始化 VTB 资源（AudioPlayer + VTS）。
@@ -911,6 +978,11 @@ class AnimaChatterPlugin(BasePlugin):
         else:
             logger.info("唱歌能力已通过 config.plugin.enable_singing=false 关闭，跳过歌库初始化")
             self.song_library = None
+
+        # 查询 TTS Provider 能力元数据，供 SayAction / SayAndPerformAction 的
+        # to_schema() 动态注入参数说明。查询失败时 tts_capabilities 保持 None，
+        # Action 回退到 Annotated 里的默认描述。
+        self._init_tts_capabilities(config)
 
     def _register_prompts(self) -> None:
         """注册 anima_chatter 在 prompt manager 上的全部模板。
@@ -1009,15 +1081,89 @@ class AnimaChatterPlugin(BasePlugin):
             )
         )
 
+    def _init_tts_capabilities(self, config: AnimaChatterConfig) -> None:
+        """通过进程内 service API 获取 TTS Provider 的能力元数据并缓存。
+
+        不再走 HTTP 回环查询 ``/status``——本方法在 ``on_plugin_loaded`` 中被
+        调用时，HTTP 服务器尚未绑定端口，回环查询必然 ConnectionRefused。
+
+        改为通过 :func:`get_service` 拿 ``TTSProviderRegistryService``，
+        再调 ``get_provider().get_capabilities()`` 直接拿到原始
+        :class:`TTSCapabilities` 对象——零序列化损失，无需反序列化。
+
+        时序容忍：若调用时 provider 尚未注册（tts_voice_plugin-neo 还没
+        加载），``tts_capabilities`` 保持 ``None``，Action 的
+        :meth:`_get_tts_capabilities` 会在 ``to_schema`` 首次调用时懒加载兜底。
+
+        Args:
+            config: 插件配置（保留参数兼容，当前未使用——endpoint 不再需要）。
+        """
+
+        try:
+            from src.app.plugin_system.api.service_api import get_service
+
+            registry = get_service("tts_http_server:service:tts_provider_registry")
+        except Exception as exc:
+            logger.debug(f"获取 TTSProviderRegistryService 失败: {exc}")
+            return
+
+        if registry is None:
+            logger.debug("tts_http_server registry service 未注册，跳过 capabilities 查询")
+            return
+
+        provider_name = ""
+        try:
+            # getattr 绕过类型检查：get_service 返回 BaseService，
+            # 但运行时实际是 TTSProviderRegistryService 子类
+            get_provider_fn = getattr(registry, "get_provider", None)
+            if not callable(get_provider_fn):
+                logger.debug("registry 无 get_provider 方法")
+                return
+            provider: Any = get_provider_fn()
+            if provider is None:
+                logger.debug("无 TTS Provider 注册，capabilities 将在 to_schema 时懒加载")
+                return
+            provider_name = str(getattr(provider, "provider_name", "") or "")
+            get_caps_fn = getattr(provider, "get_capabilities", None)
+            caps: Any = get_caps_fn() if callable(get_caps_fn) else None
+        except Exception as exc:
+            logger.debug(f"调用 TTS Provider get_capabilities 失败: {exc}")
+            return
+
+        if caps is None:
+            logger.info(
+                f"TTS Provider '{provider_name}' 未提供 capabilities，"
+                "Action schema 将使用默认参数描述"
+            )
+            return
+
+        self.tts_capabilities = caps
+        style_marker = "  - '"
+        style_count_str = ""
+        if caps.style_guide:
+            style_count_str = f", styles={caps.style_guide.description.count(style_marker)}"
+        logger.info(
+            f"已从 TTS Provider '{provider_name}' 获取能力元数据"
+            f"{style_count_str}，Action schema 将动态注入参数说明"
+        )
+
     async def _init_audio_resources(self, config: AnimaChatterConfig) -> None:
-        """初始化本地 AudioPlayer 与 VTSPerformer。"""
+        """初始化本地 AudioPlayer 与 VTube Studio 表演器。
+
+        音频输出设备配置取 ``config.vts`` 段；若 ``config.vts.enabled`` 为 True
+        则实例化 :class:`VTSPerformer`，否则仅初始化 AudioPlayer。
+        """
 
         # 0 表示关闭响度归一化；否则把目标 dBFS 传给 AudioPlayer。
+        output_device = config.vts.audio_output_device
+        inst_output_device = config.vts.inst_output_device
+
         loudness_target = float(config.audio_drive.loudness_target_dbfs)
         loudness_arg: float | None = None if loudness_target == 0.0 else loudness_target
         self.audio_player = AudioPlayer(
-            output_device=config.vts.audio_output_device,
+            output_device=output_device,
             loudness_target_dbfs=loudness_arg,
+            inst_output_device=inst_output_device,
         )
         if loudness_arg is None:
             logger.info("响度归一化已关闭（按原音量播放所有音频）")
@@ -1044,6 +1190,14 @@ class AnimaChatterPlugin(BasePlugin):
             logger.warning(
                 "VTSPerformer 初始化未连接 VTS，vtb 模式将仅播放 TTS 音频。"
             )
+
+    def get_active_performer(self) -> VTSPerformer | None:
+        """返回当前激活的 VTSPerformer 实例。
+
+        Action 层统一通过本方法获取表演器；未初始化时返回 None。
+        """
+
+        return self.vts_performer
 
     def _init_song_library(self) -> None:
         """初始化直播清唱歌库（``data/anima_chatter/songs/`` 目录）。"""
