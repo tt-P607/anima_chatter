@@ -8,15 +8,15 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from src.core.components.base.action import BaseAction
+from src.app.plugin_system.base import BaseAction
 
 
 class AnimaPassAndWaitAction(BaseAction):
     """登记等待用户继续说话或等待指定秒数后主动恢复。"""
 
-    action_name = "pass_and_wait"
+    name = "pass_and_wait"
     associated_types = ["text"]
-    action_description = (
+    description = (
         "为当前实时通话/虚拟形象会话登记等待点。说完话后调用它等待用户继续说话；"
         "seconds 为空时等待新输入，传入秒数时到时主动恢复。"
         "本动作只影响 chatter 是否挂起，不影响已经派发的 TTS / VTS 表演。"

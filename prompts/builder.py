@@ -383,14 +383,9 @@ class AnimaChatterPromptBuilder:
 
     @staticmethod
     def build_negative_behaviors_extra() -> str:
-        """构建用户提示词末尾的负面行为提醒（"近因效应"复述）。
+        """构建用户提示词末尾的负面行为提醒。
 
-        历史上 system prompt 与 user prompt 各注入一份，模型会在一次请求里
-        看到两份相同的 negative_behaviors 文本——浪费 token 不说，还容易让
-        模型觉得"这就是模板冗余"，反而降低提醒效果。
-
-        现在策略：**只**在 user prompt 末尾注入一份（"近因效应"对模型注意力
-        最友好），system prompt 模板里同名占位符已经移除。
+        约束只在用户提示词末尾注入一次，避免重复文本占用上下文并降低提醒效果。
         """
 
         negative_behaviors = get_core_config().personality.negative_behaviors

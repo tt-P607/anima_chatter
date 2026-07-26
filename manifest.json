@@ -1,16 +1,23 @@
 {
     "name": "anima_chatter",
-    "display_name": "语音通话与 VTube Studio 互动聊天器",
-    "version": "1.1.5",
-    "description": "ASR 实时语音通话 + VTube Studio 虚拟形象 通用 Chatter",
-    "author": "MoFox Team",
+    "api_version": {"adapter_api": "1.0.0", "chat_api": "1.0.0", "event_api": "1.0.0", "llm_api": "1.0.0", "log_api": "1.0.0", "plugin_api": "1.0.0", "send_api": "1.0.0", "service_api": "1.0.0", "stream_api": "1.0.0"},
+
+    "display_name": "Anima 语音通话与虚拟形象聊天器",
+    "version": "1.1.6",
+    "description": "统一编排实时语音通话、VTube Studio 表演和直播弹幕互动的三模式 Chatter。",
+    "author": "言柒",
     "dependencies": {
         "plugins": [
             "asr_adapter_anima",
             "tts_http_server",
             "default_chatter"
         ],
-        "components": []
+        "components": [
+            "default_chatter:service:chat_core",
+            "asr_adapter_anima:adapter:asr_adapter_anima",
+            "asr_adapter_anima:service:asr_redirect",
+            "tts_http_server:service:tts_provider_registry"
+        ]
     },
     "python_dependencies": [
         "pyvts>=0.3.3",
@@ -80,7 +87,8 @@
         "voice",
         "chatter",
         "real-time",
-        "company",
-        "vtb"
+        "tts",
+        "vtube-studio",
+        "live"
     ]
 }

@@ -30,8 +30,7 @@ from typing import TYPE_CHECKING, Annotated, Any, AsyncGenerator, cast
 
 from src.app.plugin_system.api import send_api
 from src.app.plugin_system.api.log_api import get_logger
-from src.core.components.base import Failure
-from src.core.components.base.action import BaseAction
+from src.app.plugin_system.base import BaseAction, Failure
 
 from .. import pipeline_state
 from .._internal_compat import create_background_task
@@ -57,9 +56,9 @@ logger = get_logger("anima_chatter.action.say_and_perform")
 class SayAndPerformAction(BaseAction):
     """通过虚拟形象（VTube Studio）说一段话并设定情绪与意图（vtb 模式）。"""
 
-    action_name = "say_and_perform"
+    name = "say_and_perform"
     associated_types = ["voice", "text"]
-    action_description = (
+    description = (
         "通过 VTube Studio 虚拟形象说一段话。会同时把文本发到当前聊天，"
         "用 TTS 朗读，并驱动虚拟形象的嘴型 + 表情 + 头部姿态。"
         "支持 [wait:n] 控制下一段播放前等待 n 秒（仅需要长停顿时使用）。"
@@ -270,15 +269,20 @@ class SayAndPerformAction(BaseAction):
                 logger.error(f"TTS 合成段落 {idx} 失败: {exc}")
                 return idx, Failure(str(exc))
 
-        # 关键性能优化：用 asyncio.create_task 把合成任务**立即挂到事件循环**，
-        # 而不是等到 ``consume_in_order`` 里 ``asyncio.as_completed`` 才包装。
-        # 这样多个 say_and_perform action 同时被调度时，每个 action 的合成都
-        # 在拿 VTS performer 锁之前就开始跑——前一个 action 在播放音频时，
-        # 后一个 action 的 TTS 已经在 GSV 服务器上推理了，避免"播放完才合成"
-        # 的串行浪费。配合下方 consume_in_order 用 wait_for 顺序消费即可。
-        tasks: list[asyncio.Task[tuple[int, Any]]] = [
-            asyncio.create_task(synthesize_one(seg, i))
+        # 合成任务立即交给 task_manager 并发执行；播放阶段仍按索引顺序消费。
+        task_infos = [
+            create_background_task(
+                synthesize_one(seg, i),
+                name=f"anima_chatter.tts_segment.{self.chat_stream.stream_id[:8]}.{i}",
+                metadata={
+                    "stream_id": self.chat_stream.stream_id,
+                    "kind": "tts_segment",
+                },
+            )
             for i, seg in enumerate(segments)
+        ]
+        tasks: list[asyncio.Task[tuple[int, Any]]] = [
+            info.task for info in task_infos if info.task is not None
         ]
 
         # 取顶层 emotion 主类型（happy / sad / ...），用作行内 motion 切换时
@@ -357,9 +361,8 @@ class SayAndPerformAction(BaseAction):
         expression；为 None 时切回顶层 intent。没有 performer（VTS 未连）时退回
         纯 audio_player 播放。
 
-        tasks 是 ``asyncio.create_task`` 提前挂上事件循环的对象，合成在拿播放锁
-        之前已经开始跑——这里只按 idx 顺序 await，前段播放期间后段持续在 TTS
-        服务器上推理。阻塞模式与流水线后台模式共用本方法，避免逻辑分叉。
+        tasks 在进入播放阶段前已通过 task_manager 并发启动；本方法按索引顺序
+        等待结果，前段播放期间后段仍可继续合成。
         """
 
         next_to_play = 0

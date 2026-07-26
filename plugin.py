@@ -1,49 +1,52 @@
-"""anima_chatter 插件入口。
+"""Anima 三模式聊天器与插件生命周期实现。
 
-支持两种运行模式：
-
-- voice 模式（``platform == "local_asr"``）：与 ASR 适配器配合，
-  用 ``SayAction`` 把 TTS 音频回传给适配器播放。
-- vtb 模式（其他平台，由 ``/vtb on`` 显式接管）：用 ``SayAndPerformAction``
-  在本地播放 TTS 到 VB-Cable，并驱动 VTube Studio 虚拟形象。
-
-P0-3 重构：anima_chatter 的对话循环不再自己实现，整体接入 dfc 的
-``default_chatter:service:chat_core`` 服务（[`DefaultChatterService`](../default_chatter/service.py:21)）。
-本类只负责按 dfc 的 ``Adapter`` 协议提供：
-- prompt 构建（按 voice / vtb / vtb_live mode 切换文案）
-- unread 获取（通话期间附带写入 ``call_state``）
-- 工具注入（屏蔽 send_text / stop_conversation / 子代理协作工具）
-- sub-agent 决策（vtb / vtb_live 调 dfc decision_agent；voice 直通）
-- plain-text 兜底提醒（按 mode 切提醒文案）
-- 通话超时（用 task_manager 起一个独立背景 task 在 Session 外并行检查）
+该模块装配 voice、vtb 和 vtb_live 三种运行模式，并通过
+``default_chatter:service:chat_core`` 复用聊天会话控制流。模式专属逻辑包括
+提示词、注意力决策、工具可见性、语音通话超时以及 VTube Studio 资源管理。
 """
 
 from __future__ import annotations
 
 import asyncio
+import random
 from pathlib import Path
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, cast
 
+import json_repair
+
+from src.app.plugin_system.api import stream_api
+from src.app.plugin_system.api.llm_api import get_model_set_by_name, get_model_set_by_task
 from src.app.plugin_system.api.log_api import get_logger
-from src.core.components.base import (
+from src.app.plugin_system.base import (
     BaseChatter,
     BasePlugin,
     Failure,
     Success,
     Wait,
     WaitResumeEvent,
+    register_plugin,
 )
-from src.core.components.loader import register_plugin
-from src.core.components.types import ChatType
+from src.app.plugin_system.types import (
+    ChatStream,
+    ChatType,
+    LLMPayload,
+    LLMUsable,
+    Message,
+    ROLE,
+    Text,
+    ToolRegistry,
+)
 from src.core.config import get_core_config
-from src.core.models.message import Message
-from src.core.models.stream import ChatStream
+from src.core.prompt import STREAM_BUCKET_PREFIX
 from src.core.prompt import get_prompt_manager
-from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry
-from src.kernel.llm.payload.tooling import LLMUsable
+from src.core.utils.context_compression import default_chat_context_compression_handler
+from src.kernel.concurrency import get_task_manager
+from src.kernel.llm import LLMContextManager, LLMRequest, ReminderSourceSpec
 
-
-from plugins.default_chatter.type_defs import (
+from .chat_core_bridge import (
+    AnimaSessionAdapters,
+    AnimaSessionOptions,
+    ChatCoreServiceLike,
     PlainTextResponseHandling,
     SubAgentDecision,
 )
@@ -78,21 +81,7 @@ logger = get_logger("anima_chatter")
 
 
 class _SafeLoggerWrapper:
-    """对 :class:`Logger` 的薄包装，仅在 ``print_panel`` 时把内容做 rich 转义。
-
-    背景：dfc Session 会用 ``logger.print_panel(_build_actor_decision_panel(...))``
-    打印 Actor 决策面板，其中 LLM 输出的 ``content`` 字段可能包含我们自定义的
-    ``[motion:NAME]...[/motion]`` 内联标记。Rich 的 ``[xxx]`` 标记会把这些方括号
-    当成 markup tag 解析——遇到无配对的 ``[/motion]`` 时直接抛
-    ``MarkupError: closing tag '[/motion]' doesn't match any open tag``，
-    把整条 stream loop 杀掉。
-
-    本包装把 ``print_panel`` 的 ``message`` 用 :func:`rich.markup.escape` 处理一遍，
-    其它方法（info/warning/error/debug 等）全部直接转发给原 logger。这样既不
-    影响 logger 本身的 markup 渲染（比如 ``[bold]xxx[/bold]`` 这种正常 markup
-    仍然有效——它们不会经过 print_panel 路径），又能让面板里出现的"原始 LLM
-    文本"安全显示。
-    """
+    """转义决策面板中的 Rich 标记，同时透传普通日志方法。"""
 
     def __init__(self, inner: Any) -> None:
         self._inner = inner
@@ -118,7 +107,7 @@ class _SafeLoggerWrapper:
         title: str | None = None,
         border_style: str | None = None,
     ) -> None:
-        """转义 message 后转发，避免 LLM 输出的 ``[/motion]`` 等触发 rich MarkupError。"""
+        """转义面板内容，避免模型输出被 Rich 当作未闭合标记解析。"""
 
         try:
             from rich.markup import escape
@@ -129,27 +118,18 @@ class _SafeLoggerWrapper:
         try:
             self._inner.print_panel(safe, title=title, border_style=border_style)
         except Exception as exc:  # noqa: BLE001
-            # 终极兜底：连转义后还失败，就直接走 info 输出（至少不杀流）
             self._inner.info(f"[panel-fallback] {title or ''}\n{safe}")
             self._inner.debug(f"print_panel 转义后仍失败: {exc}")
 
-# 接管 / 释放命令使用的 chatter 签名常量。
-# 来自 :mod:`.constants` 的统一定义；保留模块级别名给历史调用点。
 _CHATTER_SIGNATURE = CHATTER_SIGNATURE
-
-# dfc 的 chat_core service 签名——anima_chatter 通过它创建会话。
-_DFC_CHAT_CORE_SERVICE = "default_chatter:service:chat_core"
+_CHAT_CORE_SERVICE_SIGNATURE = "default_chatter:service:chat_core"
 
 
 class AnimaChatter(BaseChatter):
-    """anima_chatter：语音通话 / VTube Studio 虚拟形象通用 Chatter。
+    """提供语音通话、虚拟形象互动与直播弹幕对话控制。"""
 
-    本类只负责按 dfc 的 :class:`DefaultChatterSessionAdapters` 协议提供
-    若干 hook，对话循环本身完全由 dfc :class:`DefaultChatterSession` 跑。
-    """
-
-    chatter_name = "anima_chatter"
-    chatter_description = (
+    name = "anima_chatter"
+    description = (
         "语音通话与 VTube Studio 虚拟形象互动通用 Chatter。"
         "platform=local_asr 时为实时通话模式；其他平台需通过 /vtb on 显式接管。"
     )
@@ -349,23 +329,13 @@ class AnimaChatter(BaseChatter):
         # 会进入 stream context.unread_messages，门通过后由 super 一次性
         # 全部拉出来给 dfc Session。
         try:
-            from src.core.managers import get_stream_manager
-
-            chat_stream = await get_stream_manager().activate_stream(self.stream_id)
-        except Exception:
+            chat_stream = await stream_api.activate_stream(self.stream_id)
+        except (RuntimeError, ValueError):
             chat_stream = None
         if chat_stream is not None and self._resolve_mode(chat_stream) == "vtb_live":
             from . import pipeline_state as _ps
 
-            had_gate = False
-            if _ps.get_settings().enabled:
-                # 先看一眼累积是否够触发——日志只在真要等的时候打
-                state_snap = _ps._states.get(self.stream_id)
-                if (
-                    state_snap is not None
-                    and state_snap.round_accumulated >= _ps.get_settings().min_duration_seconds
-                ):
-                    had_gate = True
+            had_gate = await _ps.is_gate_pending(self.stream_id)
             await _ps.wait_gate(self.stream_id)
             await _ps.reset_round(self.stream_id)
             if had_gate:
@@ -458,14 +428,8 @@ class AnimaChatter(BaseChatter):
         :func:`pipeline_state.reset_round` 标记新一轮开始，让下一次 reserve
         把 silence_gap 加到队列起点。
 
-        注意力过滤的 LLM 调用、token 截断、JSON 解析降级**全部交给 dfc 的
-        :func:`plugins.default_chatter.decision_agent.decide_should_respond`，
-        anima 这里只负责按 mode 选 prompt 模板。
+        注意力过滤使用本插件的结构化决策请求，保持与聊天核心相同的响应格式。
         """
-
-        import random
-
-        from plugins.default_chatter.decision_agent import decide_should_respond
 
         mode = self._resolve_mode(chat_stream)
         if mode == "voice":
@@ -529,26 +493,17 @@ class AnimaChatter(BaseChatter):
                     "reason": f"概率直通响应：{reason_text}",
                 }
 
-        # ── 走 dfc 的 sub_actor LLM 决策 ──
-        # 选 mode 对应的 prompt 模板名；dfc decide_should_respond 内部会
-        # 优先用同名模板渲染，找不到才用 fallback_prompt。
+        # ── sub_actor LLM 决策 ──
         if mode == "vtb_live":
             template_name = "anima_chatter_sub_agent_prompt_vtb_live"
             fallback_prompt = SUB_AGENT_PROMPT_LIVE
         else:
             template_name = "anima_chatter_sub_agent_prompt_vtb"
             fallback_prompt = SUB_AGENT_PROMPT_VTB
-        # 注意：dfc decide_should_respond 内部硬编码 template name 是
-        # "default_chatter_sub_agent_prompt"，找不到才用 fallback_prompt。
-        # 我们走 fallback_prompt 路径——anima 的两个模板用专门的 mode 名
-        # 注册（vtb / vtb_live 文案有差异），不能套 dfc 的同名模板。
-        _ = template_name  # 未来 dfc 暴露 template_name 参数后切回去
-
-        return await decide_should_respond(
-            chatter=self,
-            logger=logger,
+        return await self._decide_should_respond(
             unreads_text=unreads_text,
             chat_stream=chat_stream,
+            template_name=template_name,
             fallback_prompt=fallback_prompt,
         )
 
@@ -666,6 +621,68 @@ class AnimaChatter(BaseChatter):
             max(current, cls._NEXT_TICK_REPLY_BONUS),
         )
 
+    async def _decide_should_respond(
+        self,
+        *,
+        unreads_text: str,
+        chat_stream: ChatStream,
+        template_name: str,
+        fallback_prompt: str,
+    ) -> SubAgentDecision:
+        """调用 sub_actor 模型判断当前批次消息是否需要回复。"""
+
+        try:
+            request = self.create_request(
+                "sub_actor",
+                "anima_attention",
+                with_reminder="sub_actor",
+            )
+        except (ValueError, KeyError):
+            return {"should_respond": True, "reason": "sub_actor 配置不可用，默认响应"}
+
+        personality = get_core_config().personality
+        bot_id = chat_stream.bot_id or ""
+        bot_id_section = f"它的平台标识是 {bot_id}。\n" if bot_id else ""
+        template = get_prompt_manager().get_template(template_name)
+        if template is not None:
+            sub_prompt = await (
+                template.set("nickname", personality.nickname)
+                .set("bot_id", bot_id)
+                .set("bot_id_section", bot_id_section)
+                .set("personality_core_section", personality.personality_core)
+                .set("personality_side_section", personality.personality_side)
+                .build()
+            )
+        else:
+            sub_prompt = fallback_prompt.format(
+                nickname=personality.nickname,
+                bot_id=bot_id,
+                bot_id_section=bot_id_section,
+                personality_core_section=personality.personality_core,
+                personality_side_section=personality.personality_side,
+            )
+
+        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(sub_prompt)))
+        request.add_payload(
+            LLMPayload(ROLE.USER, Text(f"【新收到待判定消息】\n{unreads_text}"))
+        )
+        try:
+            response = await request.send(stream=False)
+            await response
+            content = response.message.strip()
+            if not content:
+                return {"should_respond": True, "reason": "模型未返回判断内容"}
+            result = json_repair.loads(content)
+            if isinstance(result, dict):
+                return {
+                    "should_respond": bool(result.get("should_respond", True)),
+                    "reason": str(result.get("reason") or "未提供理由"),
+                }
+            logger.warning(f"注意力决策未返回 JSON 对象: {content[:200]}")
+        except Exception as error:  # noqa: BLE001
+            logger.error(f"注意力决策执行失败: {error}", exc_info=True)
+        return {"should_respond": True, "reason": "决策失败，默认响应"}
+
     # ── PlainTextResponseAdapter 协议方法 ──────────────────
 
     def handle_plain_text_response(
@@ -694,17 +711,10 @@ class AnimaChatter(BaseChatter):
             1 if plugin_config is None else int(plugin_config.plugin.plain_text_retry_limit)
         )
 
-        # 通过 self.stream_id 反查 stream 来推断 mode——execute() 入口已激活流。
-        # 防御一下：拿不到时按 vtb 处理（用 say_and_perform 提醒）。
         platform = ""
-        try:
-            from src.core.managers import get_stream_manager
-
-            chat_stream = get_stream_manager()._streams.get(self.stream_id)
-            if chat_stream is not None:
-                platform = chat_stream.platform or ""
-        except Exception:
-            platform = ""
+        chat_stream = self._active_stream
+        if chat_stream is not None:
+            platform = chat_stream.platform or ""
 
         if platform == "local_asr":
             reminder = PLAIN_TEXT_REMINDER_VOICE
@@ -763,17 +773,15 @@ class AnimaChatter(BaseChatter):
 
     # ── LLM Request ──────────────────────────────────────────
 
+    _active_stream: ChatStream | None = None
+
     def create_request(
         self,
         task: str = "actor",
         request_name: str = "",
-        with_reminder: Any | None = None,
+        with_reminder: str | None = None,
     ) -> Any:
         """重写以支持自定义回复模型（类似 kokoro_flow_chatter）。"""
-
-        from src.kernel.llm import LLMRequest, LLMContextManager, ReminderSourceSpec
-        from src.app.plugin_system.api.llm_api import get_model_set_by_name, get_model_set_by_task
-        from src.core.utils.context_compression import default_chat_context_compression_handler
 
         config = self._get_plugin_config()
         model_set = None
@@ -799,12 +807,22 @@ class AnimaChatter(BaseChatter):
 
         reminder_sources = None
         if with_reminder is not None:
+            # 与 BaseChatter.create_request 对齐：同时注册全局 bucket 和
+            # stream:{stream_id}:{bucket} 的流私有 bucket。
+            bucket = with_reminder
             reminder_sources = [
                 ReminderSourceSpec(
-                    bucket=str(with_reminder),
+                    bucket=bucket,
                     wrap_with_system_tag=True,
                 )
             ]
+            if self.stream_id:
+                reminder_sources.append(
+                    ReminderSourceSpec(
+                        bucket=f"{STREAM_BUCKET_PREFIX}{self.stream_id}:{bucket}",
+                        wrap_with_system_tag=True,
+                    )
+                )
 
         context_manager = LLMContextManager(
             context_compression_handler=default_chat_context_compression_handler,
@@ -813,7 +831,7 @@ class AnimaChatter(BaseChatter):
 
         return LLMRequest(
             model_set=model_set,
-            request_name=request_name or self.chatter_name,
+            request_name=request_name or self.name,
             meta_data={"stream_id": self.stream_id},
             context_manager=context_manager,
         )
@@ -835,26 +853,19 @@ class AnimaChatter(BaseChatter):
         """
 
         from src.app.plugin_system.api.service_api import get_service
-        from src.core.managers.stream_manager import get_stream_manager
-
-        from plugins.default_chatter.type_defs import (
-            DefaultChatterSessionAdapters,
-            DefaultChatterSessionOptions,
-        )
-
-        stream_manager = get_stream_manager()
-        chat_stream = await stream_manager.activate_stream(self.stream_id)
+        chat_stream = await stream_api.activate_stream(self.stream_id)
         if chat_stream is None:
             logger.error(f"无法激活聊天流: {self.stream_id}")
             yield Failure("无法激活聊天流")
             return
 
+        self._active_stream = chat_stream
         self.apply_stream_runtime_options(chat_stream)
 
-        service = get_service(_DFC_CHAT_CORE_SERVICE)
+        service = get_service(_CHAT_CORE_SERVICE_SIGNATURE)
         if service is None:
             logger.error(
-                f"未找到 {_DFC_CHAT_CORE_SERVICE} service。请确认 default_chatter "
+                f"未找到 {_CHAT_CORE_SERVICE_SIGNATURE} service。请确认 default_chatter "
                 "插件已启用（manifest.json 已声明依赖，但运行期还需要其插件可用）。"
             )
             yield Failure("default_chatter chat_core service 不可用")
@@ -863,7 +874,7 @@ class AnimaChatter(BaseChatter):
         plugin_config = self._get_plugin_config()
         # anima 自定义 options：关掉 cooldown / 子代理协作 / native multimodal /
         # stop direct wake；这些 dfc 默认值对 anima 不合适。
-        options = DefaultChatterSessionOptions(
+        options = AnimaSessionOptions(
             actor_task_name="actor",
             sub_actor_task_name="sub_actor",
             enable_cooldown=False,  # anima 没有"对话冷却"概念
@@ -882,7 +893,7 @@ class AnimaChatter(BaseChatter):
             enable_llm_stream=False,
         )
 
-        adapters = DefaultChatterSessionAdapters(
+        adapters = AnimaSessionAdapters(
             request_adapter=self,
             prompt_adapter=self,
             unread_adapter=self,
@@ -893,20 +904,20 @@ class AnimaChatter(BaseChatter):
             plain_text_adapter=self,
         )
 
-        session = service.create_session(  # type: ignore[attr-defined]
+        chat_core = cast(ChatCoreServiceLike, service)
+        session = chat_core.create_session(
             stream_id=self.stream_id,
             options=options,
             adapters=adapters,
         )
 
-        # 起独立超时 watchdog——与 dfc Session 并行跑。
-        # 不通过 task_manager 启动是因为 chatter 生命周期短，CancelledError
-        # 直接由 finally 处理即可；用 task_manager 反而要额外管理 handle。
-        watchdog_task: asyncio.Task[None] | None = None
+        watchdog_task_info: Any | None = None
         try:
-            watchdog_task = asyncio.create_task(
+            watchdog_task_info = get_task_manager().create_task(
                 self._voice_call_timeout_watchdog(),
                 name=f"anima_chatter.voice_call_timeout_watchdog.{self.stream_id[:8]}",
+                daemon=True,
+                metadata={"plugin": "anima_chatter", "stream_id": self.stream_id},
             )
 
             runner = session.execute()
@@ -924,23 +935,17 @@ class AnimaChatter(BaseChatter):
                     return
                 resume_event = yield result
         finally:
-            if watchdog_task is not None and not watchdog_task.done():
-                watchdog_task.cancel()
-                try:
-                    await watchdog_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            self._active_stream = None
+            if watchdog_task_info is not None:
+                get_task_manager().cancel_task(watchdog_task_info.task_id)
 
 
 @register_plugin
 class AnimaChatterPlugin(BasePlugin):
-    """anima_chatter 插件：通话 + VTB 虚拟形象通用 chatter。"""
+    """装配 Anima 聊天器、语音动作、命令和本地表演资源。"""
 
     plugin_name = "anima_chatter"
-    plugin_version = "1.1.0"
-    plugin_description = (
-        "anima_chatter：sherpa-onnx ASR 实时语音通话 + VTube Studio 虚拟形象互动 通用 Chatter"
-    )
+    plugin_description = "实时语音通话、VTube Studio 表演与直播弹幕互动聊天器"
     configs = [AnimaChatterConfig]
     dependent_components = ["asr_adapter_anima:adapter:asr_adapter_anima"]
 
@@ -954,15 +959,7 @@ class AnimaChatterPlugin(BasePlugin):
     tts_capabilities: Any = None
 
     async def on_plugin_loaded(self) -> None:
-        """注册提示词模板，并按配置初始化 VTB 资源（AudioPlayer + VTS）。
-
-        实际工作拆成四个私有方法：
-        1. :meth:`_register_prompts` — 注册 system / user / sub_agent prompt
-           （voice / vtb / vtb_live 三个 user prompt 改为数据驱动注册）。
-        2. :meth:`_init_audio_resources` — 初始化 AudioPlayer + VTSPerformer。
-        3. :meth:`_init_song_library` — 扫描清唱歌库目录。
-        4. :meth:`_init_pipeline` — 把 ``[pipelining]`` 配置注入流水线状态机。
-        """
+        """注册提示词并初始化流水线、音频、VTS、歌库和 TTS 能力。"""
 
         self._register_prompts()
 
@@ -1222,7 +1219,22 @@ class AnimaChatterPlugin(BasePlugin):
             self.song_library = None
 
     async def on_plugin_unloaded(self) -> None:
-        """卸载时关闭 VTS 连接。"""
+        """卸载时终止通话并释放流水线、VTS 与音频资源。"""
+
+        from . import call_state
+
+        active_call = await call_state.get_active_call()
+        if active_call is not None:
+            from .voice_call_lifecycle import finalize_call
+
+            await finalize_call(
+                stream_id=active_call.caller_stream_id,
+                platform="",
+                farewell="服务正在停止，本次通话已结束。",
+                end_reason="plugin_unload",
+                plugin=self,
+            )
+        await pipeline_state.clear_all()
 
         if self.vts_performer is not None:
             try:
@@ -1231,14 +1243,15 @@ class AnimaChatterPlugin(BasePlugin):
                 logger.warning(f"关闭 VTSPerformer 失败: {exc}")
         self.vts_performer = None
         self.audio_player = None
+        self.song_library = None
+        self.tts_capabilities = None
 
     def get_components(self) -> list[type]:
-        """返回插件组件。
+        """根据插件总开关和唱歌开关返回组件。"""
 
-        ``SingSongAction`` 受 ``config.plugin.enable_singing`` 控制——
-        关闭时不注册到组件列表，框架完全感知不到这个 action 存在，prompt
-        里也不会出现任何唱歌相关的工具描述（schema 不再被序列化进去）。
-        """
+        config = self.config if isinstance(self.config, AnimaChatterConfig) else None
+        if config is not None and not config.plugin.enabled:
+            return []
 
         components: list[type] = [
             AnimaChatter,
@@ -1251,8 +1264,6 @@ class AnimaChatterPlugin(BasePlugin):
             VoiceCommand,
         ]
 
-        config = self.config if isinstance(self.config, AnimaChatterConfig) else None
-        # 配置缺失时默认启用——保持向后兼容（首次加载/配置错误不应丢功能）。
         if config is None or config.plugin.enable_singing:
             components.insert(3, SingSongAction)
 

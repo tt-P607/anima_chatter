@@ -71,6 +71,30 @@ VTube Studio 虚拟形象互动 + 实时语音通话 + 直播弹幕，三模式�
 ## 工作原理一句话版
 
 ```
+
+## 故障排查
+
+- 语音通话无法开始：确认 `asr_adapter_anima:service:asr_redirect` 与 `asr_adapter_anima:adapter:asr_adapter_anima` 均已注册，并检查 FunASR Provider 是否成功加载。
+- TTS 返回 503：说明 `tts_http_server` 当前没有可用 Provider；先访问状态接口确认默认 Provider。
+- TTS 返回 502：检查 Provider 日志。服务会拒绝 Provider 异常、空音频和非法 Base64 音频。
+- VTube Studio 无动作：确认 VTS API 已开启、授权令牌有效，并检查配置的 Hotkey / Expression 名称是否存在。
+- 插件卸载后资源未释放：卸载流程会终止活跃通话、清空流水线任务并关闭 VTS；相关警告会记录具体失败资源。
+
+## 验证
+
+自动测试位于 `plugins/anima_chatter/test/`：
+
+```bash
+uv run pytest plugins/anima_chatter/test -q --no-cov
+uv run ruff check plugins/anima_chatter
+```
+
+实机验证至少覆盖：
+
+1. voice 模式开始通话后，ASR 自动切为 `always_on` 并把真实用户身份路由到原 Stream。
+2. 挂断或超时后，ASR redirect、激活覆写、通话状态和后台任务全部释放。
+3. vtb 模式可以完成 TTS 播放与 VTube Studio 表演。
+4. vtb_live 长音频期间流水线门能继续聚合新弹幕，卸载插件后不残留唤醒任务。
 未读消息 → resolve_mode(platform) → 选 prompt + 选 action
    ↓                                    ↓
    sub_agent 注意力过滤 ────→ create_request("actor")

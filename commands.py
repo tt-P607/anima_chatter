@@ -33,8 +33,8 @@ logger = get_logger("anima_chatter.commands")
 class VTBCommand(BaseCommand):
     """``/vtb`` 命令组：在当前聊天流上手动启用/关闭 anima_chatter 的 VTB 模式。"""
 
-    command_name: str = "vtb"
-    command_description: str = (
+    name: str = "vtb"
+    description: str = (
         "VTube Studio 虚拟形象模式控制：on=接管当前聊天流；"
         "off=释放接管；status=查看当前接管状态。"
     )
@@ -100,7 +100,7 @@ class VTBCommand(BaseCommand):
         if existing.__class__.get_signature() != _CHATTER_SIGNATURE:
             await self._reply(
                 "当前聊天流目前由其他 chatter 接管（"
-                f"{existing.chatter_name}），未做更改。"
+                f"{existing.name}），未做更改。"
                 "如需切换，请使用对应的接管命令。"
             )
             return True, "not vtb"
@@ -137,7 +137,7 @@ class VTBCommand(BaseCommand):
             platform = ""
 
         lines = [
-            f"当前 chatter：{existing.chatter_name} ({signature})",
+            f"当前 chatter：{existing.name} ({signature})",
             f"是否 VTB 接管：{'是' if is_vtb else '否'}",
             f"当前平台：{platform or '(未知)'}",
         ]
@@ -161,8 +161,8 @@ class VoiceCommand(BaseCommand):
     - ``/voice status``：查看当前是否处于通话中
     """
 
-    command_name: str = "voice"
-    command_description: str = "语音通话兜底控制：off=强制挂断；status=查看通话状态。"
+    name: str = "voice"
+    description: str = "语音通话兜底控制：off=强制挂断；status=查看通话状态。"
     permission_level: PermissionLevel = PermissionLevel.OWNER
 
     async def _reply(self, text: str) -> None:

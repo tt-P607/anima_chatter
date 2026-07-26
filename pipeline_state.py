@@ -59,9 +59,11 @@ from ._internal_compat import wake_stream_from_wait
 __all__ = [
     "PipelineSettings",
     "clear",
+    "clear_all",
     "configure",
     "get_settings",
     "is_enabled",
+    "is_gate_pending",
     "reserve",
     "reset_round",
     "wait_gate",
@@ -140,9 +142,11 @@ class _StreamState:
     """最近一次跨轮 reserve 实际使用的 silence_gap（含 jitter 后的真实值）。
     仅供日志显示，不参与计算。"""
 
-    wakeup_task: asyncio.Task | None = None
-    """当前轮的"流水线门到点 → 唤醒 stream loop"后台任务句柄。
-    每次 reserve 重新调度（取消旧的、起新的）；reset_round / clear 时取消。"""
+    wakeup_task: object | None = None
+    """当前轮的流水线门唤醒任务信息。
+
+    每次 reserve 重新调度；reset_round、clear 和插件卸载时取消。
+    """
 
 
 _settings: PipelineSettings = PipelineSettings()
@@ -173,9 +177,20 @@ def get_settings() -> PipelineSettings:
 
 
 def is_enabled() -> bool:
-    """流水线是否启用（配置开关）。Action 层通常配合 mode 一起判断。"""
+    """返回流水线配置是否启用。"""
 
     return _settings.enabled
+
+
+async def is_gate_pending(stream_id: str) -> bool:
+    """返回指定流是否存在尚未通过的有效流水线门。"""
+
+    async with _lock:
+        state = _states.get(stream_id)
+        if state is None:
+            return False
+        gate = _gate_at_unlocked(state)
+    return gate > time.monotonic()
 
 
 def _get_state_unlocked(stream_id: str) -> _StreamState:
@@ -269,6 +284,20 @@ async def reserve(stream_id: str, duration: float) -> tuple[float, float]:
         return start_at, finish_at
 
 
+def _cancel_wakeup_task_unlocked(state: _StreamState) -> None:
+    """取消状态关联的唤醒任务并清空句柄。"""
+
+    task_info = state.wakeup_task
+    state.wakeup_task = None
+    if task_info is None:
+        return
+    from src.kernel.concurrency import get_task_manager
+
+    task_id = getattr(task_info, "task_id", "")
+    if task_id:
+        get_task_manager().cancel_task(task_id)
+
+
 def _schedule_wakeup_unlocked(stream_id: str, state: _StreamState) -> None:
     """**不加锁**地（重新）调度"门到点唤醒 stream loop"的后台任务。
 
@@ -280,9 +309,7 @@ def _schedule_wakeup_unlocked(stream_id: str, state: _StreamState) -> None:
     """
 
     # 取消已有任务（reserve 重新累加 → 门时刻被推迟）
-    if state.wakeup_task is not None and not state.wakeup_task.done():
-        state.wakeup_task.cancel()
-    state.wakeup_task = None
+    _cancel_wakeup_task_unlocked(state)
 
     gate = _gate_at_unlocked(state)
     if gate <= 0:
@@ -311,9 +338,13 @@ def _schedule_wakeup_unlocked(stream_id: str, state: _StreamState) -> None:
         except asyncio.CancelledError:
             pass
 
-    state.wakeup_task = asyncio.create_task(
+    from src.kernel.concurrency import get_task_manager
+
+    state.wakeup_task = get_task_manager().create_task(
         _wakeup(),
         name=f"anima_chatter.pipeline_wakeup.{stream_id[:8]}",
+        daemon=True,
+        metadata={"plugin": "anima_chatter", "stream_id": stream_id},
     )
 
 
@@ -420,10 +451,8 @@ async def reset_round(stream_id: str) -> None:
         state.round_start_at = 0.0
         # audio_finish_at 故意不动——下一次 reserve 会基于它继续排队
         remaining = max(0.0, state.audio_finish_at - time.monotonic())
-        # 取消上一轮的 wakeup_task（这一轮已经在被处理了，门已用完）
-        if state.wakeup_task is not None and not state.wakeup_task.done():
-            state.wakeup_task.cancel()
-        state.wakeup_task = None
+        # 取消上一轮的 wakeup task（这一轮已经在被处理了，门已用完）。
+        _cancel_wakeup_task_unlocked(state)
 
     if had_round:
         logger.info(
@@ -440,7 +469,19 @@ async def clear(stream_id: str) -> None:
 
     async with _lock:
         old = _states.pop(stream_id, None)
-        if old is not None and old.wakeup_task is not None and not old.wakeup_task.done():
-            old.wakeup_task.cancel()
+        if old is not None:
+            _cancel_wakeup_task_unlocked(old)
     if old is not None:
         logger.info(f"[pipeline {stream_id[:8]}] 🧹 状态已彻底清空")
+
+
+async def clear_all() -> None:
+    """取消所有唤醒任务并清空全部流的流水线状态。"""
+
+    async with _lock:
+        states = list(_states.values())
+        _states.clear()
+        for state in states:
+            _cancel_wakeup_task_unlocked(state)
+    if states:
+        logger.info(f"流水线状态已全部清空，共 {len(states)} 条流")

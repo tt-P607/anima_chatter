@@ -10,8 +10,7 @@ import asyncio
 from typing import Annotated, Any, cast
 
 from src.app.plugin_system.api.log_api import get_logger
-from src.core.components.base import Failure
-from src.core.components.base.action import BaseAction
+from src.app.plugin_system.base import BaseAction, Failure
 
 # call_state 移至方法内局部延迟导入，以防模块初始化时循环导入
 from ..config import AnimaChatterConfig
@@ -27,10 +26,10 @@ logger = get_logger("anima_chatter.action.say")
 class SayAction(BaseAction):
     """把要说的话发送到 TTS 后端并交给适配器播放（语音通话模式）。"""
 
-    action_name = "say"
+    name = "say"
     # 真实可见性由 go_activate（通话中 / platform=local_asr）严格约束。
     associated_types = ["voice", "text", "image", "emoji"]
-    action_description = (
+    description = (
         "在实时语音通话中说出一段话。content 会进入 TTS 后端并由适配器播放。"
         "支持 [wait:n] 控制下一段播放前等待 n 秒（仅在需要长停顿、换气或思考时使用，"
         "普通说话请勿使用以保持自然连贯）。"

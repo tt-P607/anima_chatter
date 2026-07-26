@@ -698,16 +698,12 @@ class AudioPlayer:
             logger.error(f"伴奏播放到系统默认设备失败: {exc}")
 
     def _play_sync(self, data: Any, samplerate: int) -> bool:
-        """同步播放，包含设备适配 + 主路径/MME 备用路径。
+        """同步播放，并依次尝试配置设备、MME 设备和系统默认设备。
 
-        **每次播放前重新解析 device id** ——sounddevice 的 device id 在 Windows
-        上不是稳定的（拔插任何 USB 音频 / VB-Cable / 蓝牙耳机都会让 id 重新分
-        配），缓存的 id 会过期触发 ``MME error 2: 使用的设备标识号已超出本地
-        系统范围``。这一段无开销（``sd.query_devices`` 在 Windows 上 < 1ms）。
+        每次播放前重新解析 device id，避免 Windows 音频设备变动后缓存标识失效。
 
         Returns:
-            ``True`` 表示某条路径成功播放完成；``False`` 表示所有路径（含终极
-            回退到系统默认设备）都失败——调用方据此决定是否重置音频后端并重试。
+            ``True`` 表示某条路径成功播放完成；``False`` 表示所有设备路径均失败。
         """
 
         # 1) 每次播放前重新解析 device id——避免缓存过期。
@@ -806,9 +802,9 @@ class AudioPlayer:
                     except Exception as exc2:
                         logger.error(f"MME 备用路径首次切换播放也失败: {exc2}")
 
-        # 4) 终极回退：系统默认设备（可能丢失口型同步）
+        # 4) 最后尝试系统默认设备（可能丢失口型同步）
         try:
-            logger.warning("尝试终极回退：系统默认输出设备")
+            logger.warning("尝试使用系统默认输出设备")
             sd.play(data, samplerate, device=None, latency="high")
             sd.wait()
             return True

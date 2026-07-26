@@ -43,7 +43,7 @@ from typing import Annotated, Any, AsyncGenerator
 
 from src.app.plugin_system.api import send_api
 from src.app.plugin_system.api.log_api import get_logger
-from src.core.components.base.action import BaseAction
+from src.app.plugin_system.base import BaseAction
 
 from .. import pipeline_state
 from .._internal_compat import create_background_task
@@ -282,9 +282,9 @@ async def _run_motion_timeline(
 class SingSongAction(BaseAction):
     """在 vtb / vtb_live 模式下播放歌库里的本地清唱到 VB-Cable。"""
 
-    action_name = "sing_song"
+    name = "sing_song"
     associated_types = ["voice", "text"]
-    action_description = (
+    description = (
         "唱歌动作——播放歌库里已翻唱好的本地音频。"
         "直播间观众能听到声音，QQ 群里只显示一条文字提示。\n"
         "\n"
@@ -762,15 +762,17 @@ class SingSongAction(BaseAction):
                         else timeline
                     )
                     if tail_timeline:
-                        timeline_task = asyncio.create_task(
+                        timeline_task_info = create_background_task(
                             _run_motion_timeline(
                                 timeline=tail_timeline,
                                 performer=performer,
                                 started_at=started_at,
                                 stop_event=stop_event,
                             ),
-                            name=f"sing_song_timeline_{song_name[:20]}",
+                            name=f"anima_chatter.sing_timeline.{song_name[:20]}",
+                            metadata={"kind": "sing_timeline"},
                         )
+                        timeline_task = timeline_task_info.task
 
                 try:
                     # 不调 start_speech_playback——唱歌不需要触发 hotkey。

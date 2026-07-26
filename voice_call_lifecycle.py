@@ -1,30 +1,14 @@
 """anima_chatter 语音通话生命周期辅助。
 
-把"通话发起 / 终结"的公共逻辑从 [`actions/voice_call.py`](actions/voice_call.py:1) 抽出来：
-``finalize_call`` 是公共"通话终结协议"，被 :class:`EndVoiceCallAction`、超时
-回调（runner 检查超时）、``/voice off`` 兜底命令复用。历史上它叫
-``_finalize_call`` 写在 action 文件里，名字带下划线但被外部模块导入——这是
-误导。挪到本模块统一以"无下划线公共函数"形式暴露。
-
-同时迁移：
-
-- :func:`finalize_call` —— 通话终结公共路径
-- :func:`_play_farewell_via_tts` —— 走 plugin.audio_player 播 TTS 告别音频
-- :func:`_resolve_caller_identity` —— 从 chat_stream 反查通话发起方真实身份
-- :func:`_start_asr_voice_session` / :func:`_end_asr_voice_session` —— ASR
-  转发 service 调用
-- ``EVENT_VOICE_CALL_STARTED`` / ``EVENT_VOICE_CALL_ENDED`` 事件名常量
-- ``_ASR_REDIRECT_SERVICE`` 服务签名常量
-
-[`actions/voice_call.py`](actions/voice_call.py:1) 仍持有
-``StartVoiceCallAction`` / ``EndVoiceCallAction`` 两个 action 类，但内部
-调用都转发到本模块的公共函数。
+集中实现通话发起、ASR 会话切换、告别音频播放、通话终结事件和状态清理。
+``finalize_call`` 由结束通话 Action、超时回调与强制挂断命令共同复用，确保
+各入口采用一致的资源释放顺序。
 """
 
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, AsyncIterator
 
 from src.app.plugin_system.api import chat_api, event_api
@@ -32,7 +16,12 @@ from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.api.service_api import get_service
 
 from . import call_state, pipeline_state
-from ._internal_compat import build_notice_message, feed_watchdog, restart_stream_loop
+from ._internal_compat import (
+    build_notice_message,
+    create_background_task,
+    feed_watchdog,
+    restart_stream_loop,
+)
 from .constants import CHATTER_SIGNATURE as _VOICE_CHATTER_SIGNATURE
 
 
@@ -76,20 +65,29 @@ async def _keep_watchdog_alive(stream_id: str) -> AsyncIterator[None]:
                 except Exception:  # noqa: BLE001
                     pass
 
-    task = asyncio.create_task(
+    task_info = create_background_task(
         _feed_loop(),
         name=f"anima_chatter.watchdog_keepalive.{stream_id[:8]}",
+        metadata={"stream_id": stream_id, "kind": "watchdog_keepalive"},
     )
+    task = task_info.task
     try:
         yield
     finally:
         stop_event.set()
-        try:
-            await asyncio.wait_for(task, timeout=1.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            task.cancel()
-        except Exception:  # noqa: BLE001 - 清理失败不应影响主流程
-            task.cancel()
+        if task is not None:
+            try:
+                await asyncio.wait_for(task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                from src.kernel.concurrency import get_task_manager
+
+                get_task_manager().cancel_task(task_info.task_id)
+            except Exception:  # noqa: BLE001
+                from src.kernel.concurrency import get_task_manager
+
+                get_task_manager().cancel_task(task_info.task_id)
+            with suppress(asyncio.CancelledError, Exception):
+                await task
 
 
 # asr_adapter 的转发服务签名。

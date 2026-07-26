@@ -9,7 +9,7 @@
 派 background task / 反查 plugin 实例 / 注入 history Message）暂未公开。
 等公开 API 上线后，把这里的实现替换为对应公开调用即可。
 
-每个函数在 docstring 顶部都用 TODO 标注了对应缺失的公开 API。
+每个函数的文档字符串说明其当前替代的框架能力。
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 async def restart_stream_loop(stream_id: str) -> None:
     """重启目标 stream 的 chatter 循环，让缓存的旧 chatter 生成器作废。
 
-    TODO(framework): 等 ``chat_api.restart_stream_loop`` 公开后切回去。
+    当前框架公开 API 尚未提供 ``chat_api.restart_stream_loop``。
 
     StreamLoopManager 会把 ``chatter.execute()`` 返回的异步生成器缓存到
     ``_chatter_genes``。直接换 chatter 实例**不会**让下一 tick 用上新
@@ -42,7 +42,7 @@ async def restart_stream_loop(stream_id: str) -> None:
 def feed_watchdog(stream_id: str) -> None:
     """同步喂一次 stream 的 watchdog。
 
-    TODO(framework): 等 ``chat_api.feed_watchdog(stream_id)`` 公开后切回去。
+    当前框架公开 API 尚未提供 ``chat_api.feed_watchdog(stream_id)``。
 
     [`heartbeat.py`](heartbeat.py:1) 的后台喂狗循环用此函数，避免长时间 await
     导致框架的 stream_warning_threshold / stream_restart_threshold 误触发。
@@ -54,37 +54,38 @@ def feed_watchdog(stream_id: str) -> None:
 
 
 # ── task_manager（VTS 后台动画/参数发送循环） ─────────────
-def create_background_task(coro: Any, *, name: str) -> Any:
-    """通过框架 task_manager 派发一个后台任务，并返回其 handle。
+def create_background_task(
+    coro: Any,
+    *,
+    name: str,
+    metadata: dict[str, Any] | None = None,
+) -> Any:
+    """通过框架 task_manager 派发守护任务并返回任务信息。
 
-    TODO(framework): 等 ``task_api.create_task`` 公开后切回去。
+    当前框架公开 API 尚未提供 ``task_api.create_task``。
 
-    VTS 长连接的 ``_heartbeat_loop`` / ``_animation_loop`` /
-    ``_param_sender_loop`` 需要一个不被自动 GC 的后台任务派发器。
-    用框架自带的 task_manager 而不是 ``asyncio.create_task`` 是规范要求。
+    用于 VTS 长连接、直播流水线播放、时间轴和心跳等生命周期受控任务。
     """
 
     from src.kernel.concurrency import get_task_manager
 
-    return get_task_manager().create_task(coro, name=name)
+    return get_task_manager().create_task(
+        coro,
+        name=name,
+        daemon=True,
+        metadata={"plugin": "anima_chatter", **(metadata or {})},
+    )
 
 
 # ── plugin 反查（sing_song.to_schema 拿 song_library） ────
 def get_anima_chatter_plugin() -> Any | None:
-    """反查 anima_chatter 插件实例。
+    """通过公开插件 API 反查 anima_chatter 实例。"""
 
-    TODO(framework): 等 ``plugin_api.get_plugin_by_name`` 公开后切回去。
-
-    [`actions/sing_song.py`](actions/sing_song.py:1) 的 ``to_schema`` 是
-    ``classmethod``，没有 ``self.plugin`` 上下文，必须从 plugin_manager
-    反查。失败时返回 ``None``，调用方需自行容错。
-    """
+    from src.app.plugin_system.api import plugin_api
 
     try:
-        from src.core.managers import get_plugin_manager
-
-        return get_plugin_manager().get_plugin("anima_chatter")
-    except Exception:  # noqa: BLE001
+        return plugin_api.get_plugin("anima_chatter")
+    except (RuntimeError, ValueError):
         return None
 
 
@@ -92,7 +93,7 @@ def get_anima_chatter_plugin() -> Any | None:
 def wake_stream_from_wait(stream_id: str, *, only_if_new_unreads: bool = True) -> bool:
     """让 stream loop 解除当前的 ``Wait()`` 状态并立即推进 chatter。
 
-    TODO(framework): 等 ``chat_api.wake_stream`` 公开后切回去。
+    当前框架公开 API 尚未提供 ``chat_api.wake_stream``。
 
     背景：dfc Session 在 ``yield Wait(None)`` 时框架会记录
     ``unread_count_at_yield``。后续只有 ``unread_count_now > unread_count_at_yield``
@@ -174,7 +175,7 @@ def build_notice_message(
 ) -> "Message":
     """构造一条 ``NOTICE`` 类型的 Message，用于注入历史边界。
 
-    TODO(framework): 等 ``message_api.create_notice_message`` 公开后切回去。
+    当前框架公开 API 尚未提供 ``message_api.create_notice_message``。
 
     [`actions/voice_call.py`](actions/voice_call.py:1) 在通话开始 / 结束时会
     向 history_messages 注入这种"系统标注"消息——给 DFC 等无状态 chatter

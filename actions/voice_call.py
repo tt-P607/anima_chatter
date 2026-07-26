@@ -44,7 +44,7 @@ from typing import Annotated
 from src.app.plugin_system.api import chat_api, event_api, send_api
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.types import ChatType
-from src.core.components.base.action import BaseAction
+from src.app.plugin_system.base import BaseAction
 
 from .. import call_state
 from .._internal_compat import build_notice_message
@@ -64,9 +64,6 @@ from ..voice_call_lifecycle import (
 logger = get_logger("anima_chatter.action.voice_call")
 
 
-# 兼容别名：早期外部模块按 ``from .actions.voice_call import _finalize_call``
-# 使用本符号；统一搬到 ``voice_call_lifecycle.finalize_call`` 后保留别名直至
-# 所有 import 点迁移完毕。新代码请直接 import voice_call_lifecycle.finalize_call。
 _finalize_call = finalize_call
 
 
@@ -83,9 +80,9 @@ class StartVoiceCallAction(BaseAction):
     5. 给用户发"接通中..."的文本提示 + 广播 ``voice_call.started`` 事件。
     """
 
-    action_name = "start_voice_call"
+    name = "start_voice_call"
     associated_types = ["text"]
-    action_description = (
+    description = (
         "在当前**私聊**里发起一次本地语音通话。"
         "调用后：你的回复会被 TTS 通过本机扬声器播放出来（不再以文字形式发到当前对话），"
         "用户用麦克风说的话会被识别为文字进入当前聊天，仿佛你们正在打电话。"
@@ -257,9 +254,9 @@ class StartVoiceCallAction(BaseAction):
 class EndVoiceCallAction(BaseAction):
     """挂断当前语音通话并广播结束事件。"""
 
-    action_name = "end_voice_call"
+    name = "end_voice_call"
     associated_types = ["text"]
-    action_description = (
+    description = (
         "挂断当前语音通话并切回正常聊天。"
         "调用场景：你和用户已经说完想说的话、用户说要挂断、或者你判断没有继续语音的必要了。"
         "调用后：anima_chatter 释放对当前 stream 的接管，下一轮自动绑回原 chatter "

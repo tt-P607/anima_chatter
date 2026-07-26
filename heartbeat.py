@@ -21,7 +21,7 @@ from collections.abc import AsyncIterator
 
 from src.app.plugin_system.api.log_api import get_logger
 
-from ._internal_compat import feed_watchdog
+from ._internal_compat import create_background_task, feed_watchdog
 
 _logger = get_logger("anima_chatter.heartbeat")
 
@@ -69,18 +69,24 @@ async def feed_watchdog_during(
         except asyncio.CancelledError:
             pass
 
-    feeder_task = asyncio.create_task(
-        _feeder(), name=f"anima_chatter_watchdog_feeder_{stream_id[:8]}"
+    feeder_task_info = create_background_task(
+        _feeder(),
+        name=f"anima_chatter.watchdog_feeder.{stream_id[:8]}",
+        metadata={"stream_id": stream_id, "kind": "watchdog_feeder"},
     )
+    feeder_task = feeder_task_info.task
 
     try:
         yield
     finally:
         stop_event.set()
-        if not feeder_task.done():
-            feeder_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await feeder_task
+        if feeder_task is not None and not feeder_task.done():
+            from src.kernel.concurrency import get_task_manager
+
+            get_task_manager().cancel_task(feeder_task_info.task_id)
+        if feeder_task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await feeder_task
 
 
 __all__ = ["feed_watchdog_during"]

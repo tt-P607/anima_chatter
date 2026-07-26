@@ -26,14 +26,14 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from src.core.components.base.config import BaseConfig, Field, SectionBase, config_section
+from src.app.plugin_system.base import BaseConfig, Field, SectionBase, config_section
 
 
 class AnimaChatterConfig(BaseConfig):
     """anima_chatter 插件配置。"""
 
-    config_name: ClassVar[str] = "config"
-    config_description: ClassVar[str] = (
+    name: ClassVar[str] = "config"
+    description: ClassVar[str] = (
         "anima_chatter 插件配置（语音通话 + VTB 表演 + 直播弹幕，三种模式共用）"
     )
 
@@ -48,6 +48,8 @@ class AnimaChatterConfig(BaseConfig):
                 "vtb / vtb_live 模式下的 tick 间隔（秒）。"
                 "voice 模式始终强制为 0.1，无法被此项影响。"
             ),
+            ge=0.05,
+            le=60.0,
         )
         allow_message_buffer: bool = Field(
             default=True,
@@ -59,6 +61,8 @@ class AnimaChatterConfig(BaseConfig):
         plain_text_retry_limit: int = Field(
             default=1,
             description="模型返回纯文本（未调用 say / say_and_perform）时的提醒重试次数",
+            ge=0,
+            le=5,
         )
         enable_action_suspend: bool = Field(
             default=True,
@@ -100,16 +104,20 @@ class AnimaChatterConfig(BaseConfig):
             description="LLM 模型名称（对应 model.toml 中的 task），models 为空时使用",
         )
         models: list[str] = Field(
-            default=[],
+            default_factory=list,
             description="指定 LLM 模型列表（对应 model.toml 中的 name）。非空时覆盖 model_task，多个模型按顺序 fallback",
         )
         temperature: float = Field(
             default=0.7,
             description="模型温度，仅在 models 非空时生效",
+            ge=0.0,
+            le=2.0,
         )
         max_tokens: int = Field(
             default=8000,
             description="最大输出 token 数，仅在 models 非空时生效",
+            ge=1,
+            le=200000,
         )
 
     @config_section("tts", title="TTS 设置")
@@ -120,10 +128,23 @@ class AnimaChatterConfig(BaseConfig):
             default="http://127.0.0.1:8000/router/tts_http_server/api/tts/v1/synthesize",
             description="TTS HTTP 合成接口地址",
         )
-        timeout: float = Field(default=30.0, description="TTS HTTP 请求超时时间（秒）")
-        max_parallel_segments: int = Field(default=4, description="最大并行合成句子数")
+        timeout: float = Field(
+            default=30.0,
+            description="TTS HTTP 请求超时时间（秒）",
+            ge=1.0,
+            le=300.0,
+        )
+        max_parallel_segments: int = Field(
+            default=4,
+            description="最大并行合成句子数",
+            ge=1,
+            le=32,
+        )
         empty_audio_retry_count: int = Field(
-            default=1, description="TTS 返回空音频时的重试次数"
+            default=1,
+            description="TTS 返回空音频时的重试次数",
+            ge=0,
+            le=5,
         )
         sentence_split_enabled: bool = Field(
             default=True, description="是否按句切分并并行合成"
@@ -307,6 +328,8 @@ class AnimaChatterConfig(BaseConfig):
         )
         trigger_percent: float = Field(
             default=0.6,
+            ge=0.0,
+            le=1.0,
             description=(
                 "本轮累积音频时长达到此比例时触发 LLM 流水线门放行（0~1）。"
                 "默认 0.6 表示总播放时长 60% 时让 LLM 醒来准备新一轮。"
@@ -316,6 +339,8 @@ class AnimaChatterConfig(BaseConfig):
         )
         silence_gap_seconds: float = Field(
             default=7.0,
+            ge=0.0,
+            le=120.0,
             description=(
                 "**跨轮**音频之间的强制静默间隔（秒）。上一轮所有音频播完后等"
                 "这么久才放下一轮第一段，避免接得太急显得机械。"
@@ -325,6 +350,8 @@ class AnimaChatterConfig(BaseConfig):
         )
         silence_gap_jitter: float = Field(
             default=2.0,
+            ge=0.0,
+            le=120.0,
             description=(
                 "跨轮静默间隔的随机抖动幅度（秒）。每次跨轮 reserve 时实际间隔 = "
                 "``silence_gap_seconds + uniform(-jitter, +jitter)``。"
@@ -334,6 +361,8 @@ class AnimaChatterConfig(BaseConfig):
         )
         min_remaining_seconds: float = Field(
             default=25.0,
+            ge=0.0,
+            le=600.0,
             description=(
                 "**距结束最少剩余秒数**——本轮播放结束前至少留这么多秒给 LLM 推理。\n"
                 "实际门时刻 = ``max(trigger_percent_gate, finish_at - min_remaining_seconds)``\n"
@@ -347,6 +376,8 @@ class AnimaChatterConfig(BaseConfig):
         )
         min_duration_seconds: float = Field(
             default=10.0,
+            ge=0.0,
+            le=600.0,
             description=(
                 "最低门槛（秒）：本轮累积音频时长低于此值时**不启用**流水线，"
                 "Action 走原阻塞模式（直接等播完才返回）。"

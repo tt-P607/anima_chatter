@@ -1,15 +1,12 @@
 """anima_chatter 的 sub-agent prompt 常量。
 
-这两段文案是 anima 在 vtb / vtb_live 模式下"是否需要回复"决策器的特色
-prompt——和 default_chatter 的 sub-agent prompt 区别在于：
+这两段文案供 anima 在 vtb / vtb_live 模式下判断是否需要回复：
 
 - :data:`SUB_AGENT_PROMPT_VTB` 强调"虚拟形象在群聊里互动"的语境；
 - :data:`SUB_AGENT_PROMPT_LIVE` 强调"虚拟主播在直播弹幕里互动"的语境，
   对话方多为陌生观众，判定标准要更严苛（避免把闲聊弹幕都当成需要回复）。
 
-实际的 LLM 调用流程、token 预算控制、JSON 解析降级，全部由
-:func:`plugins.default_chatter.decision_agent.decide_should_respond` 完成；
-这两段 prompt 只是注册到 prompt manager 后通过名称匹配被那边调用。
+模型请求与 JSON 解析由 :class:`AnimaChatter` 的注意力决策方法完成。
 """
 
 from __future__ import annotations
