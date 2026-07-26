@@ -17,12 +17,11 @@ from ..constants import INTENT_REGISTRY
 
 # ── intent 清单生成（从 INTENT_REGISTRY 派生，避免三处文案不同步） ──
 
-def _format_intent_list(field: str) -> str:
+def _format_intent_list(*, live: bool) -> str:
     """从 :data:`INTENT_REGISTRY` 按 group 分组生成 intent 清单文案。
 
     Args:
-        field: :class:`IntentMeta` 的字段名（``"desc_vtb"`` / ``"desc_live"``），
-            决定每个 intent 后面跟哪条描述。
+        live: ``True`` 用直播语境描述，``False`` 用 VTB 语境描述。
 
     Returns:
         渲染好的 intent 清单段落（含标题 + 分组 + 条目），可直接拼进场景 prompt。
@@ -40,23 +39,25 @@ def _format_intent_list(field: str) -> str:
                 lines.append("")
             lines.append(f"【{meta.group}】")
             current_group = meta.group
-        desc = getattr(meta, field)
-        lines.append(f"- {meta.name}（{desc}）")
+        lines.append(f"- {meta.name}（{meta.desc_live if live else meta.desc_vtb}）")
     return "\n".join(lines)
 
 
-_INTENT_LIST_VTB: str = _format_intent_list("desc_vtb")
-_INTENT_LIST_LIVE: str = _format_intent_list("desc_live")
+_INTENT_LIST_VTB: str = _format_intent_list(live=False)
+_INTENT_LIST_LIVE: str = _format_intent_list(live=True)
 
 
 def _build_intent_schema_desc() -> str:
     """从 :data:`INTENT_REGISTRY` 生成 schema 用的精简一句话表。
 
-    每个 intent 只列 ``name（desc_general）``，用 ``/`` 分隔，单行紧凑——
-    详细说明在场景 prompt 里给，schema 只需要让模型知道有哪些可选值。
+    每个 intent 只列 ``name（描述）``，用 ``/`` 分隔，单行紧凑——详细说明在场景
+    prompt 里给，schema 只需要让模型知道有哪些可选值。
+
+    Returns:
+        渲染好的 intent 说明。
     """
 
-    items = " / ".join(f"{m.name}（{m.desc_general}）" for m in INTENT_REGISTRY)
+    items = " / ".join(f"{meta.name}（{meta.desc_vtb}）" for meta in INTENT_REGISTRY)
     return (
         "动作意图，决定头部姿态 + 眼神方向。"
         f"从 {len(INTENT_REGISTRY)} 个里选一个（详见 system 提示词的 intent 段）：\n"
@@ -520,17 +521,10 @@ def build_vtb_live_scene_guide(active_sources: frozenset[str] | set[str] | None 
 </tool_protocol>"""
 
 
-# 兼容旧调用：保留 ``VTB_LIVE_SCENE_GUIDE`` 名字，默认按"无活跃源"渲染。
-# 推荐通过 :func:`build_vtb_live_scene_guide` 传入实时 source 集合获得贴合
-# 部署的 prompt。
-VTB_LIVE_SCENE_GUIDE = build_vtb_live_scene_guide(None)
-
-
 __all__ = [
     "EMOTION_SCHEMA_DESC",
     "INTENT_SCHEMA_DESC",
     "VOICE_SCENE_GUIDE",
-    "VTB_LIVE_SCENE_GUIDE",
     "VTB_SCENE_GUIDE",
     "build_vtb_live_scene_guide",
 ]

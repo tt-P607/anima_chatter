@@ -72,41 +72,32 @@ class VTSPerformer:
         # 可选 hotkey_map：把 emotion 主类型或 intent 名字映射到 VTS Hotkey ID。
         # 例如 {"happy": "SmileHotkey", "THINKING": "ThinkHotkey"}。
         # 没配置就不触发热键，全靠参数注入实现表演。
-        # 配置位置已合并到 [vts] section（参见 :class:`AnimaChatterConfig`）。
-        vts_section = getattr(plugin_config, "vts", None)
-        hotkey_map = getattr(vts_section, "hotkey_map", None) or {}
+        vts_section = plugin_config.vts
         self._hotkey_map: dict[str, str] = {
-            str(k).lower(): str(v) for k, v in hotkey_map.items() if v
+            str(key).lower(): str(value)
+            for key, value in vts_section.hotkey_map.items()
+            if value
         }
 
         # 可选 expression_map：把 emotion / intent 映射到 .exp3.json 表情文件 + 描述。
         # 走 ExpressionActivationRequest，不需要 VTS 配 hotkey。
         # 关键设计：**互斥**——每次说话最多激活一个命中的表情，避免同时激活多个
         # 互相冲突的表情（例如多个手部表情同时 active 会显示多只手）。
-        # 解析 ``{file, desc}`` 双字段格式，desc 由 :meth:`get_expression_hints`
-        # 暴露给提示词层注入到 LLM 的 intent schema 中。
-        expression_map = getattr(vts_section, "expression_map", None) or {}
-        # _expression_map: 大小写归一的 key → file 文件名（运行时实际触发用）
+        # _expression_map: 大小写归一的 key → 文件名（运行时触发用）
         # _expression_desc: 保留原 key 大小写 → 描述（注入 prompt 用）
         self._expression_map: dict[str, str] = {}
         self._expression_desc: dict[str, str] = {}
-        for raw_key, raw_value in expression_map.items():
+        for raw_key, entry in vts_section.expression_map.items():
             key = str(raw_key).strip()
             if not key:
                 continue
-            # 兼容老格式 dict[str, str]：值是文件名字符串
-            if isinstance(raw_value, str) and raw_value:
-                self._expression_map[key.lower()] = raw_value
+            file = str(entry.get("file") or "").strip()
+            if not file:
                 continue
-            # 新格式 {file, desc}
-            if isinstance(raw_value, dict):
-                file = str(raw_value.get("file") or "").strip()
-                desc = str(raw_value.get("desc") or "").strip()
-                if not file:
-                    continue
-                self._expression_map[key.lower()] = file
-                if desc:
-                    self._expression_desc[key] = desc
+            self._expression_map[key.lower()] = file
+            desc = str(entry.get("desc") or "").strip()
+            if desc:
+                self._expression_desc[key] = desc
 
         # 当前激活的表情集合；每次 speaking_session 入口由 _sync_expression
         # 维护"切换 + 互斥"。
@@ -163,7 +154,7 @@ class VTSPerformer:
             # AutoAnimator 接收 idle_animation 配置，把眨眼/扫视/被动摆动/
             # 宏观动作触发等频率与幅度暴露成可调旋钮（默认值已经比原版激进）。
             self.auto_animator = AutoAnimator(
-                idle_animation_config=getattr(self.plugin_config, "idle_animation", None),
+                idle_animation_config=self.plugin_config.idle_animation,
             )
             # 把 audio_player 的 envelope_tracker 注入 SpeechAnimator，
             # 让说话期间的头部 / 身体微动跟着 TTS 音频包络起伏，做出"语调律动"。
@@ -171,7 +162,7 @@ class VTSPerformer:
             # 会自动退化回原来的固定 sin 波动逻辑。
             self.speech_animator = SpeechAnimator(
                 envelope_tracker=self.audio_player.envelope_tracker,
-                audio_drive_config=getattr(self.plugin_config, "audio_drive", None),
+                audio_drive_config=self.plugin_config.audio_drive,
             )
             self.connection.animators = [self.auto_animator, self.speech_animator]
 

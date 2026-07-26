@@ -1,84 +1,81 @@
-"""anima_chatter 的语音通话发起 / 结束动作。
+"""语音通话的发起与挂断动作。
 
-提供 ``start_voice_call`` 和 ``end_voice_call`` 两个 action，让模型能够在
-私聊中主动接 / 挂电话：
+让模型能在私聊中主动接 / 挂电话::
 
-::
-
-    QQ 私聊（default_chatter / kokoro_flow_chatter）
-        │
-        │  模型决策："想跟用户语音聊"
-        │  → 调用 start_voice_call action
-        │
+    平台私聊（default_chatter / 其他 chatter）
+        │  模型决策："想跟用户语音聊" → start_voice_call
         ▼
-    本插件接管该 stream + asr_adapter_anima 转发到 QQ stream
-        │
-        │  期间：模型 say -> TTS 本地播放
-        │        用户说话 -> ASR -> 注入 QQ stream unread
-        │        用户也可以打字（与说话等价）
-        │
-        │  模型 / 用户 / 5min 超时 → end_voice_call
+    anima_chatter 接管该 stream + ASR 转发到原 stream
+        │  期间：模型 say → TTS 本地播放
+        │        用户说话 → ASR → 注入原 stream 未读
+        │  模型 / 用户 / 静默超时 → end_voice_call
         ▼
     清状态 + 释放接管 + 广播 voice_call.ended
-        │
-        │  原 chatter（如 kfc）天然回归
-        │  收到 voice_call.ended 事件 → 把通话期间消息补到 chain_payloads
+        │  原 chatter 天然回归，订阅方把通话历史补回自己的对话链
         ▼
     历史无缝衔接
 
-约束（来自设计文档第 9 节）：
-- 仅私聊（chat_type == PRIVATE）才允许调用——群聊不适合一对一通话。
-- 同时只能有一个通话进行（call_state 互斥保证）。
-- 通话期间整条 QQ stream 的 chatter 都被切到 anima_chatter（voice 模式）；
-  default_chatter / kfc 不会被触发，天然不需要"静默"处理。
+约束：仅私聊可用（群聊不适合一对一通话）；同时只能有一个通话进行；通话期间
+整条 stream 的 chatter 都切到 anima_chatter，其他 chatter 不会被触发。
 
-公共函数（``finalize_call`` / ``_play_farewell_via_tts`` / ASR session 调用 /
-事件名常量）全部位于 [`voice_call_lifecycle.py`](../voice_call_lifecycle.py:1)；
-本文件只保留 action 类。
+生命周期编排在 [`voice_call/lifecycle.py`](../voice_call/lifecycle.py:1)，本
+文件只保留 action 类。
 """
 
 from __future__ import annotations
 
+import datetime
 from typing import Annotated
 
 from src.app.plugin_system.api import chat_api, event_api, send_api
 from src.app.plugin_system.api.log_api import get_logger
-from src.app.plugin_system.types import ChatType
 from src.app.plugin_system.base import BaseAction
+from src.app.plugin_system.types import ChatType
 
-from .. import call_state
 from .._internal_compat import build_notice_message
-from ..constants import CHATTER_SIGNATURE as _VOICE_CHATTER_SIGNATURE
-from ..voice_call_lifecycle import (
-    EVENT_VOICE_CALL_ENDED,
+from ..constants import CHATTER_SIGNATURE
+from ..protocol import require_plugin
+from ..runtime import call_state
+from ..voice_call import (
     EVENT_VOICE_CALL_STARTED,
-    _end_asr_voice_session,
-    _play_farewell_via_tts,
-    _resolve_caller_identity,
-    _restart_stream_loop,
-    _start_asr_voice_session,
+    end_asr_voice_session,
     finalize_call,
+    play_via_tts,
+    resolve_caller_identity,
+    restart_stream_loop_safely,
+    start_asr_voice_session,
 )
 
 
 logger = get_logger("anima_chatter.action.voice_call")
 
 
-_finalize_call = finalize_call
+_DEFAULT_CALL_PROMPT = "我打给你吧，咱们语音聊？"
+
+
+def _build_start_note(started_at: float) -> str:
+    """构造"通话开始"系统标注文案。
+
+    Args:
+        started_at: 通话开始的 Unix 时间戳。
+
+    Returns:
+        标注正文。
+    """
+
+    started_human = datetime.datetime.fromtimestamp(started_at).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    return (
+        f"[语音通话开始 @ {started_human}] 用户已接通本地语音通话。"
+        "从此处到下一条 [语音通话结束] 之间的对话发生在电话里——"
+        "你的回复以 TTS 通过本机扬声器播放，用户的话来自麦克风 ASR 识别"
+        "（可能有错字），双方看不到文字。"
+    )
 
 
 class StartVoiceCallAction(BaseAction):
-    """发起一次本地语音通话。
-
-    模型在 QQ 私聊里"想跟用户语音聊"时调用本动作，会做四件事：
-
-    1. 校验：仅私聊 + 当前没有进行中通话。
-    2. 设状态：通过 :mod:`plugins.anima_chatter.call_state` 占用通话槽位。
-    3. 接管 stream：把当前 stream 的活跃 chatter 切成 anima_chatter，
-       重启循环让下一 tick 走 anima_chatter。
-    4. 启动 ASR 转发：让本地麦克风识别出的文本注入到当前 QQ stream。
-    5. 给用户发"接通中..."的文本提示 + 广播 ``voice_call.started`` 事件。
-    """
+    """在当前私聊中发起一次本地语音通话。"""
 
     name = "start_voice_call"
     associated_types = ["text"]
@@ -88,22 +85,20 @@ class StartVoiceCallAction(BaseAction):
         "用户用麦克风说的话会被识别为文字进入当前聊天，仿佛你们正在打电话。"
         "适用场景：你和用户私聊里聊得正起劲、对方暗示想语音、或者你主动想换种交流方式。"
         "限制：只能在私聊使用（群聊不会暴露此 action）；同时只允许一个通话进行；"
-        "超过 5 分钟自动挂断；通话期间用户的文字消息也会被 TTS 念出来。"
+        "双方静默超过 5 分钟自动挂断；通话期间用户的文字消息也会被 TTS 念出来。"
     )
-    chatter_allow: list[str] = []  # 任何 chatter（如 kokoro / default）都可调用
-    chat_type = ChatType.PRIVATE  # 仅私聊
+    chatter_allow: list[str] = []  # 任何 chatter 都可调用
+    chat_type = ChatType.PRIVATE
     primary_action = False
 
     async def go_activate(self) -> bool:
-        """私聊 + 当前没有通话进行中时才暴露。"""
+        """私聊且当前没有通话进行中时才暴露。
 
-        # 已经在通话中：模型已经身处 voice 模式，不需要再启动；隐藏即可。
-        if await call_state.is_call_active_for_stream(self.chat_stream.stream_id):
-            return False
-        # 已有别的通话占用：也隐藏（避免模型误调，规则也清晰）。
-        if await call_state.get_active_call() is not None:
-            return False
-        return True
+        Returns:
+            是否对模型可见。
+        """
+
+        return await call_state.get_active_call() is None
 
     async def execute(
         self,
@@ -113,142 +108,150 @@ class StartVoiceCallAction(BaseAction):
             "这段会被发给用户作为接通提示，用第一人称、口语化、一两句话。",
         ] = "",
     ) -> tuple[bool, str]:
-        """开启语音通话。"""
+        """开启语音通话。
+
+        执行顺序：校验互斥 → 反查对方身份 → 占用通话槽位 → 写入开始标注 →
+        启动 ASR 会话 → 接管 stream → 播放接通提示 → 广播事件。任一步失败都会
+        回滚已产生的副作用。
+
+        Args:
+            reason: 接通提示文本。
+
+        Returns:
+            ``(是否成功, 结果描述)``。
+        """
 
         stream_id = self.chat_stream.stream_id
-        platform = self.chat_stream.platform or ""
+        platform = (self.chat_stream.platform or "").strip()
+        if not platform:
+            return False, "当前流缺少 platform 信息，无法启动语音通话"
 
-        # ── 1) 互斥校验（go_activate 已过滤但仍要兜底） ──
         if await call_state.get_active_call() is not None:
             return False, "已有进行中的通话，无法同时开启第二个"
 
-        # 记录原 chatter 的签名（如果有），让 ended 事件能告诉 kfc 等
-        # "通话前接管这个 stream 的是不是你"。default_chatter 评分绑定时
-        # 通常没有"活跃 chatter"——返回 None，那就留空字符串。
-        existing = chat_api.get_chatter_by_stream(stream_id)
-        previous_signature = ""
-        if existing is not None:
-            try:
-                previous_signature = existing.__class__.get_signature() or ""
-            except Exception:
-                previous_signature = ""
-
-        # ── 2) 占用通话槽位 + 写入"通话开始"系统标注 ─────────────
-        try:
-            active = await call_state.set_active_call(
-                stream_id,
-                previous_chatter_signature=previous_signature,
-            )
-        except RuntimeError as exc:
-            return False, f"启动通话失败：{exc}"
-
-        # ── 2.0) 提前反查通话发起方身份（必须在写入 NOTICE 边界前做） ──
-        # 为什么要先做：``_resolve_caller_identity`` 倒序扫 history 找最近的
-        # 非 bot 消息。如果先把 NOTICE 边界写进 history（sender_id="system"），
-        # 即便加了 message_type 过滤，仍存在过滤不彻底的边角情况。
-        # 把反查放在 NOTICE 写入之前，从源头消除这种风险。
-        if not platform:
-            await call_state.clear_active_call()
-            return False, "当前流缺少 platform 信息，无法启动语音通话"
-
-        target_user_id, target_user_name = _resolve_caller_identity(self.chat_stream)
+        # 必须在写入 NOTICE 边界**之前**反查——否则倒序扫描会先看到自己写的标注。
+        target_user_id, target_user_name = resolve_caller_identity(self.chat_stream)
         if not target_user_id:
-            await call_state.clear_active_call()
             return False, (
                 "无法确定通话发起方在该平台上的真实 ID（最近无对方消息记录）。"
                 "请等对方先在私聊中发一条消息后再重试。"
             )
 
-        # ── 2.5) 在 messages_in_call 第一条插入系统注解，作为通话上下文的
-        # 边界标记。这条会随事件 payload 透传给 kfc handler，让 kfc 在重组
-        # chain_payloads 时知道"这一段是发生在电话里的"，并且能看到具体的
-        # 通话开始时间。
-        import datetime as _datetime
+        previous_signature = self._current_chatter_signature(stream_id)
 
-        started_human = _datetime.datetime.fromtimestamp(active.started_at).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-        note_text = (
-            f"[语音通话开始 @ {started_human}] 用户已接通本地语音通话。"
-            "从此处到下一条 [语音通话结束] 之间的对话发生在电话里——"
-            "你的回复以 TTS 通过本机扬声器播放，用户的话来自麦克风 ASR 识别"
-            "（可能有错字），双方看不到文字。"
-        )
+        try:
+            active = await call_state.set_active_call(
+                stream_id, previous_chatter_signature=previous_signature
+            )
+        except RuntimeError as exc:
+            return False, f"启动通话失败：{exc}"
+
+        note_text = _build_start_note(active.started_at)
         await call_state.record_system_note(stream_id, note_text)
-
-        # ── 2.6) 注入 history_messages 边界（给 DFC 等无状态 chatter 看） ──
-        # 构造一条 NOTICE 类型的 Message 注入到框架通用历史中。
-        # 这样 DFC 切回来时能看到明确的通话边界，不必改 DFC 源码。
-        history_msg = build_notice_message(
-            message_id=f"call_start_{active.started_at}",
-            content=note_text,
-            platform=platform,
-            stream_id=stream_id,
-            time=active.started_at,
+        self.chat_stream.context.add_history_message(
+            build_notice_message(
+                message_id=f"call_start_{active.started_at}",
+                content=note_text,
+                platform=platform,
+                stream_id=stream_id,
+                time=active.started_at,
+            )
         )
-        self.chat_stream.context.add_history_message(history_msg)
 
-        # ── 3) 启动 ASR 通话会话（启动 runtime + 切 always_on + 设 redirect） ──
-
-        if not await _start_asr_voice_session(
+        if not await start_asr_voice_session(
             platform,
             stream_id,
             user_id=target_user_id,
-            user_name=target_user_name or target_user_id,
+            user_name=target_user_name,
         ):
             await call_state.clear_active_call()
-            return False, "启动 ASR 通话会话失败（asr_adapter 未加载或启动失败？）"
+            return False, "启动 ASR 通话会话失败（asr_adapter_anima 未加载或启动失败？）"
 
-        # ── 4) 接管 stream ───────────────
-        chatter_cls = chat_api.get_chatter_class(_VOICE_CHATTER_SIGNATURE)
+        chatter_cls = chat_api.get_chatter_class(CHATTER_SIGNATURE)
         if chatter_cls is None:
-            # 找不到 anima_chatter 组件：把已设置的副作用全部回滚。
-            await _end_asr_voice_session()
+            await end_asr_voice_session()
             await call_state.clear_active_call()
             return False, "未找到 anima_chatter 组件，无法接管"
 
-        instance = chatter_cls(stream_id=stream_id, plugin=self.plugin)
-        chat_api.bind_chatter_for_stream(stream_id, instance)
-        await _restart_stream_loop(stream_id)
+        chat_api.bind_chatter_for_stream(
+            stream_id, chatter_cls(stream_id=stream_id, plugin=self.plugin)
+        )
+        await restart_stream_loop_safely(stream_id)
 
-        # ── 5) 接通提示 ─────────────────
-        # 通话语境下：开场白也是电话里的第一句话，应该 TTS 播放出来，不发回 QQ。
-        # 但接通提示稍特殊——bot 主动开通话时希望对方"先看到一条文字提醒
-        # （比如"我打给你吧"）"知道接到电话了。所以：**保留发送一条 QQ 文字
-        # 提示**，但**同时也用 TTS 把它念出来**，当作通话第一句话。
-        prompt = reason.strip() or "我打给你吧，咱们语音聊？"
-        # 接通提示也应入档：append 到 messages_in_call 里，最终 ended 事件
-        # 透传到 kfc，让对话历史保留"我说我打给你吧 → 通话开始"的连贯性。
-        await call_state.record_assistant_message(stream_id, prompt)
-        try:
-            await send_api.send_text(
-                content=prompt,
-                stream_id=stream_id,
-                platform=platform,
-            )
-        except Exception as exc:
-            logger.warning(f"发送接通提示失败 stream={stream_id}: {exc}")
-        # 同步 TTS 播放——让对方在 QQ 看到字 + 听到声音，与"接电话"体验一致。
-        await _play_farewell_via_tts(self.plugin, prompt, stream_id)
-
-        # ── 6) 广播事件 ──────────────────
-        try:
-            await event_api.publish_event(
-                EVENT_VOICE_CALL_STARTED,
-                {
-                    "caller_stream_id": stream_id,
-                    "started_at": active.started_at,
-                    "previous_chatter_signature": previous_signature,
-                },
-            )
-        except Exception as exc:
-            logger.warning(f"广播 voice_call.started 失败: {exc}")
+        await self._send_call_prompt(reason, stream_id, platform)
+        await self._publish_started_event(active, previous_signature)
 
         logger.info(
             f"语音通话已启动 stream={stream_id} prev_chatter={previous_signature!r} "
             f"timeout={active.timeout_seconds}s"
         )
         return True, "通话已开启，对方可以开始说话了"
+
+    @staticmethod
+    def _current_chatter_signature(stream_id: str) -> str:
+        """读取当前接管该 stream 的 chatter 签名。
+
+        Args:
+            stream_id: 目标聊天流 ID。
+
+        Returns:
+            chatter 组件签名；没有活跃 chatter（如按评分自动绑定）时返回空串。
+        """
+
+        existing = chat_api.get_chatter_by_stream(stream_id)
+        if existing is None:
+            return ""
+        return existing.get_signature() or ""
+
+    async def _send_call_prompt(
+        self,
+        reason: str,
+        stream_id: str,
+        platform: str,
+    ) -> None:
+        """发送接通提示并同步 TTS 播放。
+
+        接通提示比较特殊——既要让对方在聊天里**看到**一条文字提醒（知道接到电话
+        了），也要作为通话第一句话**听到**。之后的对话就只有声音了。
+
+        Args:
+            reason: 模型给的提示文本；空串时用默认文案。
+            stream_id: 目标聊天流 ID。
+            platform: 平台标识。
+        """
+
+        prompt = reason.strip() or _DEFAULT_CALL_PROMPT
+        await call_state.record_assistant_message(stream_id, prompt)
+        sent = await send_api.send_text(
+            content=prompt, stream_id=stream_id, platform=platform
+        )
+        if not sent:
+            logger.warning(f"发送接通提示失败 stream={stream_id}")
+        await play_via_tts(require_plugin(self.plugin), prompt, stream_id)
+
+    @staticmethod
+    async def _publish_started_event(
+        active: call_state.ActiveCall,
+        previous_signature: str,
+    ) -> None:
+        """广播 ``voice_call.started`` 事件。
+
+        Args:
+            active: 新建的通话状态。
+            previous_signature: 通话前的 chatter 签名。
+        """
+
+        try:
+            await event_api.publish_event(
+                EVENT_VOICE_CALL_STARTED,
+                {
+                    "caller_stream_id": active.caller_stream_id,
+                    "started_at": active.started_at,
+                    "previous_chatter_signature": previous_signature,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - 事件广播失败不应中断通话
+            logger.warning(f"广播 {EVENT_VOICE_CALL_STARTED} 失败: {exc}")
 
 
 class EndVoiceCallAction(BaseAction):
@@ -259,16 +262,19 @@ class EndVoiceCallAction(BaseAction):
     description = (
         "挂断当前语音通话并切回正常聊天。"
         "调用场景：你和用户已经说完想说的话、用户说要挂断、或者你判断没有继续语音的必要了。"
-        "调用后：anima_chatter 释放对当前 stream 的接管，下一轮自动绑回原 chatter "
-        "（default_chatter / kokoro_flow_chatter 等），通话期间产生的消息会通过事件机制"
-        "补回原 chatter 的对话历史，保证上下文不丢。"
+        "调用后：anima_chatter 释放对当前 stream 的接管，下一轮自动绑回原 chatter，"
+        "通话期间产生的消息会通过事件机制补回原 chatter 的对话历史，保证上下文不丢。"
     )
     chatter_allow = ["anima_chatter"]
     chat_type = ChatType.PRIVATE
     primary_action = False
 
     async def go_activate(self) -> bool:
-        """只在该 stream 正处于通话中时暴露。"""
+        """只在该 stream 正处于通话中时暴露。
+
+        Returns:
+            是否对模型可见。
+        """
 
         return await call_state.is_call_active_for_stream(self.chat_stream.stream_id)
 
@@ -280,22 +286,21 @@ class EndVoiceCallAction(BaseAction):
             "用第一人称、口语化、一两句话；不必煽情。",
         ] = "",
     ) -> tuple[bool, str]:
-        """挂断通话。"""
+        """挂断通话。
+
+        Args:
+            farewell: 告别文本。
+
+        Returns:
+            ``(是否成功, 结果描述)``。
+        """
 
         return await finalize_call(
             stream_id=self.chat_stream.stream_id,
-            platform=self.chat_stream.platform or "",
             farewell=farewell.strip(),
             end_reason="model",
-            plugin=self.plugin,
+            plugin=require_plugin(self.plugin),
         )
 
 
-__all__ = [
-    "EVENT_VOICE_CALL_ENDED",
-    "EVENT_VOICE_CALL_STARTED",
-    "EndVoiceCallAction",
-    "StartVoiceCallAction",
-    "_finalize_call",
-    "finalize_call",
-]
+__all__ = ["EndVoiceCallAction", "StartVoiceCallAction"]

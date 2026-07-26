@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import math
 import time
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
+from ...config import AudioDriveSection
 from ...constants import normalize_intent, split_emotion
 from .base import BaseAnimator
 from .noise import fbm
@@ -33,34 +34,29 @@ class SpeechAnimator(BaseAnimator):
         config: dict[str, Any] | None = None,
         *,
         envelope_tracker: "EnvelopeTracker | None" = None,
-        audio_drive_config: Any = None,
+        audio_drive_config: AudioDriveSection | None = None,
     ) -> None:
-        """初始化说话动画器，载入意图/情感映射表与平滑参数。
+        """初始化说话动画器，载入意图 / 情感映射表与平滑参数。
 
         Args:
-            config: 兼容 BaseAnimator 的旧配置 dict（保留）。
-            envelope_tracker: 可选的音频包络追踪器；不传则关闭音频驱动律动。
-            audio_drive_config: ``AnimaChatterConfig.audio_drive``
-                section（含 enabled / head_y_gain 等）；不传走默认值。
+            config: 兼容 BaseAnimator 的基础配置 dict。
+            envelope_tracker: 音频包络追踪器；``None`` 时关闭音频驱动律动。
+            audio_drive_config: 音频驱动配置段；``None`` 时用该段的默认值
+                （测试可裸跑，生产由插件注入）。
         """
 
         super().__init__(config)
 
         # ── 音频驱动律动 ────────────────────────────────
-        self._envelope_tracker: "Optional[EnvelopeTracker]" = envelope_tracker
-        # 从 audio_drive_config 抽取增益，找不到字段就用经验默认值。
-        # 这样 SpeechAnimator 既能在测试里裸跑（不传 config），也能在生产里
-        # 走配置覆盖。
-        cfg = audio_drive_config
-        self._audio_drive_enabled: bool = bool(getattr(cfg, "enabled", True))
-        self._head_y_gain: float = float(getattr(cfg, "head_y_gain", 8.0))
-        self._head_x_gain: float = float(getattr(cfg, "head_x_gain", 3.0))
-        self._body_y_gain: float = float(getattr(cfg, "body_y_gain", 30.0))
-        self._neutral_attenuation: float = float(
-            getattr(cfg, "neutral_attenuation", 0.5)
-        )
+        self._envelope_tracker = envelope_tracker
+        drive = audio_drive_config or AudioDriveSection()
+        self._audio_drive_enabled = drive.enabled
+        self._head_y_gain = drive.head_y_gain
+        self._head_x_gain = drive.head_x_gain
+        self._body_y_gain = drive.body_y_gain
+        self._neutral_attenuation = drive.neutral_attenuation
         # 有机微动开关：说话时的头部摆动用 noise 替代 sin，去机械感。
-        self._organic_enabled: bool = bool(getattr(cfg, "organic_enabled", True))
+        self._organic_enabled = drive.organic_enabled
         # 噪声相位随机起点。
         self._noise_phase: float = time.time() % 1000
 

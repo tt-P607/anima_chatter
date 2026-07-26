@@ -23,6 +23,7 @@ from typing import Any
 
 from src.app.plugin_system.api.log_api import get_logger
 
+from ...config import IdleAnimationSection
 from .base import BaseAnimator
 from .noise import fbm
 
@@ -37,31 +38,28 @@ class AutoAnimator(BaseAnimator):
         self,
         config: dict[str, Any] | None = None,
         *,
-        idle_animation_config: Any = None,
+        idle_animation_config: IdleAnimationSection | None = None,
     ) -> None:
-        """初始化所有子状态机：眨眼/呼吸/眼神/宏观动作/安全平滑。
+        """初始化所有子状态机：眨眼 / 呼吸 / 眼神 / 宏观动作 / 安全平滑。
 
         Args:
-            config: 兼容 BaseAnimator 的旧 dict 配置（保留）。
-            idle_animation_config: ``AnimaChatterConfig.idle_animation`` section；
-                控制各类频率 / 幅度。不传就用激进版默认值，让模型看着活一些。
+            config: 兼容 BaseAnimator 的基础配置 dict。
+            idle_animation_config: 待机动画配置段；``None`` 时用该段的默认值
+                （测试可裸跑，生产由插件注入）。
         """
 
         super().__init__(config)
         self.start_time: float = time.time()
         self.is_performing: bool = False
 
-        # 把 idle_animation_config 上的字段拿出来，找不到就用激进默认值。
-        # 这些数字之前都是写死的；现在统一暴露到配置，便于按模型微调。
-        cfg = idle_animation_config
+        cfg = idle_animation_config or IdleAnimationSection()
 
         # ── 眨眼状态 ────────────────────────────────────
         self.blink_state: int = 0  # 0 睁, 1 闭中, 2 闭停, 3 开中
         self.blink_timer: float = 0.0
-        # 眨眼间隔（秒）。真人平均 4 秒一次，但 VTB 看起来活泼一点更好；
-        # 给 1.8-4.0 秒，VTS 物理引擎也会让眨眼显得自然。
-        self._blink_min_interval: float = float(getattr(cfg, "blink_min_interval", 1.8))
-        self._blink_max_interval: float = float(getattr(cfg, "blink_max_interval", 4.0))
+        # 眨眼间隔（秒）。真人平均 4 秒一次，但 VTB 看起来活泼一点更好。
+        self._blink_min_interval = cfg.blink_min_interval
+        self._blink_max_interval = cfg.blink_max_interval
         self.next_blink_time: float = random.uniform(
             self._blink_min_interval, self._blink_max_interval
         )
@@ -77,8 +75,8 @@ class AutoAnimator(BaseAnimator):
         self.current_eye_open: float = 1.0
 
         # ── 呼吸 ──────────────────────────────────────
-        self.breath_freq: float = float(getattr(cfg, "breath_freq", 0.28))
-        self.breath_amplitude: float = float(getattr(cfg, "breath_amplitude", 0.9))
+        self.breath_freq = cfg.breath_freq
+        self.breath_amplitude = cfg.breath_amplitude
 
         # ── 眼神漫游 ──────────────────────────────────
         self.eye_x: float = 0.0
@@ -88,35 +86,21 @@ class AutoAnimator(BaseAnimator):
         self.next_saccade_time: float = 0.0
         # 扫视间隔（秒）。真人微眼动 0.2-0.6 秒一次，但全做太疲劳；
         # 给 0.5-1.8 秒一次，让眼神持续微动不显呆。
-        self._saccade_min_interval: float = float(getattr(cfg, "saccade_min_interval", 0.5))
-        self._saccade_max_interval: float = float(getattr(cfg, "saccade_max_interval", 1.8))
-        # 大扫视概率：从 0.2 提到 0.35，多看四周不老盯前方。
-        self._saccade_big_probability: float = float(
-            getattr(cfg, "saccade_big_probability", 0.35)
-        )
-        # 小 / 大扫视幅度（默认略放大原值）。
-        self._saccade_small_amplitude_x: float = float(
-            getattr(cfg, "saccade_small_amplitude_x", 0.22)
-        )
-        self._saccade_small_amplitude_y: float = float(
-            getattr(cfg, "saccade_small_amplitude_y", 0.15)
-        )
-        self._saccade_big_amplitude_x: float = float(
-            getattr(cfg, "saccade_big_amplitude_x", 0.7)
-        )
-        self._saccade_big_amplitude_y: float = float(
-            getattr(cfg, "saccade_big_amplitude_y", 0.4)
-        )
+        self._saccade_min_interval = cfg.saccade_min_interval
+        self._saccade_max_interval = cfg.saccade_max_interval
+        self._saccade_big_probability = cfg.saccade_big_probability
+        self._saccade_small_amplitude_x = cfg.saccade_small_amplitude_x
+        self._saccade_small_amplitude_y = cfg.saccade_small_amplitude_y
+        self._saccade_big_amplitude_x = cfg.saccade_big_amplitude_x
+        self._saccade_big_amplitude_y = cfg.saccade_big_amplitude_y
 
-        # ── 头部微动幅度倍率（1.5x = 比原版动得明显） ──
-        self._head_micro_scale: float = float(getattr(cfg, "head_micro_scale", 1.5))
+        # ── 头部微动幅度倍率 ──────────────────────────
+        self._head_micro_scale = cfg.head_micro_scale
 
         # ── 有机微动：用 value noise 替代 sin 叠加，去掉机械周期感 ──
-        self._organic_enabled: bool = bool(getattr(cfg, "organic_enabled", True))
+        self._organic_enabled = cfg.organic_enabled
         # 呼吸带动身体起伏的幅度（度），0 关闭。
-        self._breath_body_amplitude: float = float(
-            getattr(cfg, "breath_body_amplitude", 1.2)
-        )
+        self._breath_body_amplitude = cfg.breath_body_amplitude
         # 噪声相位随机起点，避免每次启动从同一处开始。
         self._noise_phase: float = random.uniform(0, 1000)
 
@@ -124,13 +108,8 @@ class AutoAnimator(BaseAnimator):
         self.sway_offsets: list[float] = [random.uniform(0, 100) for _ in range(4)]
 
         # ── 被动慢速摆动 ──────────────────────────────
-        # 之前 20-80 秒触发一次，整段对话基本看不到。改成 8-25 秒。
-        self._passive_sway_min_interval: float = float(
-            getattr(cfg, "passive_sway_min_interval", 8.0)
-        )
-        self._passive_sway_max_interval: float = float(
-            getattr(cfg, "passive_sway_max_interval", 25.0)
-        )
+        self._passive_sway_min_interval = cfg.passive_sway_min_interval
+        self._passive_sway_max_interval = cfg.passive_sway_max_interval
         self.next_passive_sway_time: float = time.time() + random.uniform(
             self._passive_sway_min_interval, self._passive_sway_max_interval
         )
@@ -141,13 +120,10 @@ class AutoAnimator(BaseAnimator):
         self.passive_sway_cycles: int = 1
 
         # ── 宏观动作（idle 偶尔触发的大动作） ─────────
-        # 之前 20-45 秒。改成 6-15 秒，更频繁切大动作。
-        self._macro_min_interval: float = float(getattr(cfg, "macro_min_interval", 6.0))
-        self._macro_max_interval: float = float(getattr(cfg, "macro_max_interval", 15.0))
+        self._macro_min_interval = cfg.macro_min_interval
+        self._macro_max_interval = cfg.macro_max_interval
         # 宏观动作整体速度倍率：>1 = 加快（动作时长压缩），<1 = 放慢。
-        # 默认 2.0 让"慢吞吞像慢放"的问题立刻解决——move 1s 缩到 0.5s，
-        # 真人头部转向也就这速度。hold 时长按 0.5x 也压缩，避免摆好造型停太久。
-        self._motion_speed_scale: float = float(getattr(cfg, "motion_speed_scale", 2.0))
+        self._motion_speed_scale = cfg.motion_speed_scale
         self.macro_state: str = "IDLE"  # IDLE / MOVING / HOLDING / RETURNING
         self.macro_timer: float = 0.0
         self.next_macro_trigger_time: float = time.time() + random.uniform(

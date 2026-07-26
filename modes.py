@@ -1,33 +1,42 @@
-"""anima_chatter 三态运行模式中枢。
+"""anima_chatter 三态运行模式判定。
 
-把"什么 platform 进入什么模式"的判定收敛在这一个文件里。除了 :data:`ChatterMode`
-本身和 :func:`resolve_mode`，还导出 :data:`LIVE_PLATFORMS`（直播平台白名单）
-供其它模块读取——比如插件 + 直播适配器要保持平台名一致时就能直接 import。
+把"什么 platform 进入什么模式"的判定收敛在这一个文件里。新增运行模式时：
 
-新增运行模式时（如新增 Twitch / YouTube 直播平台），改这里就够了：
-
-1. 在 :data:`LIVE_PLATFORMS` 里加上对应 ``adapter.platform`` 字符串。
-2. 如果是新模式（不只是新平台），还要在 :data:`ChatterMode` Literal 里追加一
-   项，并同步更新 :func:`resolve_mode` 的分支与 prompts 目录下的场景文案。
+1. 新增**平台**（如再接一个直播源）：在 :data:`LIVE_PLATFORMS` 加一项即可。
+2. 新增**模式**：在 :data:`ChatterMode` Literal 追加一项，同步更新
+   :func:`resolve_mode` 的分支与 [`prompts/scenes.py`](prompts/scenes.py:1) 的
+   场景文案。
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
+from .runtime import call_state
+
 if TYPE_CHECKING:
-    from src.core.models.stream import ChatStream
+    from src.app.plugin_system.types import ChatStream
+
+
+__all__ = [
+    "ChatterMode",
+    "LIVE_PLATFORMS",
+    "VOICE_PLATFORM",
+    "resolve_mode",
+]
 
 
 ChatterMode = Literal["voice", "vtb", "vtb_live"]
 """anima_chatter 三态运行模式：
 
-- ``voice``：``platform == "local_asr"``，本地 ASR 实时通话；或在通话进行中
-  接管了原 stream（如 QQ 私聊）的 anima_chatter。
+- ``voice``：本地 ASR 实时通话；或在通话进行中接管了原 stream（如 QQ 私聊）。
 - ``vtb``：被 ``/vtb on`` 接管的普通群聊 / 私聊，VTube Studio 表演但不在直播。
-- ``vtb_live``：直播平台（``platform`` 在 :data:`LIVE_PLATFORMS` 中），
-  观众是陌生弹幕、消息只入不出，要按直播间礼仪行事。
+- ``vtb_live``：直播平台，观众是陌生弹幕、消息只入不出，按直播间礼仪行事。
 """
+
+
+VOICE_PLATFORM = "local_asr"
+"""ASR 实时通话使用的 platform 字符串（与 ``asr_adapter_anima`` 一致）。"""
 
 
 LIVE_PLATFORMS: frozenset[str] = frozenset({"live"})
@@ -35,40 +44,36 @@ LIVE_PLATFORMS: frozenset[str] = frozenset({"live"})
 
 为了让多平台直播（B 站 + 抖音 + 未来的 Twitch / YouTube 等）能合并到**同一个
 chat_stream**、由 anima_chatter 串行决策（避免两边 chatter 同时触发 VTS hotkey
-打架），所有直播 adapter 都把 ``platform`` 类属性写成统一的 ``"live"``。
-真实来源由 envelope 的 ``additional_config.source_platform`` 携带，能在
-prompt 里区分（详见 ``prompts/scenes.py``）。
+打架），所有直播 adapter 都把 ``platform`` 类属性写成统一的 ``"live"``。真实
+来源由 envelope 的 ``additional_config.source_platform`` 携带，能在 prompt 里
+区分（详见 [`prompts/scenes.py`](prompts/scenes.py:1)）。
 """
 
 
-VOICE_PLATFORM = "local_asr"
-"""ASR 实时通话使用的 platform 字符串（与 ``asr_adapter`` 一致）。"""
+ASSOCIATED_PLATFORMS: list[str] = [VOICE_PLATFORM, *sorted(LIVE_PLATFORMS)]
+"""本 chatter 声明关联的平台列表，供 ``BaseChatter.associated_platforms`` 使用。"""
 
 
 def resolve_mode(chat_stream: "ChatStream") -> ChatterMode:
-    """根据流的 platform 自动判定运行模式。
+    """根据流的状态与 platform 判定运行模式。
 
     判定优先级：
 
-    1. **该 stream 当前正处于 voice_call 通话中** → 强制 :data:`voice`
-       （anima_chatter 临时接管原 stream，platform 仍是 qq / discord 等，
-       但行为要按 voice 通话来）
-    2. ``platform == "local_asr"`` → :data:`voice`
-    3. ``platform`` 在 :data:`LIVE_PLATFORMS` 中 → :data:`vtb_live`
-    4. 其他 → :data:`vtb`
+    1. **该 stream 当前正处于通话中** → ``voice``（anima_chatter 临时接管原
+       stream，platform 仍是 qq / discord 等，但行为要按通话来）
+    2. ``platform == "local_asr"`` → ``voice``
+    3. ``platform`` 在 :data:`LIVE_PLATFORMS` 中 → ``vtb_live``
+    4. 其他 → ``vtb``
 
-    优先级 1 的实现：异步查询 :mod:`.call_state`。本函数是同步的——直接尝试
-    从事件循环里跑 ``asyncio.ensure_future`` 不好控制；改成读模块级变量的
-    "快照视图"。:mod:`.call_state` 内部的 ``_lock`` 只保护写路径，读 ``_active_call``
-    单变量在 CPython 下是原子的，对优先级 1 这种"判定 + 立即用"的场景已经
-    足够稳；没必要为这条同步快路径让整个函数变成 async。
+    优先级 1 走 :func:`call_state.snapshot_active_call_unlocked` 这条同步快路径
+    ——本函数被 prompt 构建等同步调用链使用，不能 ``await``。
+
+    Args:
+        chat_stream: 当前聊天流。
+
+    Returns:
+        判定出的运行模式。
     """
-
-    # ── 优先级 1：通话中的 stream 强制 voice ─────────
-    # 走 call_state 暴露的同步快照接口；底层是模块级单变量原子读，性能等同
-    # 直接访问 _active_call，但接口名清晰、未来 call_state 内部存储换了形态
-    # 这里不会被悄悄打破。
-    from . import call_state  # 局部导入避免循环依赖（call_state 不依赖 modes）
 
     active = call_state.snapshot_active_call_unlocked()
     if active is not None and active.caller_stream_id == (chat_stream.stream_id or ""):
@@ -80,11 +85,3 @@ def resolve_mode(chat_stream: "ChatStream") -> ChatterMode:
     if platform in LIVE_PLATFORMS:
         return "vtb_live"
     return "vtb"
-
-
-__all__ = [
-    "ChatterMode",
-    "LIVE_PLATFORMS",
-    "VOICE_PLATFORM",
-    "resolve_mode",
-]
