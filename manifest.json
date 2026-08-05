@@ -21,10 +21,10 @@
         "plugins": [
             "asr_adapter_anima",
             "tts_http_server",
-            "default_chatter"
+            "neo_default_chatter"
         ],
         "components": [
-            "default_chatter:service:chat_core",
+            "neo_default_chatter:service:chat_core",
             "asr_adapter_anima:service:asr_redirect",
             "tts_http_server:service:tts_provider_registry"
         ]
@@ -42,7 +42,7 @@
             "component_type": "chatter",
             "component_name": "anima_chatter",
             "dependencies": [
-                "default_chatter:service:chat_core"
+                "neo_default_chatter:service:chat_core"
             ]
         },
         {
@@ -87,6 +87,41 @@
         {
             "component_type": "command",
             "component_name": "vtb",
+            "dependencies": []
+        },
+        {
+            "component_type": "event_handler",
+            "component_name": "anima_preprocess",
+            "dependencies": []
+        },
+        {
+            "component_type": "event_handler",
+            "component_name": "anima_inject_unread_payload",
+            "dependencies": []
+        },
+        {
+            "component_type": "event_handler",
+            "component_name": "anima_inject_usables",
+            "dependencies": []
+        },
+        {
+            "component_type": "event_handler",
+            "component_name": "anima_create_request",
+            "dependencies": []
+        },
+        {
+            "component_type": "event_handler",
+            "component_name": "anima_fetch_unreads",
+            "dependencies": []
+        },
+        {
+            "component_type": "event_handler",
+            "component_name": "anima_format_unread_line",
+            "dependencies": []
+        },
+        {
+            "component_type": "event_handler",
+            "component_name": "anima_build_history_text",
             "dependencies": []
         }
     ],

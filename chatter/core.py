@@ -1,7 +1,8 @@
 """anima_chatter 的 Chatter 主类。
 
-通过 ``default_chatter:service:chat_core`` 复用聊天会话控制流，自身只实现各个
-adapter 协议方法：
+通过 ``neo_default_chatter:service:chat_core`` 复用聊天会话控制流。NDFC 会话
+自包含，通过 ``neo_default_chatter:*`` 事件 seam 暴露可替换函数；本类自身实现
+各个 adapter 方法，由 :mod:`.ndfc_handlers` 转发 NDFC 事件调用：
 
 - **PromptAdapter**：按模式选 prompt、给直播消息加来源平台前缀
 - **UnreadAdapter**：拉未读消息，通话中同步入档；vtb_live 在此处过流水线门
@@ -52,13 +53,7 @@ from ..runtime import call_state, pipeline_state
 from ..voice_call import finalize_call
 from . import attention, request_factory
 from .attention import SubAgentDecision
-from .logging import SafeLoggerWrapper
-from .session_bridge import (
-    AnimaSessionAdapters,
-    AnimaSessionOptions,
-    ChatCoreServiceLike,
-    PlainTextResponseHandling,
-)
+from .session_bridge import ChatCoreServiceLike, PlainTextResponseHandling
 
 if TYPE_CHECKING:
     from ..config import AnimaChatterConfig
@@ -71,7 +66,7 @@ logger = get_logger("anima_chatter")
 __all__ = ["AnimaChatter"]
 
 
-_CHAT_CORE_SERVICE = "default_chatter:service:chat_core"
+_CHAT_CORE_SERVICE = "neo_default_chatter:service:chat_core"
 
 # voice 模式下强制的 tick 间隔与缓冲策略——实时通话必须高频轮询且不缓冲。
 _VOICE_TICK_INTERVAL = 0.1
@@ -616,15 +611,17 @@ class AnimaChatter(BaseChatter):
         service = get_service(_CHAT_CORE_SERVICE)
         if service is None:
             logger.error(
-                f"未找到 {_CHAT_CORE_SERVICE} service。请确认 default_chatter 插件已启用。"
+                f"未找到 {_CHAT_CORE_SERVICE} service。请确认 neo_default_chatter 插件已启用。"
             )
-            yield Failure("default_chatter chat_core service 不可用")
+            yield Failure("neo_default_chatter chat_core service 不可用")
             return
 
+        # NDFC 会话自包含：不接受 adapters/options，通过 neo_default_chatter:*
+        # 事件 seam 定制。传入 anima 插件实例供会话读取基础配置（anima 的
+        # 差异化逻辑由 ndfc_handlers 转发，会话自身的可替换函数全部被替换）。
         session = cast(ChatCoreServiceLike, service).create_session(
             stream_id=self.stream_id,
-            options=self._build_session_options(),
-            adapters=self._build_session_adapters(),
+            plugin=self.plugin,
         )
 
         watchdog = create_background_task(
@@ -650,35 +647,3 @@ class AnimaChatter(BaseChatter):
         finally:
             self._active_stream = None
             cancel_background_task(watchdog)
-
-    def _build_session_options(self) -> AnimaSessionOptions:
-        """构造 chat_core 会话选项。
-
-        Returns:
-            会话选项。
-        """
-
-        config = self._config
-        return AnimaSessionOptions(
-            enable_action_suspend=(
-                True if config is None else config.plugin.enable_action_suspend
-            ),
-        )
-
-    def _build_session_adapters(self) -> AnimaSessionAdapters:
-        """构造 chat_core 适配器集合——本 chatter 同时充当全部适配器。
-
-        Returns:
-            适配器集合。
-        """
-
-        return AnimaSessionAdapters(
-            request_adapter=self,
-            prompt_adapter=self,
-            unread_adapter=self,
-            usable_adapter=self,
-            tool_execution_adapter=self,
-            sub_agent_adapter=self,
-            logger_adapter=SafeLoggerWrapper(logger),
-            plain_text_adapter=self,
-        )

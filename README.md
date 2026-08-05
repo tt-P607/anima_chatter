@@ -89,7 +89,7 @@ anima_chatter/
 | [`asr_adapter_anima`](../asr_adapter_anima/) | voice 模式必需 | 定制版 ASR 适配器，提供 `asr_redirect` 文本重定向与按需启动服务。➜ [GitHub](https://github.com/tt-P607/asr_adapter_anima) |
 | [`funasr_asr_provider_anima`](../funasr_asr_provider_anima/) | voice 模式必需 | 定制版 FunASR 后端提供商，向 ASR 适配器提供语音推理。➜ [GitHub](https://github.com/tt-P607/funasr_asr_provider_anima) |
 | [`tts_http_server`](../tts_http_server/) | 三模式必需 | 语音合成本地服务，可用原作者官方版本 |
-| [`default_chatter`](../default_chatter/) | 三模式必需 | 提供 `chat_core` 会话控制流 |
+| [`neo_default_chatter`](../neo_default_chatter/) | 三模式必需 | 提供 `chat_core` 会话控制流；anima 通过订阅 `neo_default_chatter:*` 事件复用其主会话逻辑并注入三模式 prompt / 注意力过滤 |
 | 直播弹幕适配器 | vtb_live 模式必需 | 需声明 `platform = "live"` 与 `source_platform` 类属性 |
 
 Python 依赖见 [`manifest.json`](manifest.json) 的 `python_dependencies`（pyvts / sounddevice / soundfile / rapidfuzz 等）。

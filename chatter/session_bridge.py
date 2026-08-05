@@ -1,12 +1,17 @@
-"""与可复用聊天核心（``default_chatter:service:chat_core``）之间的协议桥接。
+"""与 NDFC（``neo_default_chatter:service:chat_core``）之间的协议桥接。
 
-按**字段协议**与 chat_core 对齐，不 import 其它插件的实现类型——插件之间的
-依赖只能通过公开签名 / Service / 协议边界建立。
+按**字段协议**与 NDFC 的 chat_core Service 对齐，不 import 其它插件的实现类型
+——插件之间的依赖只能通过公开签名 / Service / 协议边界建立。
+
+NDFC 的 ``create_session(stream_id, plugin=None)`` 不接受 adapters/options，
+会话行为自包含；anima 的差异化逻辑通过订阅 ``neo_default_chatter:*`` 事件
+（见 :mod:`.ndfc_handlers`）实现。本模块只保留：会话执行协议（:class:`SessionLike`）、
+Service 最小公开形状（:class:`ChatCoreServiceLike`），以及两个为测试 / 文档保留的
+选项与适配器 dataclass（anima 不再把它们传给 chat_core，仅作类型说明）。
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, TypedDict
 
@@ -41,21 +46,19 @@ class SessionLike(Protocol):
 
 
 class ChatCoreServiceLike(Protocol):
-    """chat_core Service 的最小公开形状。"""
+    """NDFC chat_core Service 的最小公开形状。"""
 
     def create_session(
         self,
         *,
         stream_id: str,
-        options: "AnimaSessionOptions",
-        adapters: "AnimaSessionAdapters",
+        plugin: Any | None = None,
     ) -> SessionLike:
         """创建聊天会话。
 
         Args:
             stream_id: 会话所属聊天流。
-            options: 会话选项。
-            adapters: 运行时适配器集合。
+            plugin: 可选插件实例；为 None 时回退到 Service 所属插件。
 
         Returns:
             可执行的会话对象。
@@ -65,18 +68,11 @@ class ChatCoreServiceLike(Protocol):
 
 @dataclass(slots=True)
 class AnimaSessionAdapters:
-    """传递给 chat_core 的运行时适配器集合。
+    """anima_chatter 各 adapter 能力的占位集合（类型说明用）。
 
-    Attributes:
-        request_adapter: 提供 ``create_request``。
-        prompt_adapter: 提供 system / user prompt 构建。
-        unread_adapter: 提供未读消息拉取。
-        usable_adapter: 提供工具注入。
-        tool_execution_adapter: 提供工具执行。
-        sub_agent_adapter: 提供注意力决策。
-        logger_adapter: 日志输出对象。
-        plain_text_adapter: 纯文本兜底策略提供者；``None`` 表示使用默认行为。
-        stream_event_observer: 流式事件观察者；``None`` 表示不观察。
+    anima 不再把这些 adapter 传给 chat_core；差异化逻辑改由 :mod:`.ndfc_handlers`
+    转发到 :class:`AnimaChatter` 的对应方法。本类型保留字段，供单元测试校验
+    字段完整性。
     """
 
     request_adapter: Any
@@ -87,15 +83,16 @@ class AnimaSessionAdapters:
     sub_agent_adapter: Any
     logger_adapter: Any
     plain_text_adapter: Any | None = None
-    stream_event_observer: Callable[..., Awaitable[None]] | None = None
+    stream_event_observer: Any | None = None
 
 
 @dataclass(slots=True)
 class AnimaSessionOptions:
-    """anima_chatter 运行 chat_core 时使用的会话选项。
+    """anima_chatter 会话选项（类型说明用）。
 
     默认值已按 anima 的场景调整——关掉了对话冷却、子代理协作、原生多模态与
-    stop 直接唤醒等不适用的特性。
+    stop 直接唤醒等不适用的特性。anima 不再把这些选项传给 chat_core，保留
+    字段供单元测试校验。
     """
 
     actor_task_name: str = "actor"

@@ -103,7 +103,7 @@ def resolve_mode(chat_stream) -> ChatterMode: ...
 
 ChatterManager 看到一条流，按平台 / chat_type 评分挑 chatter；anima_chatter
 通过 ``associated_platforms = ["local_asr"]`` 的弱声明吸引 ASR 流，其余平台
-默认绑回 default_chatter——直到用户 ``/vtb on``，或这条流来自直播平台
+默认绑回 neo_default_chatter——直到用户 ``/vtb on``，或这条流来自直播平台
 （platform 命中 ``LIVE_PLATFORMS`` 自动判定为 vtb_live）。
 
 详细：``commands.py`` 的 ``/vtb`` 实现里调 ``chat_api.register_active_chatter``
@@ -144,13 +144,22 @@ performer.speaking_session(emotion, intent):
                                                用 v_head_y / v_body_y 等参数
 ```
 
-## 与 default_chatter 的关系
+## 与 neo_default_chatter（NDFC）的关系
 
-- ``sub_agent.py`` 的概率门权重和 ``sub_actor`` 调用流程**手动复刻**自 dfc，
-  没有共享代码。dfc 升级时需同步本插件——文件顶部 ``.. warning::`` 块有提醒。
-- ``runner.py`` 的"读未读 / 调 LLM / 处理 tool calls / 挂起"骨架与 dfc 高度
-  相似但不复用，因为 voice / vtb / vtb_live 各有专属处理（纯文本提醒措辞、
-  stop_conversation 拒绝、纯 Action 挂起策略）。
+anima_chatter 复用 NDFC 的 ``neo_default_chatter:service:chat_core`` 主会话
+逻辑（状态机循环），通过订阅 ``neo_default_chatter:*`` 事件注入自己的差异化
+行为——见 ``chatter/ndfc_handlers.py``：
+
+- ``:preprocess``：注意力过滤（概率门 + sub_actor 决策）
+- ``:inject_unread_payload``：三模式 system / user prompt 构建
+- ``:inject_usables``：工具注入与屏蔽冲突动作
+- ``:create_request``：自定义模型集 + SystemReminder bucket
+- ``:fetch_unreads``：未读拉取 + 通话入档 + vtb_live 流水线门
+- ``:format_unread_line`` / ``:build_history_text``：直播来源平台前缀与历史格式化
+
+voice / vtb / vtb_live 的专属处理（纯文本提醒措辞、stop_conversation 拒绝、
+纯 Action 挂起策略）仍保留在 anima 侧；NDFC 会话自包含，不向 anima 暴露
+内部替换点，两者通过事件 seam 解耦。
 
 ## 待优化项（已知未做）
 

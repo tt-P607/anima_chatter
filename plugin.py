@@ -33,6 +33,15 @@ from .actions import (
 )
 from .audio import AudioPlayer
 from .chatter import AnimaChatter
+from .chatter.ndfc_handlers import (
+    AnimaBuildHistoryTextHandler,
+    AnimaCreateRequestHandler,
+    AnimaFetchUnreadsHandler,
+    AnimaFormatUnreadLineHandler,
+    AnimaInjectUnreadPayloadHandler,
+    AnimaInjectUsablesHandler,
+    AnimaPreprocessHandler,
+)
 from .commands import VTBCommand, VoiceCommand
 from .config import AnimaChatterConfig
 from .prompts import (
@@ -147,6 +156,15 @@ class AnimaChatterPlugin(BasePlugin):
             EndVoiceCallAction,
             VTBCommand,
             VoiceCommand,
+            # NDFC 事件 seam 转发 handler：把 neo_default_chatter:* 事件转发到
+            # AnimaChatter 的 adapter 方法（prompt / 注意力 / 工具 / 未读等）。
+            AnimaPreprocessHandler,
+            AnimaInjectUnreadPayloadHandler,
+            AnimaInjectUsablesHandler,
+            AnimaCreateRequestHandler,
+            AnimaFetchUnreadsHandler,
+            AnimaFormatUnreadLineHandler,
+            AnimaBuildHistoryTextHandler,
         ]
         if config is None or config.plugin.enable_singing:
             components.append(SingSongAction)

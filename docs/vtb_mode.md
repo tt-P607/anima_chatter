@@ -1,7 +1,7 @@
 # vtb 模式：群聊 / 私聊手动接管的 VTube Studio 表演
 
-非直播平台（如 QQ）默认绑定的是 `default_chatter` 之类的标准 chatter。要让某条
-流走 anima_chatter 的 VTB 表演链路，**必须**用 [`/vtb on` 命令手动接管](#vtb-命令)。
+非直播平台（如 QQ）默认绑定的是 `neo_default_chatter` 之类的标准 chatter。要让
+某条流走 anima_chatter 的 VTB 表演链路，**必须**用 [`/vtb on` 命令手动接管](#vtb-命令)。
 
 > 直播流（`platform == "bilibili_live"` 等）不需要这一步——见 [vtb_live_mode.md](vtb_live_mode.md)。
 
@@ -31,7 +31,7 @@
 | 子命令 | 行为 |
 |--------|------|
 | `/vtb on` | 释放当前流的活跃 chatter → 注册 anima_chatter 实例 → 重启 stream loop（销毁旧 chatter 生成器）|
-| `/vtb off` | 反向操作 → 下一轮自动绑回 default_chatter |
+| `/vtb off` | 反向操作 → 下一轮自动绑回 neo_default_chatter |
 | `/vtb status` | 打印当前流的活跃 chatter、是否处于 VTB 接管、平台名 |
 
 > **重要细节**：仅 `register_active_chatter` 不够——`StreamLoopManager` 缓存了
