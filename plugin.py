@@ -72,8 +72,6 @@ class AnimaChatterPlugin(BasePlugin):
     """装配 Anima 聊天器、语音动作、命令与本地表演资源。"""
 
     plugin_name = "anima_chatter"
-    plugin_description = "实时语音通话、VTube Studio 表演与直播弹幕互动聊天器"
-    plugin_version = "1.2.0"
     configs = [AnimaChatterConfig]
     dependent_components = ["asr_adapter_anima:adapter:asr_adapter_anima"]
 
