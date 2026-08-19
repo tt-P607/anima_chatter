@@ -415,20 +415,20 @@ class IdleAnimationSection(SectionBase):
     saccade_min_interval: float = Field(default=0.5, description="扫视最小间隔（秒）")
     saccade_max_interval: float = Field(default=1.8, description="扫视最大间隔（秒）")
     saccade_big_probability: float = Field(
-        default=0.35,
-        description="大幅扫视概率（其余为小幅微动）；0~1",
+        default=0.05,
+        description="大幅扫视概率（读弹幕式的一瞥，其余为小幅微动+回中）；0~1",
     )
     saccade_small_amplitude_x: float = Field(
-        default=0.22, description="小扫视水平幅度（0~1）"
+        default=0.10, description="小扫视水平幅度（0~1），扫视后自动回中看镜头"
     )
     saccade_small_amplitude_y: float = Field(
-        default=0.15, description="小扫视垂直幅度（0~1）"
+        default=0.08, description="小扫视垂直幅度（0~1），扫视后自动回中看镜头"
     )
     saccade_big_amplitude_x: float = Field(
-        default=0.7, description="大扫视水平幅度（0~1）"
+        default=0.35, description="大扫视水平幅度（0~1），一瞥后回中"
     )
     saccade_big_amplitude_y: float = Field(
-        default=0.4, description="大扫视垂直幅度（0~1）"
+        default=0.15, description="大扫视垂直幅度（0~1），上下瞟收窄保持看镜头感"
     )
 
     head_micro_scale: float = Field(
@@ -448,6 +448,14 @@ class IdleAnimationSection(SectionBase):
 
     motion_speed_scale: float = Field(
         default=2.0, description="宏观动作执行速度倍率（>1 加快，<1 放慢）"
+    )
+
+    macro_debug_loop: bool = Field(
+        default=False,
+        description=(
+            "宏观动作调试轮询：开启后持续循环播放所有宏观动作，每个间隔 2 秒，"
+            "用于逐个检查动作幅度是否合适。默认关闭。"
+        ),
     )
 
 

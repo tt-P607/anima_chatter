@@ -24,7 +24,7 @@ __all__ = ["get_tts_capabilities", "inject_tts_params"]
 _TTS_REGISTRY_SERVICE = "tts_http_server:service:tts_provider_registry"
 
 # 注入顺序固定，保证模型每次看到的参数排列一致。
-_PARAM_ORDER = ("style", "language", "speed", "effects")
+_PARAM_ORDER = ("style", "language", "speed", "effects", "aux_refer_wav_paths")
 
 
 def get_tts_capabilities() -> Any | None:

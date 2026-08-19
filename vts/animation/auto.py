@@ -84,6 +84,8 @@ class AutoAnimator(BaseAnimator):
         self.eye_wander_x: float = 0.0
         self.eye_wander_y: float = 0.0
         self.next_saccade_time: float = 0.0
+        # 扫视回中时刻；>0 表示当前扫视等待回中，到点后眼神归零回镜头中心
+        self._saccade_return_time: float = 0.0
         # 扫视间隔（秒）。真人微眼动 0.2-0.6 秒一次，但全做太疲劳；
         # 给 0.5-1.8 秒一次，让眼神持续微动不显呆。
         self._saccade_min_interval = cfg.saccade_min_interval
@@ -173,7 +175,7 @@ class AutoAnimator(BaseAnimator):
         self.macro_library: list[dict[str, Any]] = [
             {
                 "name": "重心左斜",
-                "params": {"v_head_z": -15.0, "v_head_x": -5.0},
+                "params": {"v_head_z": -5.0, "v_head_x": -1.8},
                 "weight": 20,
                 "hold": 8.0,
                 # 重心斜常常承接侧身偷瞄、好奇歪头
@@ -181,14 +183,14 @@ class AutoAnimator(BaseAnimator):
             },
             {
                 "name": "重心右斜",
-                "params": {"v_head_z": 11.0, "v_head_x": 4.0},
+                "params": {"v_head_z": 4.0, "v_head_x": 1.5},
                 "weight": 20,
                 "hold": 8.0,
                 "chain_to": {"侧身偷瞄": 0.3, "好奇歪头": 0.2},
             },
             {
                 "name": "左侧扫视",
-                "params": {"v_head_x": -18.0, "v_eye_x": -0.7, "v_head_y": 2.0},
+                "params": {"v_head_x": -5.5, "v_eye_x": -0.3, "v_head_y": 1.0},
                 "weight": 20,
                 "hold": 3.0,
                 "move_speed": 1.5,
@@ -198,7 +200,7 @@ class AutoAnimator(BaseAnimator):
             },
             {
                 "name": "右侧扫视",
-                "params": {"v_head_x": 18.0, "v_eye_x": 0.7, "v_head_y": 2.0},
+                "params": {"v_head_x": 5.5, "v_eye_x": 0.3, "v_head_y": 1.0},
                 "weight": 20,
                 "hold": 3.0,
                 "move_speed": 1.5,
@@ -207,7 +209,7 @@ class AutoAnimator(BaseAnimator):
             },
             {
                 "name": "失神发呆",
-                "params": {"v_head_y": -10.0, "v_head_z": 3.0, "v_eye_y": -0.4},
+                "params": {"v_head_y": -2.5, "v_head_z": 1.2, "v_eye_y": -0.15},
                 "weight": 20,
                 "hold": 6.0,
                 "move_speed": 4.0,
@@ -217,7 +219,7 @@ class AutoAnimator(BaseAnimator):
             },
             {
                 "name": "侧身偷瞄",
-                "params": {"v_body_x": 15.0, "v_head_x": 5.0, "v_eye_x": 0.7},
+                "params": {"v_body_x": 4.5, "v_head_x": 2.0, "v_eye_x": 0.3},
                 "weight": 20,
                 "hold": 3.0,
                 "move_speed": 1.8,
@@ -226,7 +228,7 @@ class AutoAnimator(BaseAnimator):
             },
             {
                 "name": "分心远眺",
-                "params": {"v_head_x": 22.0, "v_head_y": 8.0, "v_eye_x": -0.7, "v_eye_y": 0.3},
+                "params": {"v_head_x": 6.5, "v_head_y": 2.5, "v_eye_x": -0.3, "v_eye_y": 0.15},
                 "weight": 20,
                 "hold": 4.0,
                 "trigger_blink_on_return": True,
@@ -236,11 +238,11 @@ class AutoAnimator(BaseAnimator):
             {
                 "name": "好奇歪头",
                 "params": {
-                    "v_head_z": 12.0,
-                    "v_head_x": 8.0,
-                    "v_head_y": 5.0,
-                    "v_eye_x": -0.4,
-                    "v_eye_y": 0.2,
+                    "v_head_z": 5.5,
+                    "v_head_x": 2.5,
+                    "v_head_y": 1.5,
+                    "v_eye_x": -0.2,
+                    "v_eye_y": 0.1,
                 },
                 "weight": 20,
                 "hold": 4.0,
@@ -249,7 +251,7 @@ class AutoAnimator(BaseAnimator):
             },
             {
                 "name": "深呼吸",
-                "params": {"v_head_y": 18.0, "v_body_y": 7.0, "v_head_z": 4.0},
+                "params": {"v_head_y": 3.5, "v_body_y": 2.2, "v_head_z": 1.0},
                 "weight": 10,
                 "hold": 1.0,
                 "move_speed": 2.0,
@@ -259,7 +261,7 @@ class AutoAnimator(BaseAnimator):
             },
             {
                 "name": "向下检查",
-                "params": {"v_head_y": -20.0, "v_eye_y": -0.7, "v_body_y": -2.0},
+                "params": {"v_head_y": -5.0, "v_eye_y": -0.35, "v_body_y": -0.8},
                 "weight": 10,
                 "hold": 2.5,
                 "move_speed": 1.5,
@@ -268,12 +270,12 @@ class AutoAnimator(BaseAnimator):
             {
                 "name": "害羞回避",
                 "params": {
-                    "v_head_x": -15.0,
-                    "v_head_y": -12.0,
-                    "v_head_z": -8.0,
-                    "v_eye_x": 0.5,
-                    "v_eye_y": -0.3,
-                    "v_blush": 1.0,
+                    "v_head_x": -4.5,
+                    "v_head_y": -3.0,
+                    "v_head_z": -2.5,
+                    "v_eye_x": 0.25,
+                    "v_eye_y": -0.15,
+                    "v_blush": 0.5,
                 },
                 "weight": 10,
                 "hold": 5.0,
@@ -282,9 +284,9 @@ class AutoAnimator(BaseAnimator):
             },
             {
                 "name": "深度思考",
-                "params": {"v_head_y": 15.0, "v_head_z": -5.0, "v_eye_y": 0.7, "v_eye_x": 0.0},
-                "eye_oscillation": 0.35,
-                "osc_freq": 2.5,
+                "params": {"v_head_y": 4.0, "v_head_z": -2.0, "v_eye_y": 0.25, "v_eye_x": 0.0},
+                "eye_oscillation": 0.15,
+                "osc_freq": 1.5,
                 "weight": 10,
                 "hold": 5.0,
                 "move_speed": 2.0,
@@ -303,6 +305,9 @@ class AutoAnimator(BaseAnimator):
         self._max_chain_count: int = 2  # 最多连续衔接 2 次，避免一直在动
         self._current_chain_to: dict[str, float] = {}
 
+        # 调试轮询开关：开启后持续循环播放所有宏观动作
+        self._macro_debug_loop: bool = cfg.macro_debug_loop
+
         # 参数 ID
         self.param_eye_l = "v_eye_left"
         self.param_eye_r = "v_eye_right"
@@ -311,6 +316,12 @@ class AutoAnimator(BaseAnimator):
         self.param_head_x = "v_head_x"
         self.param_head_y = "v_head_y"
         self.param_head_z = "v_head_z"
+
+        # 调试轮询：启动时自动填充演示队列并立即开始循环
+        if self._macro_debug_loop:
+            self.macro_demo_queue = self.macro_library.copy()
+            self.next_macro_trigger_time = 0
+            logger.info(f"调试轮询模式已启用，将循环播放所有 {len(self.macro_library)} 个宏观动作（间隔 2s）")
 
     # ── 工具 ─────────────────────────────────────────
 
@@ -382,29 +393,36 @@ class AutoAnimator(BaseAnimator):
         # 3) 眼神漫游
         micro_jitter_x = math.sin(elapsed * math.pi * 6) * 0.01
         micro_jitter_y = math.cos(elapsed * math.pi * 5.5) * 0.01
-        self.eye_wander_x = math.sin(elapsed * 0.3) * 0.05 + math.sin(elapsed * 0.17) * 0.03
-        self.eye_wander_y = math.cos(elapsed * 0.25) * 0.04 + math.cos(elapsed * 0.13) * 0.02
+        self.eye_wander_x = math.sin(elapsed * 0.3) * 0.025 + math.sin(elapsed * 0.17) * 0.015
+        self.eye_wander_y = math.cos(elapsed * 0.25) * 0.02 + math.cos(elapsed * 0.13) * 0.01
 
         if elapsed >= self.next_saccade_time:
             if random.random() >= self._saccade_big_probability:
-                # 小幅扫视：眼神微微偏移，用于"还在看你"的状态
+                # 小幅扫视：短暂一瞥后回中——眼神 95% 时间停留在镜头中心
                 self.eye_x = random.uniform(
                     -self._saccade_small_amplitude_x, self._saccade_small_amplitude_x
                 )
                 self.eye_y = random.uniform(
                     -self._saccade_small_amplitude_y, self._saccade_small_amplitude_y
                 )
+                self._saccade_return_time = elapsed + random.uniform(0.2, 0.5)
             else:
-                # 大幅扫视：左顾右盼，让 VTB 看四周不显呆
+                # 大幅扫视：偶发的一瞥（读弹幕感），上下瞟幅度收窄避免"不看镜头"
                 self.eye_x = random.uniform(
                     -self._saccade_big_amplitude_x, self._saccade_big_amplitude_x
                 )
                 self.eye_y = random.uniform(
                     -self._saccade_big_amplitude_y, self._saccade_big_amplitude_y
                 )
+                self._saccade_return_time = elapsed + random.uniform(0.3, 0.6)
             self.next_saccade_time = elapsed + random.uniform(
                 self._saccade_min_interval, self._saccade_max_interval
             )
+        elif self._saccade_return_time > 0 and elapsed >= self._saccade_return_time:
+            # 回中：一瞥结束，眼神回到镜头中心（观众/摄像头）
+            self.eye_x = 0.0
+            self.eye_y = 0.0
+            self._saccade_return_time = 0.0
 
         # 4) 被动慢摆
         now = time.time()
@@ -472,6 +490,10 @@ class AutoAnimator(BaseAnimator):
         base_eye_x = self.eye_x + self.eye_wander_x + micro_jitter_x
         base_eye_y = self.eye_y + self.eye_wander_y + micro_jitter_y
 
+        # 头眼联动：眼神偏移时头部轻微跟随（0.3 倍，上限 ±1.5°），
+        # 避免"眼珠在动头完全僵着"的假人感；回中后联动值随 eye_x 归零。
+        head_follow_eye = max(-1.5, min(1.5, self.eye_x * 0.3 * 10.0))
+
         # 宏观 HOLDING 阶段的振荡
         eye_osc_x = 0.0
         head_osc_x = 0.0
@@ -488,7 +510,9 @@ class AutoAnimator(BaseAnimator):
         raw_output: dict[str, float] = {}
         raw_output[self.param_eye_x] = base_eye_x + self.macro_current_params.get("v_eye_x", 0.0) + eye_osc_x
         raw_output[self.param_eye_y] = base_eye_y + self.macro_current_params.get("v_eye_y", 0.0)
-        raw_output[self.param_head_x] = head_micro_x + self.macro_current_params.get("v_head_x", 0.0) + head_osc_x
+        raw_output[self.param_head_x] = (
+            head_micro_x + self.macro_current_params.get("v_head_x", 0.0) + head_osc_x + head_follow_eye
+        )
         raw_output[self.param_head_y] = head_micro_y + self.macro_current_params.get("v_head_y", 0.0)
         raw_output[self.param_head_z] = (
             breath_z + self.macro_current_params.get("v_head_z", 0.0) + head_osc_z + self.passive_sway_val
@@ -505,18 +529,18 @@ class AutoAnimator(BaseAnimator):
 
         # 8) 安全平滑层（阻尼 + 速率限制）
         # damp_factor 影响整体平滑（越小越跟手）；max_speeds 限制单帧最大变化
-        # 速率（度/秒）。原版 60°/s 对头部转向偏慢，现在按真人快速转头能到
-        # 180°/s 设置——配合 motion_speed_scale=2.0，宏观动作能在 0.5s 内到位。
-        damp_factor = 0.18
+        # 速率（度/秒）。幅度差异大的两个动作切换时，跟踪过快会形成
+        # "急冲→急停"的顿挫感，故用较大阻尼 + 适中速率让过渡自然融合。
+        damp_factor = 0.35
         max_speeds = {
-            self.param_head_x: 180.0,
-            self.param_head_y: 180.0,
-            self.param_head_z: 180.0,
-            "v_body_x": 100.0,
-            "v_body_y": 100.0,
-            "v_body_z": 100.0,
-            self.param_eye_x: 8.0,
-            self.param_eye_y: 8.0,
+            self.param_head_x: 40.0,
+            self.param_head_y: 40.0,
+            self.param_head_z: 40.0,
+            "v_body_x": 25.0,
+            "v_body_y": 25.0,
+            "v_body_z": 25.0,
+            self.param_eye_x: 3.0,
+            self.param_eye_y: 3.0,
         }
 
         for key, target_val in raw_output.items():
@@ -597,7 +621,8 @@ class AutoAnimator(BaseAnimator):
         now = time.time()
 
         if self.macro_state == "IDLE":
-            if self.is_performing:
+            # 调试轮询开启时忽略"表演中"状态，持续循环宏观动作供观察。
+            if self.is_performing and not self._macro_debug_loop:
                 # 表演中暂停宏观动作触发；下次重排在表演结束之后。
                 self.next_macro_trigger_time = now + random.uniform(
                     self._macro_min_interval, self._macro_max_interval
@@ -721,6 +746,11 @@ class AutoAnimator(BaseAnimator):
                 elif self.macro_demo_queue:
                     # 演示模式：动作之间留 2 秒间隙就够了。
                     self.next_macro_trigger_time = now + 2.0
+                elif self._macro_debug_loop:
+                    # 调试轮询：队列耗尽后自动重填，无限循环
+                    self.macro_demo_queue = self.macro_library.copy()
+                    self.next_macro_trigger_time = now + 2.0
+                    logger.info("调试轮询：一轮播放完毕，重新开始循环")
                 else:
                     self.next_macro_trigger_time = now + random.uniform(
                         self._macro_min_interval, self._macro_max_interval
