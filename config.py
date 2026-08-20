@@ -285,6 +285,20 @@ class AudioDriveSection(SectionBase):
         default=30.0,
         description="身体律动灵敏度（velocity × gain → v_body_y 度数）",
     )
+    # 说话韵律向上半身扩散：把音频能量不仅给口型 / 头部，也衰减注入身体多轴，
+    # 让说话节奏在身体上也能被"看见"。三路默认值保守，避免抢过口型与头部。
+    body_x_gain: float = Field(
+        default=6.0,
+        description="音量 → 身体横向轻摆灵敏度（rms × gain → v_body_x 度数）",
+    )
+    body_z_gain: float = Field(
+        default=8.0,
+        description="velocity → 身体节拍侧向灵敏度（velocity × gain → v_body_z 度数）",
+    )
+    body_bounce_k: float = Field(
+        default=1.2,
+        description="音量 → 身体上下弹跳系数（rms × k → v_body_y 附加弹跳）",
+    )
     neutral_attenuation: float = Field(
         default=0.5,
         description=(
@@ -456,6 +470,42 @@ class IdleAnimationSection(SectionBase):
             "宏观动作调试轮询：开启后持续循环播放所有宏观动作，每个间隔 2 秒，"
             "用于逐个检查动作幅度是否合适。默认关闭。"
         ),
+    )
+
+    # ── 身体与上半身灵动度 ────────────────────────────
+    # 头部 → 身体耦合：用二阶弹簧阻尼让身体作为头部的"带惯性从动体"，转头时
+    # 胸腔 / 腰部同向但滞后跟随，侧歪时反向重心代偿，消除"头转身体不转"的假人感。
+    body_follow_head_enabled: bool = Field(
+        default=True,
+        description="身体跟随头部耦合总开关（v_body_x / v_body_z 随头部二阶波动）",
+    )
+    body_follow_head_f: float = Field(
+        default=1.6, description="身体跟随头部的二阶系统固有频率（Hz），越大跟随越快"
+    )
+    body_follow_head_z: float = Field(
+        default=0.75,
+        description="身体跟随头部的阻尼比；1.0 临界无过冲，<1.0 有轻微回弹",
+    )
+    body_follow_head_w_rx: float = Field(
+        default=0.4, description="水平跟随权重：头转 30° 时身体跟转约 w_rx×30°"
+    )
+    body_follow_head_w_rz: float = Field(
+        default=0.3, description="侧倾跟随权重：头侧歪时身体侧向跟随比例"
+    )
+    body_follow_head_w_comp: float = Field(
+        default=0.08, description="重心代偿权重：头部横向转时身体反向微补偿（重心侧移感）"
+    )
+
+    # 呼吸相位差：真实呼吸是胸腔扩张伴随耸肩、呼气肩沉、肩滞后约 0.15s。
+    # 把呼吸从"整体上下平移"升级为"胸腔前后仰 + 肩膀滞后起伏"的层次感。
+    breath_shoulder_enabled: bool = Field(
+        default=True, description="呼吸肩相位差开关（胸腔与肩膀不同相起伏）"
+    )
+    breath_shoulder_amplitude: float = Field(
+        default=0.9, description="呼吸时肩膀起伏幅度（v_body_z 度数），0 关闭"
+    )
+    breath_shoulder_lag: float = Field(
+        default=0.5, description="肩膀相对胸腔的滞后（弧度，约 π/6 ≈ 0.52）"
     )
 
 

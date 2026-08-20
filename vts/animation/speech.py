@@ -54,6 +54,10 @@ class SpeechAnimator(BaseAnimator):
         self._head_y_gain = drive.head_y_gain
         self._head_x_gain = drive.head_x_gain
         self._body_y_gain = drive.body_y_gain
+        # 说话韵律向上半身扩散的增益（横向轻摆 / 节拍侧向 / 上下弹跳）。
+        self._body_x_gain = drive.body_x_gain
+        self._body_z_gain = drive.body_z_gain
+        self._body_bounce_k = drive.body_bounce_k
         self._neutral_attenuation = drive.neutral_attenuation
         # 有机微动开关：说话时的头部摆动用 noise 替代 sin，去机械感。
         self._organic_enabled = drive.organic_enabled
@@ -244,7 +248,9 @@ class SpeechAnimator(BaseAnimator):
         dynamic_y = 0.0
         dynamic_x = 0.0
         dynamic_z = 0.0
+        dynamic_body_x = 0.0
         dynamic_body_y = 0.0
+        dynamic_body_z = 0.0
         if self.is_speaking:
             speaking_elapsed = time.time() - self.speaking_start_time
             if self._organic_enabled:
@@ -289,6 +295,14 @@ class SpeechAnimator(BaseAnimator):
                 )
                 # 身体律动：用 velocity（变化率）驱动。突变量大 = 节奏感强。
                 dynamic_body_y += frame.velocity * self._body_y_gain * attenuation
+                # 韵律向上半身扩散：音量 → 横向轻摆；volume → 上下弹跳；
+                # velocity → 节拍侧向。三路默认增益保守，避免抢过口型 / 头部。
+                dynamic_body_x += (
+                    math.sin(time.time() * 4.0) * frame.rms
+                    * self._body_x_gain * attenuation
+                )
+                dynamic_body_y += frame.rms * self._body_bounce_k * attenuation
+                dynamic_body_z += frame.velocity * self._body_z_gain * attenuation
 
         # 平滑 + 速率限制
         output: dict[str, float] = {}
@@ -316,10 +330,14 @@ class SpeechAnimator(BaseAnimator):
                 final_value += dynamic_z
             output[key] = final_value
 
-        # 身体律动单独走 v_body_y（不在 target_params 里，绕过情绪基准的 lerp）。
-        # 直接输出叠加值，由 connection 层与 AutoAnimator 的 body_y 求和。
+        # 身体律动单独走 v_body_*（不在 target_params 里，绕过情绪基准的 lerp）。
+        # 直接输出叠加值，由 connection 层与 AutoAnimator 的 body_* 求和。
+        if dynamic_body_x != 0.0:
+            output["v_body_x"] = dynamic_body_x
         if dynamic_body_y != 0.0:
             output["v_body_y"] = dynamic_body_y
+        if dynamic_body_z != 0.0:
+            output["v_body_z"] = dynamic_body_z
 
         return output
 

@@ -25,6 +25,7 @@ from src.app.plugin_system.api.log_api import get_logger
 
 from ...config import IdleAnimationSection
 from .base import BaseAnimator
+from .dynamics import SecondOrderDynamics
 from .noise import fbm
 
 
@@ -311,6 +312,32 @@ class AutoAnimator(BaseAnimator):
         # 调试轮询开关：开启后持续循环播放所有宏观动作
         self._macro_debug_loop: bool = cfg.macro_debug_loop
 
+        # ── 身体与上半身灵动度 ──────────────────────────
+        # 头部 → 身体耦合：两个二阶弹簧系统分别让 v_body_x 跟随 v_head_x、
+        # v_body_z 跟随 v_head_z，产生"带惯性滞后 + 轻微回弹"的从动质感。
+        self._body_follow_head_enabled: bool = cfg.body_follow_head_enabled
+        self._body_freq: float = cfg.body_follow_head_f
+        self._body_damp: float = cfg.body_follow_head_z
+        self._body_w_rx: float = cfg.body_follow_head_w_rx
+        self._body_w_rz: float = cfg.body_follow_head_w_rz
+        self._body_w_comp: float = cfg.body_follow_head_w_comp
+        self._body_coupling_x = SecondOrderDynamics(
+            frequency=max(0.1, self._body_freq),
+            damping=self._body_damp,
+            response=0.0,
+            x0=0.0,
+        )
+        self._body_coupling_z = SecondOrderDynamics(
+            frequency=max(0.1, self._body_freq),
+            damping=self._body_damp,
+            response=0.0,
+            x0=0.0,
+        )
+        # 呼吸肩相位差：胸腔前后仰与肩膀起伏不同相，形成肌肉拉动感。
+        self._breath_shoulder_enabled: bool = cfg.breath_shoulder_enabled
+        self._breath_shoulder_amplitude: float = cfg.breath_shoulder_amplitude
+        self._breath_shoulder_lag: float = cfg.breath_shoulder_lag
+
         # 参数 ID
         self.param_eye_l = "v_eye_left"
         self.param_eye_r = "v_eye_right"
@@ -510,6 +537,39 @@ class AutoAnimator(BaseAnimator):
             if self.macro_eye_oscillation > 0:
                 eye_osc_x = math.sin(t_ratio * self.macro_osc_freq * math.pi * 2) * self.macro_eye_oscillation
 
+        # 呼吸肩相位差：真实呼吸是胸腔扩张伴随耸肩、肩滞后约 lag 弧度。
+        # 用独立相位给 v_body_z 一个滞后分量，替代"全身同相上下浮"的机械感。
+        breath_shoulder_z = 0.0
+        if self._breath_shoulder_enabled and self._breath_shoulder_amplitude > 0.0:
+            breath_shoulder_z = (
+                math.sin(
+                    elapsed * self.breath_freq * 2 * math.pi - self._breath_shoulder_lag
+                )
+                * self._breath_shoulder_amplitude
+            )
+
+        # 身体跟随头部二阶耦合：以"真实头部角度"（微动 + 宏观 + 振荡 + 头眼联动）
+        # 为输入，输出带惯性滞后 / 轻微回弹的身体角度。刻意排除宏观 v_body_*，
+        # 避免大动作目标被二阶系统二次耦合放大；也排除呼吸 Z 轴避免同频抖动。
+        body_coupling_x = 0.0
+        body_coupling_z = 0.0
+        if self._body_follow_head_enabled:
+            head_eff_x = (
+                head_micro_x
+                + self.macro_current_params.get("v_head_x", 0.0)
+                + head_osc_x
+                + head_follow_eye
+            )
+            head_eff_z = self.macro_current_params.get("v_head_z", 0.0) + head_osc_z
+            body_coupling_x = self._body_coupling_x.update(
+                head_eff_x * self._body_w_rx, logic_delta
+            )
+            # 侧倾跟随 + 重心代偿：头横向转时身体反向微补偿，产生重心侧移感。
+            body_coupling_z = self._body_coupling_z.update(
+                head_eff_z * self._body_w_rz - head_eff_x * self._body_w_comp,
+                logic_delta,
+            )
+
         raw_output: dict[str, float] = {}
         raw_output[self.param_eye_x] = base_eye_x + self.macro_current_params.get("v_eye_x", 0.0) + eye_osc_x
         raw_output[self.param_eye_y] = base_eye_y + self.macro_current_params.get("v_eye_y", 0.0)
@@ -520,13 +580,17 @@ class AutoAnimator(BaseAnimator):
         raw_output[self.param_head_z] = (
             breath_z + self.macro_current_params.get("v_head_z", 0.0) + head_osc_z + self.passive_sway_val
         )
-        raw_output["v_body_x"] = self.macro_current_params.get("v_body_x", 0.0)
+        raw_output["v_body_x"] = (
+            self.macro_current_params.get("v_body_x", 0.0) + body_coupling_x
+        )
         raw_output["v_body_y"] = self.macro_current_params.get("v_body_y", 0.0) + breath_body_y
         raw_output["v_body_z"] = (
             body_sway_z
             + self.macro_current_params.get("v_body_z", 0.0)
             + head_osc_z
             + (self.passive_sway_val * 0.4)
+            + body_coupling_z
+            + breath_shoulder_z
         )
         raw_output["v_blush"] = self.macro_current_params.get("v_blush", 0.0)
 

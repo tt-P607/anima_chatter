@@ -164,6 +164,9 @@ VB-Cable 的 Input 通常显示为 `CABLE Input (VB-Audio Virtual Cable)` ——
 | `head_y_gain` | float | `8.0` | 头部前后倾灵敏度（rms × gain → v_head_y 度数） |
 | `head_x_gain` | float | `3.0` | 头部横向摆动幅度（rms × gain × sin → v_head_x 度数） |
 | `body_y_gain` | float | `30.0` | 身体律动灵敏度（velocity × gain → v_body_y 度数） |
+| `body_x_gain` | float | `6.0` | 说话韵律横向轻摆（rms × gain → v_body_x 度数） |
+| `body_z_gain` | float | `8.0` | 说话韵率节拍侧向（velocity × gain → v_body_z 度数） |
+| `body_bounce_k` | float | `1.2` | 音量 → 身体上下弹跳系数（rms × k → v_body_y 附加弹跳） |
 | `neutral_attenuation` | float | `0.5` | emotion=neutral 时整体增益乘数。`0.5` 平静叙述律动减半；`0.0` 平静时完全不动 |
 
 **调参建议**：第一次跑出来八成"太激进"或"太迟钝"，按你的模型的灵敏度配置看着调：
@@ -221,6 +224,27 @@ AutoAnimator 负责眨眼 / 呼吸 / 眼神扫视 / 被动摆动 / 宏观大动�
 
 `motion_speed_scale = 2.0` 让宏观动作的 move 阶段从原版 ~2 秒压缩到 ~1 秒，
 接近真人头部转向速度。调高 = 动作更快更利落；调低 = 慢镜头风。
+
+### 身体与上半身灵动度
+
+用二阶弹簧阻尼让身体作为头部的"带惯性从动体"：转头时胸腔 / 腰部同向但
+滞后跟随，侧歪时反向重心代偿，消除"头转身体不转"的假人感。呼吸则升级为
+"胸腔前后仰 + 肩膀滞后起伏"的层次感。
+
+| 字段 | 类型 | 默认 | 说明 |
+|------|------|----|------|
+| `body_follow_head_enabled` | bool | `true` | 身体跟随头部耦合总开关（v_body_x / v_body_z 随头部二阶波动） |
+| `body_follow_head_f` | float | `1.6` | 身体跟随头部的二阶系统固有频率 Hz，越大跟随越快 |
+| `body_follow_head_z` | float | `0.75` | 阻尼比；`1.0` 临界无过冲，`<1.0` 有轻微回弹 |
+| `body_follow_head_w_rx` | float | `0.4` | 水平跟随权重：头转 30° 时身体跟转约 `w_rx × 30°` |
+| `body_follow_head_w_rz` | float | `0.3` | 侧倾跟随权重：头侧歪时身体侧向跟随比例 |
+| `body_follow_head_w_comp` | float | `0.08` | 重心代偿权重：头部横向转时身体反向微补偿（重心侧移感） |
+| `breath_shoulder_enabled` | bool | `true` | 呼吸肩相位差开关（胸腔与肩膀不同相起伏） |
+| `breath_shoulder_amplitude` | float | `0.9` | 呼吸时肩膀起伏幅度（v_body_z 度数），`0` 关闭 |
+| `breath_shoulder_lag` | float | `0.5` | 肩膀相对胸腔的滞后（弧度，约 π/6 ≈ 0.52） |
+
+调参建议：身体跟得太紧/太僵硬 → 调小 `body_follow_head_w_rx` / `body_follow_head_w_rz`
+或调大阻尼 `body_follow_head_z`；肩膀起伏太明显 → 调小 `breath_shoulder_amplitude`。
 
 ---
 
