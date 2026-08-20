@@ -179,7 +179,7 @@ class AutoAnimator(BaseAnimator):
         self.macro_library: list[dict[str, Any]] = [
             {
                 "name": "重心左斜",
-                "params": {"v_head_z": -5.0, "v_head_x": -1.8},
+                "params": {"v_head_z": -5.8, "v_head_x": -2.1},
                 "weight": 20,
                 "hold": 8.0,
                 # 重心斜常常承接侧身偷瞄、好奇歪头
@@ -187,14 +187,14 @@ class AutoAnimator(BaseAnimator):
             },
             {
                 "name": "重心右斜",
-                "params": {"v_head_z": 4.0, "v_head_x": 1.5},
+                "params": {"v_head_z": 4.6, "v_head_x": 1.75},
                 "weight": 20,
                 "hold": 8.0,
                 "chain_to": {"侧身偷瞄": 0.3, "好奇歪头": 0.2},
             },
             {
                 "name": "左侧扫视",
-                "params": {"v_head_x": -5.5, "v_eye_x": -0.3, "v_head_y": 1.0},
+                "params": {"v_head_x": -6.1, "v_eye_x": -0.33, "v_head_y": 1.1},
                 "weight": 20,
                 "hold": 3.0,
                 "move_speed": 1.5,
@@ -204,7 +204,7 @@ class AutoAnimator(BaseAnimator):
             },
             {
                 "name": "右侧扫视",
-                "params": {"v_head_x": 5.5, "v_eye_x": 0.3, "v_head_y": 1.0},
+                "params": {"v_head_x": 6.1, "v_eye_x": 0.33, "v_head_y": 1.1},
                 "weight": 20,
                 "hold": 3.0,
                 "move_speed": 1.5,
@@ -213,7 +213,7 @@ class AutoAnimator(BaseAnimator):
             },
             {
                 "name": "失神发呆",
-                "params": {"v_head_y": -2.5, "v_head_z": 1.2, "v_eye_y": -0.15},
+                "params": {"v_head_y": -2.8, "v_head_z": 1.35, "v_eye_y": -0.17},
                 "weight": 20,
                 "hold": 6.0,
                 "move_speed": 4.0,
@@ -223,7 +223,7 @@ class AutoAnimator(BaseAnimator):
             },
             {
                 "name": "侧身偷瞄",
-                "params": {"v_body_x": 4.5, "v_head_x": 2.0, "v_eye_x": 0.3},
+                "params": {"v_body_x": 5.2, "v_head_x": 2.3, "v_eye_x": 0.34},
                 "weight": 20,
                 "hold": 3.0,
                 "move_speed": 1.8,
@@ -232,7 +232,7 @@ class AutoAnimator(BaseAnimator):
             },
             {
                 "name": "分心远眺",
-                "params": {"v_head_x": 6.5, "v_head_y": 2.5, "v_eye_x": -0.3, "v_eye_y": 0.15},
+                "params": {"v_head_x": 7.5, "v_head_y": 2.9, "v_eye_x": -0.34, "v_eye_y": 0.17},
                 "weight": 20,
                 "hold": 4.0,
                 "trigger_blink_on_return": True,
@@ -242,11 +242,11 @@ class AutoAnimator(BaseAnimator):
             {
                 "name": "好奇歪头",
                 "params": {
-                    "v_head_z": 5.5,
-                    "v_head_x": 2.5,
-                    "v_head_y": 1.5,
-                    "v_eye_x": -0.2,
-                    "v_eye_y": 0.1,
+                    "v_head_z": 6.3,
+                    "v_head_x": 2.9,
+                    "v_head_y": 1.7,
+                    "v_eye_x": -0.23,
+                    "v_eye_y": 0.11,
                 },
                 "weight": 20,
                 "hold": 4.0,
@@ -255,7 +255,7 @@ class AutoAnimator(BaseAnimator):
             },
             {
                 "name": "深呼吸",
-                "params": {"v_head_y": 3.5, "v_body_y": 2.2, "v_head_z": 1.0},
+                "params": {"v_head_y": 3.9, "v_body_y": 2.5, "v_head_z": 1.1},
                 "weight": 10,
                 "hold": 1.0,
                 "move_speed": 2.0,
@@ -265,7 +265,7 @@ class AutoAnimator(BaseAnimator):
             },
             {
                 "name": "向下检查",
-                "params": {"v_head_y": -5.0, "v_eye_y": -0.35, "v_body_y": -0.8},
+                "params": {"v_head_y": -5.5, "v_eye_y": -0.39, "v_body_y": -0.9},
                 "weight": 10,
                 "hold": 2.5,
                 "move_speed": 1.5,
@@ -274,12 +274,12 @@ class AutoAnimator(BaseAnimator):
             {
                 "name": "害羞回避",
                 "params": {
-                    "v_head_x": -4.5,
-                    "v_head_y": -3.0,
-                    "v_head_z": -2.5,
-                    "v_eye_x": 0.25,
-                    "v_eye_y": -0.15,
-                    "v_blush": 0.5,
+                    "v_head_x": -5.2,
+                    "v_head_y": -3.5,
+                    "v_head_z": -2.9,
+                    "v_eye_x": 0.28,
+                    "v_eye_y": -0.17,
+                    "v_blush": 0.55,
                 },
                 "weight": 10,
                 "hold": 5.0,
@@ -288,7 +288,7 @@ class AutoAnimator(BaseAnimator):
             },
             {
                 "name": "深度思考",
-                "params": {"v_head_y": 4.0, "v_head_z": -2.0, "v_eye_y": 0.25, "v_eye_x": 0.0},
+                "params": {"v_head_y": 4.5, "v_head_z": -2.3, "v_eye_y": 0.28, "v_eye_x": 0.0},
                 "eye_oscillation": 0.15,
                 "osc_freq": 1.5,
                 "weight": 10,
