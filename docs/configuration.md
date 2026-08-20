@@ -243,8 +243,29 @@ AutoAnimator 负责眨眼 / 呼吸 / 眼神扫视 / 被动摆动 / 宏观大动�
 | `breath_shoulder_amplitude` | float | `0.9` | 呼吸时肩膀起伏幅度（v_body_z 度数），`0` 关闭 |
 | `breath_shoulder_lag` | float | `0.5` | 肩膀相对胸腔的滞后（弧度，约 π/6 ≈ 0.52） |
 
-调参建议：身体跟得太紧/太僵硬 → 调小 `body_follow_head_w_rx` / `body_follow_head_w_rz`
-或调大阻尼 `body_follow_head_z`；肩膀起伏太明显 → 调小 `breath_shoulder_amplitude`。
+### 身体常驻律动
+
+真人站立时身体从不静止：横向重心、纵向沉稳、侧向肩腰总在持续但轻缓地摇动。
+这条通道用 value noise 三轴独立生成**常驻**身体摇摆底噪，让待机不再"钉在原地"，
+逼近 Neuro-sama 那种"始终在活"的质感。与头部耦合、被动慢摆、宏观动作互不干扰。
+
+| 字段 | 类型 | 默认 | 说明 |
+|------|------|----|------|
+| `body_idle_enabled` | bool | `true` | 待机身体常驻律动总开关；关闭后只剩呼吸那点可察觉的极弱摆动 |
+| `body_idle_scale` | float | `1.0` | 总幅度倍率；调大更明显，调小更安静 |
+| `body_idle_x_amp` | float | `4.5` | 横向重心律动幅度（v_body_x 度），左右轻微晃重心 |
+| `body_idle_y_amp` | float | `2.5` | 上下沉稳起伏幅度（v_body_y 度） |
+| `body_idle_z_amp` | float | `3.5` | 侧向肩腰律动幅度（v_body_z 度） |
+
+调参建议：
+- 身体"动得太明显/像抖" → 整体调小 `body_idle_scale`（如 `0.6`），或单轴调小对应 `*_amp`。
+- 想要更"活" → 调大 `body_idle_scale` 到 `1.3~1.5`。
+- 只想去掉某一轴的晃动 → 单独把该轴 `*_amp` 设 `0`。
+
+> 身体跟得太紧/僵硬 → 调小 `body_follow_head_w_rx` / `body_follow_head_w_rz`
+> 或调大阻尼 `body_follow_head_z`；肩膀起伏太明显 → 调小 `breath_shoulder_amplitude`。
+
+---
 
 ---
 

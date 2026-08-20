@@ -338,6 +338,19 @@ class AutoAnimator(BaseAnimator):
         self._breath_shoulder_amplitude: float = cfg.breath_shoulder_amplitude
         self._breath_shoulder_lag: float = cfg.breath_shoulder_lag
 
+        # ── 身体常驻律动 ──────────────────────────────
+        # 真人站立时身体从不静止：横向重心、纵向沉稳、侧向肩腰总在持续但
+        # 轻缓地摇动。用 value noise 三轴独立生成常驻摇摆，作为身体"活着"的
+        # 底噪，叠加上去后待机不再钉在原地。关闭总开关则退回仅有呼吸的极弱
+        # 摆动（几乎不可感知）。
+        self._body_idle_enabled: bool = cfg.body_idle_enabled
+        self._body_idle_scale: float = cfg.body_idle_scale
+        self._body_idle_x_amp: float = cfg.body_idle_x_amp
+        self._body_idle_y_amp: float = cfg.body_idle_y_amp
+        self._body_idle_z_amp: float = cfg.body_idle_z_amp
+        # 常驻律动的随机相位：每次启动走一条不完全相同的曲线，避免千篇一律。
+        self._body_idle_phase: float = random.uniform(0, 1000)
+
         # 参数 ID
         self.param_eye_l = "v_eye_left"
         self.param_eye_r = "v_eye_right"
@@ -570,6 +583,25 @@ class AutoAnimator(BaseAnimator):
                 logic_delta,
             )
 
+        # 身体常驻律动：用 value noise 三轴独立、持续生成身体摇摆底噪。
+        # 频率很慢（0.05~0.08），像真人站立时无意识的重心浮动；幅度由
+        # body_idle_* 控制，scale 统一放大缩小。作 Independent 的"活着"底噪，
+        # 与头部微动、被动慢摆、宏观动作互不耦合，确保待机也在"动"。
+        body_idle_x = 0.0
+        body_idle_y = 0.0
+        body_idle_z = 0.0
+        if self._body_idle_enabled:
+            # 频率 ~0.15Hz（约 6.6 秒一个周期）：快过呼吸那点几乎不可察的摆动，
+            # 又慢到像"无意识重心浮动"，不会像抽搐。三轴走独立噪声曲线 + 轻微
+            # 倍率差，避免三轴同频显得僵硬。
+            idle_t = (elapsed + self._body_idle_phase) * 0.15
+            body_idle_x = fbm(idle_t, seed=21) * self._body_idle_x_amp
+            body_idle_y = fbm(idle_t * 0.9 + 7.0, seed=22) * self._body_idle_y_amp
+            body_idle_z = fbm(idle_t * 1.1 + 13.0, seed=23) * self._body_idle_z_amp
+            body_idle_x *= self._body_idle_scale
+            body_idle_y *= self._body_idle_scale
+            body_idle_z *= self._body_idle_scale
+
         raw_output: dict[str, float] = {}
         raw_output[self.param_eye_x] = base_eye_x + self.macro_current_params.get("v_eye_x", 0.0) + eye_osc_x
         raw_output[self.param_eye_y] = base_eye_y + self.macro_current_params.get("v_eye_y", 0.0)
@@ -581,9 +613,15 @@ class AutoAnimator(BaseAnimator):
             breath_z + self.macro_current_params.get("v_head_z", 0.0) + head_osc_z + self.passive_sway_val
         )
         raw_output["v_body_x"] = (
-            self.macro_current_params.get("v_body_x", 0.0) + body_coupling_x
+            self.macro_current_params.get("v_body_x", 0.0)
+            + body_coupling_x
+            + body_idle_x
         )
-        raw_output["v_body_y"] = self.macro_current_params.get("v_body_y", 0.0) + breath_body_y
+        raw_output["v_body_y"] = (
+            self.macro_current_params.get("v_body_y", 0.0)
+            + breath_body_y
+            + body_idle_y
+        )
         raw_output["v_body_z"] = (
             body_sway_z
             + self.macro_current_params.get("v_body_z", 0.0)
@@ -591,6 +629,7 @@ class AutoAnimator(BaseAnimator):
             + (self.passive_sway_val * 0.4)
             + body_coupling_z
             + breath_shoulder_z
+            + body_idle_z
         )
         raw_output["v_blush"] = self.macro_current_params.get("v_blush", 0.0)
 
@@ -603,9 +642,9 @@ class AutoAnimator(BaseAnimator):
             self.param_head_x: 40.0,
             self.param_head_y: 40.0,
             self.param_head_z: 40.0,
-            "v_body_x": 25.0,
-            "v_body_y": 25.0,
-            "v_body_z": 25.0,
+            "v_body_x": 40.0,
+            "v_body_y": 40.0,
+            "v_body_z": 40.0,
             self.param_eye_x: 3.0,
             self.param_eye_y: 3.0,
         }

@@ -496,6 +496,26 @@ class IdleAnimationSection(SectionBase):
         default=0.08, description="重心代偿权重：头部横向转时身体反向微补偿（重心侧移感）"
     )
 
+    # ── 身体常驻律动 ──────────────────────────────
+    # 真人站立时身体绝不静止：横向重心、纵向沉稳、侧向肩腰总在轻微但持续地摇动。
+    # 用 value noise 三轴独立生成常驻身体摇摆，让待机不再"钉在原地"，逼近
+    # Neuro-sama 那种"始终在活"的质感。幅度默认给到能明显感知但不过度。
+    body_idle_enabled: bool = Field(
+        default=True, description="待机身体常驻律动总开关（关闭后退回仅有呼吸的可察觉极弱摆动）"
+    )
+    body_idle_scale: float = Field(
+        default=1.0, description="身体常驻律动总幅度倍率；调大更明显，调小更安静"
+    )
+    body_idle_x_amp: float = Field(
+        default=4.5, description="横向重心律动幅度（v_body_x 度），左右轻微晃重心"
+    )
+    body_idle_y_amp: float = Field(
+        default=2.5, description="上下沉稳起伏幅度（v_body_y 度）"
+    )
+    body_idle_z_amp: float = Field(
+        default=3.5, description="侧向肩腰律动幅度（v_body_z 度）"
+    )
+
     # 呼吸相位差：真实呼吸是胸腔扩张伴随耸肩、呼气肩沉、肩滞后约 0.15s。
     # 把呼吸从"整体上下平移"升级为"胸腔前后仰 + 肩膀滞后起伏"的层次感。
     breath_shoulder_enabled: bool = Field(
