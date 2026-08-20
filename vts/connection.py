@@ -1,11 +1,15 @@
 """VTube Studio WebSocket 连接管理。
 
 封装 pyvts 的连接、认证、自定义参数注册、动画循环 + 参数发送循环。
-所有后台任务通过 :mod:`src.kernel.concurrency.task_manager` 派发，
-不直接使用 ``asyncio.create_task``。
 
-旧版基于独立子进程 + Socket IPC 的设计在新框架下不再必要——Neo 的
-task_manager 与 watchdog 已经能保证主事件循环不被阻塞。
+**独立事件循环线程**：VTS 的动画 / 参数发送 / 心跳三个后台循环跑在一个
+**独立线程 + 私有 asyncio 事件循环**里，与主程序的事件循环完全隔离。这样主程序
+即便发生会阻塞主事件循环的操作（LLM 请求、音频解码、同步 I/O 等），动画与参数
+发送也不会卡顿，从而避免 VTB 模型抽搐 / 卡顿。
+
+对外接口（``connect`` / ``close`` / ``trigger_hotkey`` / ``set_expression``）
+签名保持不变，主进程侧通过 :meth:`asyncio.run_coroutine_threadsafe` 把请求投递到
+worker 循环执行并等待结果；因此上层调用方（VTSPerformer）无需任何改动。
 """
 
 from __future__ import annotations
@@ -13,11 +17,12 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import threading
+from collections.abc import Coroutine
+from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.log_api import get_logger
-
-from .._internal_compat import create_background_task
 
 if TYPE_CHECKING:
     from .animation.base import BaseAnimator
@@ -91,7 +96,11 @@ def _sanitize_params(params: dict[str, float]) -> dict[str, float]:
 
 
 class VTSConnection:
-    """与 VTube Studio 维持 WebSocket 长连接，并跑动画循环。"""
+    """与 VTube Studio 维持 WebSocket 长连接，并跑动画循环。
+
+    动画 / 发送 / 心跳循环运行在**独立线程的私有事件循环**里，与主程序事件循环
+    隔离，从而主程序卡顿不影响动画发送节奏。
+    """
 
     def __init__(
         self,
@@ -102,7 +111,11 @@ class VTSConnection:
         developer: str = "MoFox Team",
         token_path: str | None = None,
     ) -> None:
-        """初始化连接参数；token 文件用于免重复授权。"""
+        """初始化连接参数；token 文件用于免重复授权。
+
+        事件循环 / 线程在首次需要时惰性启动（见 :meth:`_ensure_worker_loop`），
+        避免实例化即开线程造成的资源浪费与测试噪音。
+        """
 
         self.host = host
         self.port = port
@@ -111,24 +124,135 @@ class VTSConnection:
         self.token_path = token_path
 
         # pyvts.vts 实例；保持 Any 避免在未安装 pyvts 的开发环境下出现导入错误。
+        # 始终只被 worker 循环内的协程读写（connect / 心跳 / sender / 控制接口）。
         self.vts: Any = None
         self.is_connected: bool = False
 
+        # 以下 asyncio primitives 首次 await 发生在 worker 循环内，因此会绑定到
+        # worker 循环。它们绝不会被主线程直接 await；主线程只会通过
+        # run_coroutine_threadsafe 把协程投递到 worker 循环后在其中执行，从而
+        # 保证锁 / future 与循环一致。
         self._connect_lock = asyncio.Lock()
         self._request_lock = asyncio.Lock()
         self._buffer_lock = asyncio.Lock()
         self._param_buffer: dict[str, float] = {}
 
-        self._heartbeat_handle: Any = None
-        self._animation_handle: Any = None
-        self._sender_handle: Any = None
+        # 独立事件循环线程的句柄与状态。
+        self._worker_thread: threading.Thread | None = None
+        self._worker_loop: asyncio.AbstractEventLoop | None = None
+        self._worker_stop: threading.Event = threading.Event()
+        # 三循环的任务句柄（跑在 worker 循环里，用于关闭时取消）。
+        self._heartbeat_task: asyncio.Task[Any] | None = None
+        self._animation_task: asyncio.Task[Any] | None = None
+        self._sender_task: asyncio.Task[Any] | None = None
+        self._loop_started: threading.Event = threading.Event()
+
         self.animators: list[BaseAnimator] = []
+
+    # ── 独立事件循环线程 ──────────────────────────────
+
+    def _ensure_worker_loop(self) -> "asyncio.AbstractEventLoop":
+        """确保 worker 线程 + 事件循环在运行；若已停止则重启。
+
+        返回当前可用的 worker 事件循环。每次调用都校验线程存活与循环未关闭，
+        保证任何桥接调用都不会把协程投递到已停摆的循环上。
+
+        Returns:
+            worker 循环实例。
+        """
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            loop = self._worker_loop
+            if loop is not None and not loop.is_closed():
+                return loop
+            # 线程活着但循环已关闭：清掉引用，走下方重建路径。
+            self._worker_loop = None
+
+        self._loop_started.clear()
+        self._worker_stop = threading.Event()
+        self._worker_loop = None
+
+        def _run() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._worker_loop = loop
+            self._loop_started.set()
+            try:
+                loop.run_forever()
+            finally:
+                # 循环结束时清理 pending 任务，避免 "Task was destroyed" 噪音。
+                try:
+                    pending = asyncio.all_tasks(loop)
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True)
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
+                loop.close()
+                if self._worker_loop is loop:
+                    self._worker_loop = None
+
+        thread = threading.Thread(
+            target=_run,
+            name="anima_chatter.vts.worker",
+            daemon=True,
+        )
+        thread.start()
+        self._worker_thread = thread
+        if not self._loop_started.wait(timeout=10):
+            raise RuntimeError("VTS worker 事件循环启动超时")
+        return self._worker_loop  # type: ignore[return-value]
+
+    def _submit(self, coro: "Coroutine[Any, Any, Any]") -> "Future[Any]":
+        """把协程投递到 worker 循环执行，返回可等待的 Future。
+
+        Args:
+            coro: 要在 worker 循环执行的协程。
+
+        Returns:
+            与 coro 结果绑定的 ``concurrent.futures.Future``。
+        """
+        loop = self._ensure_worker_loop()
+        return asyncio.run_coroutine_threadsafe(coro, loop)
+
+    def _run_coro(self, coro: "Coroutine[Any, Any, Any]", timeout: float) -> Any:
+        """同步等待 worker 循环上的协程执行完并返回结果。
+
+        供主线程调用：阻塞当前线程直到 worker 循环里的 coro 完成（或超时）。
+        内部通过 ``Future.result`` 在 worker 线程执行，主线程不会触碰循环锁。
+
+        Args:
+            coro: 要执行的协程。
+            timeout: 超时秒数。
+
+        Returns:
+            coro 的返回值。
+
+        Raises:
+            asyncio.TimeoutError: 超时未完成。
+        """
+        future = self._submit(coro)
+        return future.result(timeout=timeout)
 
     # ── 生命周期 ──────────────────────────────────────
 
     async def connect(self) -> bool:
-        """建立 WebSocket 连接，注册自定义参数，启动后台循环。"""
+        """建立 WebSocket 连接，注册自定义参数，启动后台循环。
 
+        在**独立 worker 事件循环**中执行真正的连接逻辑，以隔离主程序事件循环
+        的卡顿。调用方（主线程）await 本方法，它会阻塞至连接完成或失败。
+
+        Returns:
+            是否连接成功。
+        """
+        # 把异步连接逻辑委托给 worker 循环；_connect_locked 在 worker 循环里跑，
+        # 因此对 self._connect_lock / self._request_lock 的 await 均绑定正确循环。
+        return bool(await asyncio.wrap_future(self._submit(self._connect_in_worker())))
+
+    async def _connect_in_worker(self) -> bool:
+        """worker 循环内的实际连接实现（含锁与后台循环启动）。"""
         async with self._connect_lock:
             if self.is_connected and self.vts is not None:
                 return True
@@ -140,7 +264,7 @@ class VTSConnection:
                 async with self._request_lock:
                     try:
                         await self.vts.close()
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         pass
                     self.vts = None
 
@@ -171,48 +295,90 @@ class VTSConnection:
                 self.is_connected = True
                 logger.info("✅ VTube Studio 连接并认证成功")
 
-                if self._heartbeat_handle is None:
-                    self._heartbeat_handle = create_background_task(
-                        self._heartbeat_loop(),
-                        name="anima_chatter.vts.heartbeat",
-                    )
-                if self._animation_handle is None:
-                    self._animation_handle = create_background_task(
-                        self._animation_loop(),
-                        name="anima_chatter.vts.animation",
-                    )
-                if self._sender_handle is None:
-                    self._sender_handle = create_background_task(
-                        self._param_sender_loop(),
-                        name="anima_chatter.vts.sender",
-                    )
+                self._start_background_tasks()
                 return True
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(f"连接 VTube Studio 失败: {exc}")
                 self.is_connected = False
                 self.vts = None
                 return False
 
+    def _start_background_tasks(self) -> None:
+        """在 worker 循环里创建并跟踪三个后台循环任务（幂等）。"""
+        loop = self._worker_loop
+        if loop is None or loop.is_closed():
+            return
+        if self._heartbeat_task is None:
+            self._heartbeat_task = loop.create_task(
+                self._heartbeat_loop(), name="anima_chatter.vts.heartbeat"
+            )
+        if self._animation_task is None:
+            self._animation_task = loop.create_task(
+                self._animation_loop(), name="anima_chatter.vts.animation"
+            )
+        if self._sender_task is None:
+            self._sender_task = loop.create_task(
+                self._param_sender_loop(), name="anima_chatter.vts.sender"
+            )
+
     async def close(self) -> None:
         """终止后台循环并断开 WebSocket。"""
+        # 若 worker 循环从未启动（未 connect 过），直接复位即可。
+        if self._worker_loop is None or self._worker_loop.is_closed():
+            self.vts = None
+            self.is_connected = False
+            logger.info("VTube Studio 连接已关闭（worker 未运行）")
+            return
 
-        for handle_attr in ("_heartbeat_handle", "_animation_handle", "_sender_handle"):
-            handle = getattr(self, handle_attr, None)
-            if handle is not None:
+        # 取消后台任务并断开连接，全部在 worker 循环里完成。
+        try:
+            await asyncio.wrap_future(self._submit(self._close_in_worker()))
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 停止并回收 worker 线程与事件循环。
+        self._shutdown_worker()
+
+    async def _close_in_worker(self) -> None:
+        """worker 循环内的关闭实现：取消三循环、断开 ws。"""
+        for attr in ("_heartbeat_task", "_animation_task", "_sender_task"):
+            task = getattr(self, attr)
+            if task is not None:
                 try:
-                    handle.cancel()
-                except Exception:
+                    task.cancel()
+                except Exception:  # noqa: BLE001
                     pass
-                setattr(self, handle_attr, None)
+                setattr(self, attr, None)
 
         if self.vts is not None and self.is_connected:
             try:
                 await self.vts.close()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
         self.vts = None
         self.is_connected = False
         logger.info("VTube Studio 连接已关闭")
+
+    def _shutdown_worker(self) -> None:
+        """停止并回收 worker 线程与私有事件循环（幂等、可重复调用）。"""
+        loop = self._worker_loop
+        thread = self._worker_thread
+        if loop is not None and not loop.is_closed():
+            self._worker_stop.set()
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except Exception:  # noqa: BLE001
+                pass
+        if thread is not None and thread.is_alive():
+            try:
+                thread.join(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+        self._worker_thread = None
+        self._worker_loop = None
+        self._heartbeat_task = None
+        self._animation_task = None
+        self._sender_task = None
 
     # ── 自定义参数注册 ────────────────────────────────
 
@@ -231,7 +397,7 @@ class VTSConnection:
                 )
                 await self.vts.request(msg)
                 logger.debug(f"注册自定义参数: {param['name']}")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.debug(f"注册参数 {param['name']} 跳过（可能已存在）: {exc}")
 
     # ── 心跳 + 自动重连 ─────────────────────────────────
@@ -261,7 +427,7 @@ class VTSConnection:
                 return 0.5
             return min(0.5 * (2 ** (failures - 4)), max_backoff)
 
-        while True:
+        while not self._worker_stop.is_set():
             try:
                 # 断连状态：进入重连分支。第一次进来不 sleep，立即尝试。
                 if not self.is_connected or self.vts is None:
@@ -274,7 +440,7 @@ class VTSConnection:
                         await asyncio.sleep(wait)
                     else:
                         logger.info("VTS 未连接，立即尝试重连…")
-                    ok = await self.connect()
+                    ok = await self._connect_in_worker()
                     if ok:
                         logger.info("✅ VTS 自动重连成功")
                         consecutive_failures = 0
@@ -300,7 +466,7 @@ class VTSConnection:
             except asyncio.CancelledError:
                 logger.info("VTS 心跳循环已停止")
                 return
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(f"VTS 心跳检测失败，连接可能已断开: {exc}")
                 self.is_connected = False
                 # 故意不在这里 sleep / connect；交给下一轮循环开头的重连分支
@@ -312,7 +478,7 @@ class VTSConnection:
         """以 ~30Hz 调用所有动画器，把输出汇总到参数缓冲区。"""
 
         last_time = asyncio.get_event_loop().time()
-        while True:
+        while not self._worker_stop.is_set():
             try:
                 if not self.is_connected or self.vts is None:
                     await asyncio.sleep(2)
@@ -332,7 +498,7 @@ class VTSConnection:
                             continue
                         for key, value in params.items():
                             aggregated[key] = aggregated.get(key, 0.0) + value
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001
                         logger.error(
                             f"animator {animator.__class__.__name__} update 出错: {exc}"
                         )
@@ -345,7 +511,7 @@ class VTSConnection:
             except asyncio.CancelledError:
                 logger.info("VTS 动画循环已停止")
                 return
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.error(f"VTS 动画循环异常: {exc}")
                 await asyncio.sleep(1)
 
@@ -354,7 +520,7 @@ class VTSConnection:
     async def _param_sender_loop(self) -> None:
         """高频消费 ``_param_buffer``，把最新值送进 VTS。"""
 
-        while True:
+        while not self._worker_stop.is_set():
             try:
                 if not self.is_connected or self.vts is None:
                     await asyncio.sleep(1)
@@ -393,7 +559,7 @@ class VTSConnection:
                                 list(snapshot.values()),
                             )
                             await vts_local.request(msg)
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         # 单次发送失败不致命，等下次循环。
                         pass
 
@@ -401,15 +567,26 @@ class VTSConnection:
             except asyncio.CancelledError:
                 logger.info("VTS 参数发送循环已停止")
                 return
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.error(f"VTS 参数发送循环异常: {exc}")
                 await asyncio.sleep(0.5)
 
     # ── 直接控制接口 ─────────────────────────────────
 
     async def trigger_hotkey(self, hotkey_id: str) -> bool:
-        """触发 VTube Studio 中已配置的热键（动作/表情按钮）。"""
+        """触发 VTube Studio 中已配置的热键（动作/表情按钮）。
 
+        在主线程被调用，实际在 worker 循环里执行；返回结果通过 :class:`Future`
+        桥接回主线程。
+        """
+        if not hotkey_id:
+            return False
+        if self._worker_loop is None or self._worker_loop.is_closed():
+            return False
+        return bool(self._run_coro(self._trigger_hotkey_in_worker(hotkey_id), 10.0))
+
+    async def _trigger_hotkey_in_worker(self, hotkey_id: str) -> bool:
+        """worker 循环内：触发热键实现。"""
         if not self.is_connected or self.vts is None or not hotkey_id:
             return False
 
@@ -425,7 +602,7 @@ class VTSConnection:
                 if response is None:
                     return False
                 return response.get("data", {}).get("hotkeyID") == hotkey_id
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.error(f"触发热键失败: {exc}")
                 return False
 
@@ -449,7 +626,18 @@ class VTSConnection:
         Returns:
             VTS 是否报告成功。
         """
+        if not expression_file:
+            return False
+        if self._worker_loop is None or self._worker_loop.is_closed():
+            return False
+        return bool(
+            self._run_coro(
+                self._set_expression_in_worker(expression_file, active), 10.0
+            )
+        )
 
+    async def _set_expression_in_worker(self, expression_file: str, active: bool) -> bool:
+        """worker 循环内：设置表情激活状态实现。"""
         if not self.is_connected or self.vts is None or not expression_file:
             return False
 
@@ -479,7 +667,7 @@ class VTSConnection:
                     )
                     return False
                 return True
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.error(f"设置表情失败 {expression_file}: {exc}")
                 return False
 
