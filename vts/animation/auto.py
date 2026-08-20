@@ -83,7 +83,9 @@ class AutoAnimator(BaseAnimator):
         self.eye_y: float = 0.0
         self.eye_wander_x: float = 0.0
         self.eye_wander_y: float = 0.0
-        self.next_saccade_time: float = 0.0
+        # 首次扫视延后：避免刚连接时眼珠立刻跳动，让模型先自然稳定几秒。
+        # 比较用的是相对 elapsed（秒），故此处存一个"过多少秒后首次扫视"的时长。
+        self.next_saccade_time: float = random.uniform(1.5, 3.0)
         # 扫视回中时刻；>0 表示当前扫视等待回中，到点后眼神归零回镜头中心
         self._saccade_return_time: float = 0.0
         # 扫视间隔（秒）。真人微眼动 0.2-0.6 秒一次，但全做太疲劳；
@@ -128,9 +130,10 @@ class AutoAnimator(BaseAnimator):
         self._motion_speed_scale = cfg.motion_speed_scale
         self.macro_state: str = "IDLE"  # IDLE / MOVING / HOLDING / RETURNING
         self.macro_timer: float = 0.0
-        self.next_macro_trigger_time: float = time.time() + random.uniform(
-            self._macro_min_interval, self._macro_max_interval
-        )
+        # 首个宏观动作延后（12-22 秒）：刚连接时模型刚从"静止"进入驱动，
+        # 若像默认 6-15 秒那样过早触发大幅摆位，观感会像开机抽搐。首启先
+        # 自然稳定十几秒，之后动作回到正常的 6-15 秒节奏。
+        self.next_macro_trigger_time: float = time.time() + random.uniform(12.0, 22.0)
 
         self.macro_history: list[str] = []
         self.macro_demo_queue: list[dict[str, Any]] = []
