@@ -1,7 +1,7 @@
 {
   "name": "anima_chatter",
   "display_name": "Anima 语音通话与虚拟形象聊天器",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "统一编排实时语音通话、VTube Studio 表演和直播弹幕互动的三模式 Chatter。",
   "author": "言柒",
   "entry_point": "plugin.py",
@@ -15,7 +15,7 @@
     "plugin_api": "1.0.0",
     "send_api": "1.0.0",
     "service_api": "1.0.0",
-    "stream_api": "1.0.0"
+    "stream_api": "2.0.0"
   },
   "dependencies": {
     "plugins": [
