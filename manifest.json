@@ -1,46 +1,107 @@
 {
-    "name": "voice_chatter",
-    "display_name": "语音通话专用聊天器",
-    "version": "1.0.2",
-    "description": "ASR 实时语音通话专用 Chatter",
-    "author": "MoFox Team",
-    "dependencies": {
-        "plugins": [
-            "asr_adapter",
-            "tts_http_server"
-        ],
-        "components": []
-    },
-    "include": [
-        {
-            "component_type": "chatter",
-            "component_name": "voice_chatter",
-            "dependencies": [
-                "asr_adapter:adapter:asr_adapter"
-            ]
-        },
-        {
-            "component_type": "action",
-            "component_name": "say",
-            "dependencies": [
-                "asr_adapter:adapter:asr_adapter"
-            ]
-        },
-        {
-            "component_type": "action",
-            "component_name": "pass_and_wait",
-            "dependencies": []
-        }
+  "name": "anima_chatter",
+  "display_name": "Anima 直播",
+  "version": "1.2.2",
+  "description": "Neo-MoFox 直播互动插件，接收观众弹幕，生成语音回复，并支持 VTube Studio 虚拟形象表演和本地歌曲播放。",
+  "author": "言柒",
+  "entry_point": "plugin.py",
+  "min_core_version": "1.2.0-alpha",
+  "api_version": {
+    "adapter_api": "1.0.0",
+    "chat_api": "1.0.0",
+    "event_api": "1.0.0",
+    "llm_api": "1.0.0",
+    "log_api": "1.0.0",
+    "plugin_api": "1.0.0",
+    "prompt_api": "1.0.0",
+    "send_api": "1.0.0",
+    "service_api": "1.0.0",
+    "stream_api": "2.0.0"
+  },
+  "dependencies": {
+    "plugins": [
+      "tts_voice_plugin-neo",
+      "neo_default_chatter"
     ],
-    "entry_point": "plugin.py",
-    "min_core_version": "1.2.0-alpha",
-    "categories": [
-        "chat"
-    ],
-    "tags": [
-        "voice",
-        "chatter",
-        "real-time",
-        "company"
+    "components": [
+      "neo_default_chatter:service:chat_core",
+      "tts_voice_plugin-neo:service:speech"
     ]
+  },
+  "python_dependencies": [
+    "pyvts>=0.3.3",
+    "websockets>=12.0",
+    "sounddevice>=0.4.6",
+    "soundfile>=0.12.1",
+    "rapidfuzz>=3.0.0",
+    "numpy>=1.24.0"
+  ],
+  "include": [
+    {
+      "component_type": "chatter",
+      "component_name": "anima_chatter",
+      "dependencies": [
+        "neo_default_chatter:service:chat_core"
+      ]
+    },
+    {
+      "component_type": "action",
+      "component_name": "say_and_perform",
+      "dependencies": []
+    },
+    {
+      "component_type": "action",
+      "component_name": "sing_song",
+      "dependencies": []
+    },
+    {
+      "component_type": "action",
+      "component_name": "pass_and_wait",
+      "dependencies": []
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "anima_preprocess",
+      "dependencies": []
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "anima_inject_unread_payload",
+      "dependencies": []
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "anima_inject_usables",
+      "dependencies": []
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "anima_create_request",
+      "dependencies": []
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "anima_fetch_unreads",
+      "dependencies": []
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "anima_format_unread_line",
+      "dependencies": []
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "anima_build_history_text",
+      "dependencies": []
+    }
+  ],
+  "categories": [
+    "chat"
+  ],
+  "tags": [
+    "live",
+    "chatbot",
+    "tts",
+    "vtube-studio"
+  ]
 }

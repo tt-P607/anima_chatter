@@ -1,46 +1,501 @@
-"""sherpa-onnx 语音 Chatter 配置。"""
+"""anima_chatter 直播插件配置——全插件配置字段的**唯一真源**。
+
+所有配置节都定义在模块顶层，供其它模块直接 import 做类型标注，从而避免
+``getattr(cfg, "field", default)`` 这种"第二份默认值"。任何需要读配置的代码
+都应该接收具体的 Section 类型并直接访问字段。
+
+本配置仅用于直播模式 ``vtb_live``。
+
+配置区段（共 6 个）：
+
+============================ ===================================================
+section                       适用模式 / 用途
+============================ ===================================================
+``[plugin]``                  通用 chatter 行为（tick / buffer / 重试 / 挂起开关）
+``[vts]``                     VTube Studio 连接 + 本地音频输出 + Hotkey 映射
+                              （直播表演）
+``[vtb_attention]``           直播弹幕"是否回复"过滤器
+``[audio_drive]``             音频驱动律动（直播表演时让形象跟着声音动）
+``[pipelining]``              直播流水线优化（让 LLM 推理与音频播放并行）
+``[idle_animation]``          直播待机动画频率与幅度
+============================ ===================================================
+"""
 
 from __future__ import annotations
 
-from typing import ClassVar
+import os
+import tempfile
+import tomllib
+from pathlib import Path
+from typing import ClassVar, Self
 
-from src.core.components.base.config import BaseConfig, Field, SectionBase, config_section
+from src.app.plugin_system.base import BaseConfig, Field, SectionBase, config_section
+
+from ._internal_compat import render_plugin_config
+
+__all__ = [
+    "AnimaChatterConfig",
+    "AudioDriveSection",
+    "IdleAnimationSection",
+    "PipeliningSection",
+    "PluginSection",
+    "VTBAttentionSection",
+    "VTSSection",
+]
 
 
-class SherpaOnnxVoiceChatterConfig(BaseConfig):
-    """sherpa-onnx 语音 Chatter 配置。"""
+@config_section("plugin", title="插件设置", tag="plugin")
+class PluginSection(SectionBase):
+    """直播插件基础配置。"""
 
-    config_name: ClassVar[str] = "config"
-    config_description: ClassVar[str] = "sherpa-onnx 语音 Chatter 配置"
+    enabled: bool = Field(default=True, description="是否启用本 chatter")
+    tick_interval: float = Field(
+        default=1.0,
+        description=(
+            "直播模式下的 tick 间隔（秒）。"
+        ),
+        ge=0.05,
+        le=60.0,
+    )
+    allow_message_buffer: bool = Field(
+        default=True,
+        description=(
+            "直播模式下是否允许消息缓冲。"
+        ),
+    )
+    plain_text_retry_limit: int = Field(
+        default=1,
+        description="模型返回纯文本（未调用 say / say_and_perform）时的提醒重试次数",
+        ge=0,
+        le=5,
+    )
+    enable_action_suspend: bool = Field(
+        default=True,
+        description=(
+            "是否启用纯 Action 回合的挂起机制。关闭后，纯 Action 结果会"
+            "像常规工具结果一样继续 follow-up，而不是立即等待用户。"
+        ),
+    )
+    enable_singing: bool = Field(
+        default=True,
+        description=(
+            "是否启用唱歌能力（SingSongAction）。"
+            "关闭后插件会**完全卸载**该能力——不注册 sing_song action、"
+            "不初始化 song_library、prompt 中也不会出现任何关于唱歌的描述，"
+            "模型完全感知不到这个功能存在。"
+            "适合不想让 bot 唱歌、或者还没准备好歌库的场景。"
+        ),
+    )
+    custom_prompt: str = Field(
+        default="",
+        description=(
+            "自定义提示词。启用后会以 ``<custom_instructions>`` 块形式追加到直播 "
+            "system prompt 末尾，用来声明部署独有的行为（口癖、台风、回复策略等）。"
+            "支持多行；可以写 markdown / 标签等任意格式，模型会原样收到。"
+            "留空则不注入。"
+        ),
+    )
+    custom_prompt_enabled: bool = Field(
+        default=True,
+        description="是否在直播 system prompt 中注入自定义提示词。",
+    )
+    model_task: str = Field(
+        default="actor",
+        description="LLM 模型名称（对应 model.toml 中的 task），models 为空时使用",
+    )
+    models: list[str] = Field(
+        default_factory=list,
+        description=(
+            "指定 LLM 模型列表（对应 model.toml 中的 name）。"
+            "非空时覆盖 model_task，多个模型按顺序 fallback"
+        ),
+    )
+    temperature: float = Field(
+        default=0.7,
+        description="模型温度，仅在 models 非空时生效",
+        ge=0.0,
+        le=2.0,
+    )
+    max_tokens: int = Field(
+        default=8000,
+        description="最大输出 token 数，仅在 models 非空时生效",
+        ge=1,
+        le=200000,
+    )
 
-    @config_section("plugin", title="插件设置", tag="plugin")
-    class PluginSection(SectionBase):
-        """插件基础配置。"""
 
-        enabled: bool = Field(default=True, description="是否启用语音 Chatter")
-        tick_interval: float = Field(default=1.0, description="该语音聊天流的 Tick 间隔")
-        allow_message_buffer: bool = Field(default=False, description="是否允许消息缓冲")
-        plain_text_retry_limit: int = Field(default=1, description="模型返回纯文本时的提醒重试次数")
-        enable_action_suspend: bool = Field(
-            default=True,
-            description="是否启用纯 Action 回合的挂起机制。关闭后，纯 Action 结果会像常规工具结果一样继续 follow-up，而不是立即等待用户。",
-        )
+@config_section("vts", title="VTube Studio 接入")
+class VTSSection(SectionBase):
+    """VTube Studio 连接 + 音频输出 + Hotkey 映射（仅 vtb / vtb_live 生效）。
 
-    @config_section("tts", title="TTS 设置", tag="tts")
-    class TTSSection(SectionBase):
-        """TTS 后端配置。"""
+    在 vtb 系模式下集中表达"虚拟形象那一边的所有接入参数"。
+    """
 
-        endpoint: str = Field(
-            default="http://127.0.0.1:8000/router/tts_http_server/api/tts/v1/synthesize",
-            description="TTS HTTP 合成接口地址",
-        )
-        timeout: float = Field(default=30.0, description="TTS HTTP 请求超时时间")
-        max_parallel_segments: int = Field(default=4, description="最大并行合成句子数")
-        empty_audio_retry_count: int = Field(default=1, description="TTS 返回空音频时的重试次数")
-        sentence_split_enabled: bool = Field(default=True, description="是否按句切分并并行合成")
-        mime_type: str = Field(default="audio/wav", description="TTS 音频 MIME 类型")
-        provider: str = Field(default="qwen_tts", description="TTS provider 名称，留空则使用服务端默认 provider")
-        emit_text_on_tts_failure: bool = Field(default=False, description="TTS 失败时是否回退发送文本")
+    # ── 长连接 ─────────────────────────────────
+    enabled: bool = Field(
+        default=False,
+        description="是否启用 VTS（关闭后 vtb 系模式仅播 TTS，不驱动虚拟形象）",
+    )
+    host: str = Field(default="127.0.0.1", description="VTS 主机地址")
+    port: int = Field(default=8001, description="VTS WebSocket 端口")
+    auth_token: str = Field(
+        default="",
+        description=(
+            "VTS 鉴权 token；首次留空，VTS 会弹授权窗，认证后由 pyvts 自动写入 "
+            "data/anima_chatter/vts_token.txt（之后免重复授权）。"
+        ),
+    )
+
+    # ── 音频输出 ────────────────────────────────
+    audio_output_device: str = Field(
+        default="CABLE Input@WASAPI",
+        description=(
+            "vtb / vtb_live 模式下用于本地播放 TTS 的输出设备，"
+            "格式为 '设备名@驱动名'。通常指向 VB-Cable Input，"
+            "使虚拟形象与直播软件能听到同一份音频。"
+        ),
+    )
+    inst_output_device: str = Field(
+        default="",
+        description=(
+            "双轨翻唱时**伴奏**的专用输出设备，格式 '设备名@驱动名' 或纯设备名。"
+            "留空则伴奏走系统默认输出。\n"
+            "用途：人声走上面的 VB-Cable 驱动口型，伴奏单独送到这个设备——"
+            "把它指到一个专门给直播软件采集的设备，就能让伴奏单独进直播流而不经过 "
+            "VB-Cable，避免人声重复采集。\n"
+            "仅 vtb / vtb_live 模式的双轨歌伴奏路使用；单轨歌 / TTS 不受影响。"
+        ),
+    )
+
+    # ── Hotkey 映射 ─────────────────────────────
+    hotkey_map: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "可选：把 intent / emotion 主类型映射到 VTS Hotkey ID。"
+            "详见 docs/configuration.md。留空则不触发热键。"
+        ),
+    )
+
+    # ── 表情文件直激活（不走 hotkey 系统） ──────
+    expression_map: dict[str, dict[str, str]] = Field(
+        default_factory=dict,
+        description=(
+            "可选：把 intent / emotion 主类型映射到 Live2D .exp3.json 表情文件。"
+            "格式 {key: {file, desc}}；详见 docs/configuration.md。"
+        ),
+    )
+
+
+@config_section("vtb_attention", title="VTB 注意力过滤")
+class VTBAttentionSection(SectionBase):
+    """vtb / vtb_live 模式下"是否回复"过滤器。
+
+    权重数值（基础概率 / 各类加成）与 default_chatter 保持同款硬编码，避免
+    插件之间行为漂移。这里只暴露两个总控开关。
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "是否启用 VTB 注意力过滤。关闭后每条未读消息都会直接触发 LLM 回复，"
+            "适合一对一私聊或低流量群聊；多人群聊 / 直播间建议保持启用。"
+        ),
+    )
+    enable_programmatic_controller: bool = Field(
+        default=True,
+        description=(
+            "是否启用 sub-agent 程序化控制器（与 default_chatter 同名设置一致）。"
+            "开启后会先按本地概率规则判断是否直接响应；关闭后始终交由 sub_actor LLM 决策。"
+        ),
+    )
+
+
+@config_section("audio_drive", title="音频驱动律动")
+class AudioDriveSection(SectionBase):
+    """vtb / vtb_live 模式下"音频驱动头部 / 身体律动"配置。
+
+    实时计算 TTS 音频包络（RMS + 变化率），按下面的增益叠加到 SpeechAnimator
+    的输出参数上：声音大时头部微抬，声音突变时身体一震，让程序化动画看起来
+    像跟着语调起伏。所有增益都是经验值，按自己的模型调整即可。
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="是否启用音频驱动律动；关闭后退回固定 sin 波动逻辑",
+    )
+    organic_enabled: bool = Field(
+        default=True,
+        description="说话时头部微动用 value noise 替代 sin，去机械周期感；关闭回退旧 sin",
+    )
+    head_y_gain: float = Field(
+        default=8.0,
+        description="头部前后倾灵敏度（rms × gain → v_head_y 度数）",
+    )
+    head_x_gain: float = Field(
+        default=3.0,
+        description="头部横向摆动幅度（rms × gain × sin → v_head_x 度数）",
+    )
+    body_y_gain: float = Field(
+        default=30.0,
+        description="身体律动灵敏度（velocity × gain → v_body_y 度数）",
+    )
+    # 说话韵律向上半身扩散：把音频能量不仅给口型 / 头部，也衰减注入身体多轴，
+    # 让说话节奏在身体上也能被"看见"。三路默认值保守，避免抢过口型与头部。
+    body_x_gain: float = Field(
+        default=6.0,
+        description="音量 → 身体横向轻摆灵敏度（rms × gain → v_body_x 度数）",
+    )
+    body_z_gain: float = Field(
+        default=8.0,
+        description="velocity → 身体节拍侧向灵敏度（velocity × gain → v_body_z 度数）",
+    )
+    body_bounce_k: float = Field(
+        default=1.2,
+        description="音量 → 身体上下弹跳系数（rms × k → v_body_y 附加弹跳）",
+    )
+    neutral_attenuation: float = Field(
+        default=0.5,
+        description=(
+            "emotion=neutral 时整体增益乘数。0.5 表示平静叙述时律动减半，"
+            "避免显得乱抖；调到 0.0 等于平静时完全不动。"
+        ),
+    )
+    loudness_target_dbfs: float = Field(
+        default=-14.0,
+        description=(
+            "全局响度目标（dBFS）。AudioPlayer 在播放任何音频前，会按 RMS 把"
+            "响度统一拉到这个值——不同 TTS 生成结果和翻唱歌曲音量再不齐也会被"
+            "拉齐，直播间观众听感一致。"
+            "默认 -14：比直播常用的 -20/-16 更响，确保送进 VB-Cable 的电平"
+            "足够高、VTS 麦克风口型能把嘴张开。觉得太吵可回调到 -16 ~ -20。"
+            "设为 0 关闭归一化，按原音量播放。"
+        ),
+    )
+
+
+@config_section("pipelining", title="vtb_live 流水线优化")
+class PipeliningSection(SectionBase):
+    """直播回复轮次的音频容量上限和歌曲尾段准备窗口。"""
+
+    song_prepare_lead_seconds: float = Field(
+        default=25.0,
+        ge=0.0,
+        le=600.0,
+        description=(
+            "歌曲实际起播后，距预计结束此秒数时允许准备下一回复轮。"
+        ),
+    )
+    max_backlog_seconds: float = Field(
+        default=60.0,
+        ge=1.0,
+        le=86400.0,
+        description=(
+            "播放队列最大积压秒数（背压上限）。队列剩余播放时长超过此值时，"
+            "新播放请求被拒排并把背压信号反馈给模型，让输出量自然收敛——"
+            "高压弹幕下队列不再无限增长。设为 86400 等价于关闭背压。"
+        ),
+    )
+
+
+@config_section("idle_animation", title="待机动画频率 / 幅度")
+class IdleAnimationSection(SectionBase):
+    """vtb / vtb_live 模式下"待机自动化"动画的频率与幅度。
+
+    AutoAnimator 负责眨眼 / 呼吸 / 眼神扫视 / 被动摆动 / 宏观大动作。默认值
+    已经比较激进——让 VTB 待机时看起来"活"一些。动得太狂就调小，呆就调大。
+    """
+
+    # 眨眼间隔（秒）。真人 2-4 秒一次，1.8-4.0 让 VTB 更显灵动。
+    blink_min_interval: float = Field(default=1.8, description="眨眼最小间隔（秒）")
+    blink_max_interval: float = Field(default=4.0, description="眨眼最大间隔（秒）")
+
+    organic_enabled: bool = Field(
+        default=True,
+        description="待机头身微动用 value noise 替代 sin；关闭回退旧 sin 行为",
+    )
+
+    # 呼吸频率（Hz）+ 振幅。0.28Hz ≈ 17 次/分，正常人呼吸节奏。
+    breath_freq: float = Field(default=0.28, description="呼吸频率 Hz")
+    breath_amplitude: float = Field(default=0.9, description="呼吸 head_z 振幅（度）")
+    breath_body_amplitude: float = Field(
+        default=1.2,
+        description="呼吸带动身体上下起伏振幅（v_body_y 度数），0 关闭",
+    )
+
+    # 眼神扫视：真人微眼动 0.2-0.6 秒/次，0.5-1.8 让眼神持续微动不显呆。
+    saccade_min_interval: float = Field(default=0.5, description="扫视最小间隔（秒）")
+    saccade_max_interval: float = Field(default=1.8, description="扫视最大间隔（秒）")
+    saccade_big_probability: float = Field(
+        default=0.05,
+        description="大幅扫视概率（读弹幕式的一瞥，其余为小幅微动+回中）；0~1",
+    )
+    saccade_small_amplitude_x: float = Field(
+        default=0.10, description="小扫视水平幅度（0~1），扫视后自动回中看镜头"
+    )
+    saccade_small_amplitude_y: float = Field(
+        default=0.08, description="小扫视垂直幅度（0~1），扫视后自动回中看镜头"
+    )
+    saccade_big_amplitude_x: float = Field(
+        default=0.35, description="大扫视水平幅度（0~1），一瞥后回中"
+    )
+    saccade_big_amplitude_y: float = Field(
+        default=0.15, description="大扫视垂直幅度（0~1），上下瞟收窄保持看镜头感"
+    )
+
+    head_micro_scale: float = Field(
+        default=1.5, description="头部微动幅度倍率，1.0 为原版基准"
+    )
+
+    passive_sway_min_interval: float = Field(
+        default=8.0, description="被动慢摆最小间隔（秒）"
+    )
+    passive_sway_max_interval: float = Field(
+        default=25.0, description="被动慢摆最大间隔（秒）"
+    )
+
+    # 宏观动作（重心斜 / 好奇歪头 / 害羞回避等）触发频率（秒）。
+    macro_min_interval: float = Field(default=6.0, description="宏观动作最小间隔（秒）")
+    macro_max_interval: float = Field(
+        default=15.0, description="宏观动作最大间隔（秒）"
+    )
+
+    motion_speed_scale: float = Field(
+        default=2.0, description="宏观动作执行速度倍率（>1 加快，<1 放慢）"
+    )
+
+    macro_debug_loop: bool = Field(
+        default=False,
+        description=(
+            "宏观动作调试轮询：开启后持续循环播放所有宏观动作，每个间隔 2 秒，"
+            "用于逐个检查动作幅度是否合适。默认关闭。"
+        ),
+    )
+
+    # ── 身体与上半身灵动度 ────────────────────────────
+    # 头部 → 身体耦合：用二阶弹簧阻尼让身体作为头部的"带惯性从动体"，转头时
+    # 胸腔 / 腰部同向但滞后跟随，侧歪时反向重心代偿，消除"头转身体不转"的假人感。
+    body_follow_head_enabled: bool = Field(
+        default=True,
+        description="身体跟随头部耦合总开关（v_body_x / v_body_z 随头部二阶波动）",
+    )
+    body_follow_head_f: float = Field(
+        default=1.6, description="身体跟随头部的二阶系统固有频率（Hz），越大跟随越快"
+    )
+    body_follow_head_z: float = Field(
+        default=0.75,
+        description="身体跟随头部的阻尼比；1.0 临界无过冲，<1.0 有轻微回弹",
+    )
+    body_follow_head_w_rx: float = Field(
+        default=0.4, description="水平跟随权重：头转 30° 时身体跟转约 w_rx×30°"
+    )
+    body_follow_head_w_rz: float = Field(
+        default=0.3, description="侧倾跟随权重：头侧歪时身体侧向跟随比例"
+    )
+    body_follow_head_w_comp: float = Field(
+        default=0.08,
+        description="重心代偿权重：头部横向转时身体反向微补偿（重心侧移感）",
+    )
+
+    # ── 身体常驻律动 ──────────────────────────────
+    # 真人站立时身体绝不静止：横向重心、纵向沉稳、侧向肩腰总在轻微但持续地摇动。
+    # 用 value noise 三轴独立生成常驻身体摇摆，让待机不再"钉在原地"，逼近
+    # Neuro-sama 那种"始终在活"的质感。幅度默认给到能明显感知但不过度。
+    body_idle_enabled: bool = Field(
+        default=True,
+        description="待机身体常驻律动总开关（关闭后退回仅有呼吸的可察觉极弱摆动）",
+    )
+    body_idle_scale: float = Field(
+        default=1.0, description="身体常驻律动总幅度倍率；调大更明显，调小更安静"
+    )
+    body_idle_x_amp: float = Field(
+        default=4.5, description="横向重心律动幅度（v_body_x 度），左右轻微晃重心"
+    )
+    body_idle_y_amp: float = Field(
+        default=2.5, description="上下沉稳起伏幅度（v_body_y 度）"
+    )
+    body_idle_z_amp: float = Field(
+        default=3.5, description="侧向肩腰律动幅度（v_body_z 度）"
+    )
+
+    # 呼吸相位差：真实呼吸是胸腔扩张伴随耸肩、呼气肩沉、肩滞后约 0.15s。
+    # 把呼吸从"整体上下平移"升级为"胸腔前后仰 + 肩膀滞后起伏"的层次感。
+    breath_shoulder_enabled: bool = Field(
+        default=True, description="呼吸肩相位差开关（胸腔与肩膀不同相起伏）"
+    )
+    breath_shoulder_amplitude: float = Field(
+        default=0.9, description="呼吸时肩膀起伏幅度（v_body_z 度数），0 关闭"
+    )
+    breath_shoulder_lag: float = Field(
+        default=0.5, description="肩膀相对胸腔的滞后（弧度，约 π/6 ≈ 0.52）"
+    )
+
+
+class AnimaChatterConfig(BaseConfig):
+    """anima_chatter 插件配置。"""
+
+    name: ClassVar[str] = "config"
+    description: ClassVar[str] = "anima_chatter 直播、VTube Studio 与歌曲排播配置"
 
     plugin: PluginSection = Field(default_factory=PluginSection)
-    tts: TTSSection = Field(default_factory=TTSSection)
+    vts: VTSSection = Field(default_factory=VTSSection)
+    vtb_attention: VTBAttentionSection = Field(default_factory=VTBAttentionSection)
+    audio_drive: AudioDriveSection = Field(default_factory=AudioDriveSection)
+    pipelining: PipeliningSection = Field(default_factory=PipeliningSection)
+    idle_animation: IdleAnimationSection = Field(default_factory=IdleAnimationSection)
+
+    @classmethod
+    def load(cls, path: str | Path, *, auto_update: bool = False) -> Self:
+        """在签名同步之前备份旧模式配置并保留直播提示词作用域。
+
+        Args:
+            path: TOML 配置文件路径。
+            auto_update: 是否将迁移结果和模型签名写回配置。
+
+        Returns:
+            已校验的直播配置实例。
+        """
+
+        config_path = Path(path)
+        if not config_path.exists():
+            return super().load(config_path, auto_update=auto_update)
+        original_bytes = config_path.read_bytes()
+        raw_config = tomllib.loads(original_bytes.decode("utf-8"))
+        plugin_config = raw_config.get("plugin")
+        if not isinstance(plugin_config, dict) or "custom_prompt_modes" not in plugin_config:
+            return super().load(config_path, auto_update=auto_update)
+
+        legacy_modes = plugin_config.pop("custom_prompt_modes")
+        if not isinstance(legacy_modes, list):
+            raise TypeError("custom_prompt_modes 必须是字符串列表")
+        plugin_config.setdefault(
+            "custom_prompt_enabled",
+            "vtb_live" in {str(mode).strip().lower() for mode in legacy_modes},
+        )
+        rendered = render_plugin_config(cls, raw_config)
+        migrated = cls.from_dict(tomllib.loads(rendered))
+        if not auto_update:
+            return migrated
+
+        backup_path = config_path.with_name(f"{config_path.name}.anima_voice.bak")
+        if backup_path.exists():
+            if backup_path.read_bytes() != original_bytes:
+                raise FileExistsError("旧配置备份已存在且内容不同：config.toml.anima_voice.bak")
+        else:
+            with backup_path.open("xb") as backup_file:
+                backup_file.write(original_bytes)
+
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="\n", dir=config_path.parent,
+                prefix=f".{config_path.name}.", suffix=".tmp", delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(rendered)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            os.replace(temporary_path, config_path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+        return migrated

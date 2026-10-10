@@ -1,305 +1,324 @@
-"""sherpa-onnx ASR 实时语音通话专用 Chatter。"""
+"""anima_chatter 插件装配与生命周期。
+
+职责边界：本文件**只**负责资源装配（prompt 注册 + 音频 / VTS / 歌库 / TTS 能力
+初始化）与组件清单，不含任何对话逻辑——那些在 [`chatter/`](chatter/__init__.py:1)、
+[`speech/`](speech/__init__.py:1)、[`vts/`](vts/__init__.py:1) 三个
+子包里。
+"""
 
 from __future__ import annotations
 
-import asyncio
-from typing import Annotated, Any, AsyncGenerator
+import os
+from pathlib import Path
+from typing import Any, ClassVar
 
 from src.app.plugin_system.api.log_api import get_logger
-from src.core.components.base import BaseChatter, BasePlugin, Failure, Success, Wait, WaitResumeEvent
-from src.core.components.base.action import BaseAction
-from src.core.components.loader import register_plugin
-from src.core.components.types import ChatType
-from src.core.config import get_core_config
-from src.core.models.stream import ChatStream
-from src.core.prompt import get_prompt_manager
-from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry
-from src.kernel.llm.payload.tooling import LLMUsable
+from src.app.plugin_system.api.service_api import get_service
+from src.app.plugin_system.base import BasePlugin, register_plugin
 
-from .config import SherpaOnnxVoiceChatterConfig
-from .markers import parse_speech_segments
-from .prompt_builder import SYSTEM_PROMPT, USER_PROMPT, VoiceChatterPromptBuilder
-from .runner import run_voice_conversation
-from .tts import build_tts_backend, synthesize_segments
+from ._internal_compat import (
+    get_personality,
+    get_prompt_manager,
+    prompt_min_len,
+    prompt_optional,
+    prompt_wrap,
+)
+from .actions import (
+    AnimaPassAndWaitAction,
+    SayAndPerformAction,
+    SingSongAction,
+)
+from .audio import AudioPlayer
+from .chatter import AnimaChatter
+from .chatter.ndfc_handlers import (
+    AnimaBuildHistoryTextHandler,
+    AnimaCreateRequestHandler,
+    AnimaFetchUnreadsHandler,
+    AnimaFormatUnreadLineHandler,
+    AnimaInjectUnreadPayloadHandler,
+    AnimaInjectUsablesHandler,
+    AnimaPreprocessHandler,
+)
+from .config import AnimaChatterConfig
+from .prompts import (
+    LIVE_USER_PROMPT_PROFILE,
+    SYSTEM_PROMPT,
+    USER_PROMPT_TEMPLATE,
+)
+from .prompts.sub_agent import SUB_AGENT_PROMPT_LIVE
+from .runtime import pipeline_state, sung_history
+from .song_library import SongLibrary
+from .speech.playback import activate_playback, close_playback
+from .vts import VTSPerformer
 
-
-logger = get_logger("voice_chatter")
-
-_PASS_AND_WAIT = "action-pass_and_wait"
-
-
-class SayAction(BaseAction):
-    """把要说的话发送到 TTS 后端并交给适配器播放。"""
-
-    action_name = "say"
-    action_description = (
-        "在实时语音通话中说出一段话。content 会进入 TTS 后端并由适配器播放。"
-        "支持 [wait:1] 控制下一段播放前等待 1 秒，支持 [emotion:happy]...[/emotion] 标记情绪。"
-        "[wait] 只影响语音片段播放间隔，不会让聊天流等待；说完等待用户时请另外调用 pass_and_wait。"
-    )
-    chatter_allow = ["voice_chatter"]
-    associated_platforms = ["local_asr"]
-    dependencies = ["asr_adapter:adapter:asr_adapter"]
-
-    async def execute(
-        self,
-        content: Annotated[str, "要通过 TTS 说出的内容，可包含 [wait:n] 和 [emotion:name] 标记"],
-    ) -> tuple[bool, str]:
-        """执行语音播放动作。"""
-
-        plugin_config = getattr(self.plugin, "config", None)
-        split_enabled = True
-        max_parallel = 4
-        empty_audio_retry_count = 1
-        if isinstance(plugin_config, SherpaOnnxVoiceChatterConfig):
-            split_enabled = bool(plugin_config.tts.sentence_split_enabled)
-            max_parallel = int(plugin_config.tts.max_parallel_segments)
-            empty_audio_retry_count = int(plugin_config.tts.empty_audio_retry_count)
-
-        segments = parse_speech_segments(content or "", split_sentences=split_enabled)
-        if not segments:
-            return True, "没有可播放的语音内容"
-
-        backend = build_tts_backend(plugin_config, logger)
-        artifacts = await synthesize_segments(
-            backend=backend,
-            stream_id=self.chat_stream.stream_id,
-            segments=segments,
-            max_parallel=max_parallel,
-            empty_audio_retry_count=empty_audio_retry_count,
-        )
-
-        success_count = 0
-        failed_reasons: list[str] = []
-        for segment, artifact in zip(segments, artifacts, strict=False):
-            error = artifact.metadata.get("error") if isinstance(artifact.metadata, dict) else None
-            if error:
-                failed_reasons.append(str(error))
-                logger.error(f"TTS 合成失败，跳过播放: {segment.text} ({error})")
-                continue
-            if not artifact.audio:
-                failed_reasons.append("TTS 后端未返回音频数据")
-                logger.error(f"TTS 后端未返回音频数据，跳过播放: {segment.text}")
-                continue
-            if segment.wait_before > 0:
-                await asyncio.sleep(segment.wait_before)
-            if await backend.emit(artifact, self.chat_stream):
-                success_count += 1
-
-        if success_count == 0 and failed_reasons:
-            return False, f"TTS 合成失败: {failed_reasons[0]}"
-        return True, f"已提交 {success_count}/{len(segments)} 段语音到适配器播放"
+logger = get_logger("anima_chatter.plugin")
 
 
-class VoicePassAndWaitAction(BaseAction):
-    """等待用户继续语音输入或等待指定秒数后主动恢复。"""
-
-    action_name = "pass_and_wait"
-    action_description = (
-        "为实时语音通话登记等待点。说完话后调用它等待用户继续说话；"
-        "seconds 为空时等待新语音输入，传入秒数时到时主动恢复。"
-    )
-    chatter_allow = ["voice_chatter"]
-    associated_platforms = ["local_asr"]
-
-    async def execute(
-        self,
-        seconds: Annotated[float | None, "等待秒数；为空则等待新的用户语音输入"] = None,
-    ) -> tuple[bool, str]:
-        """登记等待状态。"""
-
-        if seconds is None:
-            return True, "已登记等待新的用户语音输入"
-        return True, f"已登记等待 {seconds} 秒后继续语音通话"
+__all__ = ["AnimaChatterPlugin"]
 
 
-class SherpaOnnxVoiceChatter(BaseChatter):
-    """sherpa-onnx ASR 实时语音通话专用 Chatter。"""
+_TTS_SERVICE = "tts_voice_plugin-neo:service:speech"
 
-    chatter_name = "voice_chatter"
-    chatter_description = "sherpa-onnx ASR 实时语音通话专用 Chatter"
-    associated_platforms = ["local_asr"]
-    chat_type = ChatType.PRIVATE
-    dependencies = ["asr_adapter:adapter:asr_adapter"]
-    stream_tick_interval = 0.1
-    allow_message_buffer = False
-
-    def _get_plugin_config(self) -> SherpaOnnxVoiceChatterConfig | None:
-        """返回插件配置。"""
-
-        config = getattr(self.plugin, "config", None)
-        return config if isinstance(config, SherpaOnnxVoiceChatterConfig) else None
-
-    def apply_stream_runtime_options(self, chat_stream: Any) -> None:
-        """把语音通话的流运行时配置写入当前 stream。"""
-
-        plugin_config = self._get_plugin_config()
-        if plugin_config is not None:
-            self.stream_tick_interval = float(plugin_config.plugin.tick_interval)
-            self.allow_message_buffer = bool(plugin_config.plugin.allow_message_buffer)
-        super().apply_stream_runtime_options(chat_stream)
-
-    async def _build_system_prompt(self, chat_stream: ChatStream) -> str:
-        """构建语音通话系统提示词。"""
-
-        return await VoiceChatterPromptBuilder.build_system_prompt(
-            self._get_plugin_config(),
-            chat_stream,
-        )
-
-    def _build_history_text(self, chat_stream: ChatStream) -> str:
-        """构建历史消息文本。"""
-
-        return VoiceChatterPromptBuilder.build_history_text(chat_stream, self.format_message_line)
-
-    async def _build_user_prompt(
-        self,
-        chat_stream: ChatStream,
-        history_text: str,
-        unread_lines: str,
-        extra: str = "",
-    ) -> str:
-        """构建语音通话用户提示词。"""
-
-        return await VoiceChatterPromptBuilder.build_user_prompt(
-            chat_stream,
-            history_text,
-            unread_lines,
-            extra,
-        )
-
-    @staticmethod
-    def _build_negative_behaviors_extra() -> str:
-        """构建行为提醒。"""
-
-        return VoiceChatterPromptBuilder.build_negative_behaviors_extra()
-
-    def _is_action_suspend_enabled(self) -> bool:
-        """读取纯 Action 回合的挂起开关。"""
-
-        plugin_config = self._get_plugin_config()
-        return plugin_config is None or bool(plugin_config.plugin.enable_action_suspend)
-
-    @staticmethod
-    def _append_user_payload(response: Any, text: str) -> None:
-        """向当前 LLM 上下文追加 USER 文本。"""
-
-        response.add_payload(LLMPayload(ROLE.USER, Text(text)))
-
-    async def inject_usables(self, request: Any) -> ToolRegistry:
-        """注入语音 Chatter 可用工具，排除 stop/send_text/sub-agent 管理工具。"""
-
-        usables = await self.get_llm_usables()
-        usables = await self.modify_llm_usables(usables)
-        blocked_names = {
-            "action-send_text",
-            "action-stop_conversation",
-            "create_agent",
-            "get_agent",
-            "kill_agent",
-        }
-
-        registry = ToolRegistry()
-        for usable in usables:
-            schema = usable.to_schema()
-            name = str(schema.get("function", {}).get("name", ""))
-            if name in blocked_names:
-                continue
-            registry.register(usable)
-
-        if registry.get_all():
-            request.add_payload(LLMPayload(ROLE.TOOL, registry.get_all()))  # type: ignore[arg-type]
-        return registry
-
-    async def execute(self) -> AsyncGenerator[Wait | Success | Failure, WaitResumeEvent | None]:
-        """执行语音 Chatter 主循环。"""
-
-        from src.core.managers.stream_manager import get_stream_manager
-
-        stream_manager = get_stream_manager()
-        chat_stream = await stream_manager.activate_stream(self.stream_id)
-        if chat_stream is None:
-            logger.error(f"无法激活聊天流: {self.stream_id}")
-            yield Failure("无法激活聊天流")
-            return
-
-        self.apply_stream_runtime_options(chat_stream)
-        plugin_config = self._get_plugin_config()
-        retry_limit = 1 if plugin_config is None else int(plugin_config.plugin.plain_text_retry_limit)
-
-        runner = run_voice_conversation(
-            chatter=self,
-            chat_stream=chat_stream,
-            logger=logger,
-            pass_call_name=_PASS_AND_WAIT,
-            plain_text_retry_limit=max(0, retry_limit),
-            enable_action_suspend=self._is_action_suspend_enabled(),
-        )
-        resume_event: WaitResumeEvent | None = None
-        while True:
-            try:
-                result = await runner.asend(resume_event)
-            except StopAsyncIteration:
-                return
-            resume_event = yield result
+# 歌库目录（相对项目根）。放在全局 data 目录下，避免污染插件代码目录。
+_SONGS_RELATIVE_PATH = ("data", "anima_chatter", "songs")
 
 
 @register_plugin
-class SherpaOnnxVoiceChatterPlugin(BasePlugin):
-    """sherpa-onnx ASR 实时语音 Chatter 插件。"""
+class AnimaChatterPlugin(BasePlugin):
+    """装配直播聊天器、表演动作与本地直播资源。"""
 
-    plugin_name = "voice_chatter"
-    plugin_version = "1.0.0"
-    plugin_description = "sherpa-onnx ASR 实时语音通话专用 Chatter"
-    configs = [SherpaOnnxVoiceChatterConfig]
-    dependent_components = ["asr_adapter:adapter:asr_adapter"]
+    plugin_name = "anima_chatter"
+    configs: ClassVar[list[type]] = [AnimaChatterConfig]
+    dependent_components: ClassVar[list[str]] = []
+
+    # 直播运行时资源，由 on_plugin_loaded 按配置初始化。
+    audio_player: AudioPlayer | None = None
+    vts_performer: VTSPerformer | None = None
+    song_library: SongLibrary | None = None
+    # TTS Provider 能力元数据缓存。为 None 表示未获取到（TTS 服务未启动 / 老
+    # provider 不支持），Action 的 to_schema 会懒加载兜底。
+    tts_capabilities: Any | None = None
+
+    # ── 生命周期 ────────────────────────────────────────
 
     async def on_plugin_loaded(self) -> None:
-        """注册语音 Chatter 提示词模板。"""
+        """注册提示词并初始化流水线、音频、VTS、歌库与 TTS 能力。"""
 
-        from src.core.prompt import min_len, optional, wrap
+        self._register_prompts()
 
-        personality = get_core_config().personality
-        get_prompt_manager().get_or_create(
-            name="voice_chatter_system_prompt",
-            template=SYSTEM_PROMPT,
-            policies={
-                "nickname": optional(personality.nickname),
-                "alias_names": optional("、".join(personality.alias_names)),
-                "personality_core": optional(personality.personality_core),
-                "personality_side": optional(personality.personality_side),
-                "identity": optional(personality.identity),
-                "reply_style": optional(personality.reply_style),
-                "background_story": optional(personality.background_story)
-                .then(min_len(10))
-                .then(wrap("# 背景故事\n", "\n")),
-                "safety_guidelines": optional("\n".join(personality.safety_guidelines)),
-                "negative_behaviors": optional("\n".join(personality.negative_behaviors)),
-                "voice_guide": optional(""),
-            },
-        )
-        get_prompt_manager().get_or_create(
-            name="voice_chatter_user_prompt",
-            template=USER_PROMPT,
-            policies={
-                "stream_name": optional("未知通话"),
-                "current_time": optional("未知时间"),
-                "platform": optional("local_asr"),
-                "history": optional("").then(min_len(2)).then(wrap("# 历史通话内容\n", "\n")),
-                "unreads": optional("").then(min_len(2)).then(wrap("# 新识别到的语音\n", "\n")),
-                "extra": optional("").then(min_len(2)).then(wrap("# 额外提醒\n", "\n")),
-            },
-        )
+        config = self.config
+        if not isinstance(config, AnimaChatterConfig):
+            logger.warning("插件配置加载异常，直播将无法播放音频或驱动 VTS")
+            return
+
+        pipeline_state.configure(config.pipelining)
+        activate_playback()
+        await self._init_audio_resources(config)
+
+        if config.plugin.enable_singing:
+            self._init_song_library()
+        else:
+            logger.info(
+                "唱歌能力已通过 plugin.enable_singing=false 关闭，跳过歌库初始化"
+            )
+
+        self._init_tts_capabilities()
+
+    async def on_plugin_unloaded(self) -> None:
+        """释放本插件的直播流水线、VTS、音频与歌库资源。"""
+
+        await close_playback()
+        await pipeline_state.clear_all()
+        await sung_history.clear()
+
+        if self.vts_performer is not None:
+            try:
+                await self.vts_performer.shutdown()
+            except Exception as exc:  # noqa: BLE001 - 卸载路径不能因单点失败中断
+                logger.warning(f"关闭 VTSPerformer 失败: {exc}")
+
+        self.vts_performer = None
+        self.audio_player = None
+        self.song_library = None
+        self.tts_capabilities = None
 
     def get_components(self) -> list[type]:
-        """返回插件组件。"""
+        """按总开关与唱歌开关返回要注册的组件。
 
-        return [SherpaOnnxVoiceChatter, SayAction, VoicePassAndWaitAction]
+        Returns:
+            组件类列表；插件被禁用时返回空列表。
+        """
 
+        config = self.config if isinstance(self.config, AnimaChatterConfig) else None
+        if config is not None and not config.plugin.enabled:
+            return []
 
-__all__ = [
-    "SayAction",
-    "SherpaOnnxVoiceChatter",
-    "SherpaOnnxVoiceChatterPlugin",
-    "VoicePassAndWaitAction",
-]
+        components: list[type] = [
+            AnimaChatter,
+            SayAndPerformAction,
+            AnimaPassAndWaitAction,
+            # NDFC 事件 seam 转发 handler：把 neo_default_chatter:* 事件转发到
+            # AnimaChatter 的 adapter 方法（prompt / 注意力 / 工具 / 未读等）。
+            AnimaPreprocessHandler,
+            AnimaInjectUnreadPayloadHandler,
+            AnimaInjectUsablesHandler,
+            AnimaCreateRequestHandler,
+            AnimaFetchUnreadsHandler,
+            AnimaFormatUnreadLineHandler,
+            AnimaBuildHistoryTextHandler,
+        ]
+        if config is None or config.plugin.enable_singing:
+            components.append(SingSongAction)
+        return components
+
+    def get_active_performer(self) -> VTSPerformer | None:
+        """返回当前激活的 VTS 表演器。
+
+        Action 层统一通过本方法获取表演器。
+
+        Returns:
+            表演器实例；未启用 VTS 时返回 ``None``。
+        """
+
+        return self.vts_performer
+
+    # ── Prompt 注册 ─────────────────────────────────────
+
+    def _register_prompts(self) -> None:
+        """注册本插件在 prompt manager 上的全部模板。
+
+        注册直播 system、user 与弹幕注意力判定三个模板。
+        """
+
+        personality = get_personality()
+        prompt_manager = get_prompt_manager()
+
+        prompt_manager.get_or_create(
+            name="anima_chatter_system_prompt",
+            template=SYSTEM_PROMPT,
+            policies={
+                "nickname": prompt_optional(personality.nickname),
+                "alias_names": prompt_optional("、".join(personality.alias_names)),
+                "personality_core": prompt_optional(personality.personality_core),
+                "personality_side": prompt_optional(personality.personality_side),
+                "identity": prompt_optional(personality.identity),
+                "reply_style": prompt_optional(personality.reply_style),
+                "background_story": prompt_optional(personality.background_story)
+                .then(prompt_min_len(10))
+                .then(prompt_wrap("# 背景故事\n", "\n")),
+                "safety_guidelines": prompt_optional(
+                    "\n".join(personality.safety_guidelines)
+                ),
+                "scene_guide": prompt_optional(""),
+            },
+        )
+
+        profile = LIVE_USER_PROMPT_PROFILE
+        prompt_manager.get_or_create(
+            name=profile["template_name"],
+            template=USER_PROMPT_TEMPLATE,
+            policies={
+                "stream_name": prompt_optional(profile["stream_name_default"]),
+                "current_time": prompt_optional("未知时间"),
+                "platform": prompt_optional(""),
+                "history": prompt_optional("")
+                .then(prompt_min_len(2))
+                .then(prompt_wrap(profile["history_wrap_prefix"], "\n")),
+                "unreads": prompt_optional("")
+                .then(prompt_min_len(2))
+                .then(prompt_wrap(profile["unreads_wrap_prefix"], "\n")),
+                "extra": prompt_optional("")
+                .then(prompt_min_len(2))
+                .then(prompt_wrap("# 额外提醒\n", "\n")),
+                "mode_header": prompt_optional(profile["mode_header"]),
+                "section_tail": prompt_optional(profile["section_tail"]),
+            },
+        )
+
+        sub_agent_policies = {
+            "nickname": prompt_optional(personality.nickname),
+            "bot_id": prompt_optional(""),
+            "bot_id_section": prompt_optional(""),
+            "personality_core_section": prompt_optional(
+                personality.personality_core
+            ).then(prompt_wrap("它的核心人格是：", "\n")),
+            "personality_side_section": prompt_optional(
+                personality.personality_side
+            ).then(prompt_wrap("它的人格侧面是：", "\n")),
+        }
+        prompt_manager.get_or_create(
+            name="anima_chatter_sub_agent_prompt_vtb_live",
+            template=SUB_AGENT_PROMPT_LIVE,
+            policies=sub_agent_policies,
+        )
+
+    # ── 资源初始化 ──────────────────────────────────────
+
+    async def _init_audio_resources(self, config: AnimaChatterConfig) -> None:
+        """初始化本地音频播放器与 VTube Studio 表演器。
+
+        Args:
+            config: 插件配置。
+        """
+
+        loudness_target = config.audio_drive.loudness_target_dbfs
+        # 0 表示关闭响度归一化。
+        loudness_arg = None if loudness_target == 0.0 else loudness_target
+
+        self.audio_player = AudioPlayer(
+            output_device=config.vts.audio_output_device,
+            loudness_target_dbfs=loudness_arg,
+            inst_output_device=config.vts.inst_output_device,
+        )
+        if loudness_arg is None:
+            logger.info("响度归一化已关闭（按原音量播放所有音频）")
+        else:
+            logger.info(
+                f"响度归一化已启用：目标 {loudness_arg:.1f} dBFS"
+                "（TTS 说话 / 唱歌 / 其它播放统一拉齐）"
+            )
+
+        if not config.vts.enabled:
+            logger.info("配置中 vts.enabled=false，跳过 VTS 初始化（vtb 模式仅播音频）")
+            return
+
+        self.vts_performer = VTSPerformer(
+            plugin_config=config, audio_player=self.audio_player
+        )
+        if await self.vts_performer.initialize():
+            logger.info("VTSPerformer 已就绪，vtb 模式回复将驱动 VTube Studio")
+        else:
+            logger.warning("VTSPerformer 未连上 VTS，vtb 模式将仅播放 TTS 音频")
+
+    def _init_song_library(self) -> None:
+        """初始化直播清唱歌库。"""
+
+        songs_dir = Path(os.getcwd()).resolve().joinpath(*_SONGS_RELATIVE_PATH)
+        try:
+            self.song_library = SongLibrary(songs_dir)
+        except OSError as exc:
+            logger.warning(f"清唱歌库初始化失败: {exc}")
+            self.song_library = None
+            return
+
+        song_count = len(self.song_library.get_song_names())
+        if song_count > 0:
+            logger.info(
+                f"清唱歌库已加载 {song_count} 首：{self.song_library.songs_dir}"
+            )
+        else:
+            logger.info(
+                f"清唱歌库为空（路径：{self.song_library.songs_dir}），"
+                "把清唱文件放进去后重启即可被 sing_song 识别"
+            )
+
+    def _init_tts_capabilities(self) -> None:
+        """通过进程内 service API 获取 TTS Provider 的能力元数据并缓存。
+
+        不走 HTTP 回环查询——本方法在 ``on_plugin_loaded`` 中被调用时 HTTP 服务
+        尚未绑定端口，回环查询必然失败。
+
+        时序容忍：调用时 provider 可能尚未注册（TTS 插件还没加载），此时
+        ``tts_capabilities`` 保持 ``None``，Action 的 ``to_schema`` 会懒加载兜底。
+        """
+
+        service = get_service(_TTS_SERVICE)
+        if service is None:
+            logger.debug("TTS speech service 未注册，跳过 capabilities 查询")
+            return
+
+        get_capabilities = getattr(service, "get_capabilities", None)
+        caps = get_capabilities() if callable(get_capabilities) else None
+
+        if caps is None:
+            logger.info(
+                "TTS speech service 未提供 capabilities，"
+                "Action schema 将使用默认参数描述"
+            )
+            return
+
+        self.tts_capabilities = caps
+        logger.info(
+            "已从 TTS speech service 获取能力元数据，"
+            "Action schema 将动态注入参数说明"
+        )

@@ -1,1 +1,1 @@
-"""sherpa-onnx ASR 实时语音通话 Chatter 插件。"""
+"""anima_chatter：直播弹幕、语音表演、VTube Studio 与歌曲排播插件。"""
