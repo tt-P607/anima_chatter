@@ -1,4 +1,4 @@
-"""vtb / vtb_live 模式的"是否回复"注意力过滤。
+"""直播弹幕的"是否回复"注意力过滤。
 
 两级过滤：
 
@@ -7,7 +7,6 @@
    插件之间行为漂移。
 2. **sub_actor LLM 决策**：概率门没放行时，用小模型判断这批消息值不值得回。
 
-voice 模式与私聊场景直通响应，不做过滤。
 """
 
 from __future__ import annotations
@@ -21,8 +20,7 @@ from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.types import ChatStream, LLMPayload, Message, ROLE, Text
 
 from .._internal_compat import get_personality, get_prompt_manager
-from ..modes import ChatterMode
-from ..prompts.sub_agent import SUB_AGENT_PROMPT_LIVE, SUB_AGENT_PROMPT_VTB
+from ..prompts.sub_agent import SUB_AGENT_PROMPT_LIVE
 
 if TYPE_CHECKING:
     from ..config import VTBAttentionSection
@@ -62,6 +60,10 @@ _NEXT_TICK_REPLY_BONUS = 0.5
 
 # 加成值挂在 stream context 上的属性名。
 _NEXT_TICK_BONUS_ATTR = "_anima_chatter_next_tick_bonus"
+
+# 身份名缓存：缓存键 (bot_nickname, bot_persona_id) → (主名字, 别名列表)。
+# 高频 tick 下避免每条消息重复查询人格服务。
+_IDENTITY_CACHE: dict[tuple[str, Any], tuple[str, list[str]]] = {}
 
 
 def mark_reply_success(chat_stream: ChatStream) -> None:
@@ -125,7 +127,7 @@ def _messages_contain_any(messages: list[Message], names: list[str]) -> bool:
         命中任意一个时返回 ``True``。
     """
 
-    normalized = [name.strip().lower() for name in names if name.strip()]
+    normalized = tuple(name.strip().lower() for name in names if name.strip())
     if not normalized:
         return False
     return any(
@@ -137,22 +139,40 @@ def _messages_contain_any(messages: list[Message], names: list[str]) -> bool:
 def _identity_names(chat_stream: ChatStream) -> tuple[str, list[str]]:
     """获取 bot 的主名字与别名列表。
 
+    结果按 ``(bot_nickname, bot_persona_id)`` 短缓存——同一流的高频 tick 间
+    persona 不会变，避免每条消息都走一遍人格服务查询；人格更新后最多延迟
+    一个流一个 tick 生效。
+
     Args:
-        chat_stream: 当前聊天流，用于取平台侧昵称作为兜底。
+        chat_stream: 当前聊天流，用于取平台侧昵称作为兜底与缓存键。
 
     Returns:
         ``(主名字, 别名列表)``。
     """
 
+    cache_key = (
+        chat_stream.bot_nickname or "",
+        getattr(chat_stream.context, "bot_persona_id", None),
+    )
+    cached = _IDENTITY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     fallback = (chat_stream.bot_nickname or "").strip()
     try:
         personality = get_personality()
     except RuntimeError:
-        return fallback, []
+        result = (fallback, [])
+        _IDENTITY_CACHE[cache_key] = result
+        return result
 
     nickname = (personality.nickname or "").strip() or fallback
     aliases = [alias.strip() for alias in personality.alias_names if alias.strip()]
-    return nickname, aliases
+    result = (nickname, aliases)
+    if len(_IDENTITY_CACHE) > 32:
+        _IDENTITY_CACHE.clear()
+    _IDENTITY_CACHE[cache_key] = result
+    return result
 
 
 def compute_bypass_probability(
@@ -198,19 +218,14 @@ def compute_bypass_probability(
     return capped, "，".join(reasons)
 
 
-def resolve_sub_agent_prompt_source(mode: ChatterMode) -> tuple[str, str]:
-    """按模式选择 sub-agent 决策 prompt。
-
-    Args:
-        mode: 当前运行模式。
+def resolve_sub_agent_prompt_source() -> tuple[str, str]:
+    """返回直播注意力决策模板。
 
     Returns:
         ``(模板名, 模板内容兜底)``——模板未注册时用后者格式化。
     """
 
-    if mode == "vtb_live":
-        return "anima_chatter_sub_agent_prompt_vtb_live", SUB_AGENT_PROMPT_LIVE
-    return "anima_chatter_sub_agent_prompt_vtb", SUB_AGENT_PROMPT_VTB
+    return "anima_chatter_sub_agent_prompt_vtb_live", SUB_AGENT_PROMPT_LIVE
 
 
 async def _render_sub_agent_prompt(

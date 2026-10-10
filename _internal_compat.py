@@ -12,11 +12,9 @@
 ============================== ===============================================
 能力                            当前实现依赖
 ============================== ===============================================
-重启 stream loop                ``src.core.transport.distribution``
 主动唤醒 Wait 状态              ``src.core.transport.distribution``（私有属性）
 喂 watchdog                     ``src.kernel.concurrency.get_watchdog``
 派发后台任务                    ``src.kernel.concurrency.get_task_manager``
-构造 NOTICE Message             ``src.core.models.message``
 读取全局人设配置                ``src.core.config.get_core_config``
 prompt 渲染策略 / bucket 前缀   ``src.core.prompt``
 LLM 上下文压缩默认 handler      ``src.core.utils.context_compression``
@@ -32,11 +30,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.log_api import get_logger
+from src.app.plugin_system.base import BaseConfig
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
-
-    from src.core.models.message import Message
 
 
 logger = get_logger("anima_chatter.compat")
@@ -44,7 +41,6 @@ logger = get_logger("anima_chatter.compat")
 
 __all__ = [
     "BackgroundTaskHandle",
-    "build_notice_message",
     "cancel_background_task",
     "create_background_task",
     "default_context_compression_handler",
@@ -55,10 +51,24 @@ __all__ = [
     "prompt_min_len",
     "prompt_optional",
     "prompt_wrap",
-    "restart_stream_loop",
+    "render_plugin_config",
     "stream_reminder_bucket",
+    "wait_state_snapshot",
     "wake_stream_from_wait",
 ]
+
+
+def render_plugin_config(config_type: type[BaseConfig], data: dict[str, Any]) -> str:
+    """用框架同一字段合并与 TOML 渲染规则生成插件配置。"""
+
+    from src.kernel.config.core import (
+        _merge_with_model_defaults,
+        _render_toml_with_signature,
+    )
+
+    merged = _merge_with_model_defaults(config_type, data)
+    config_type.from_dict(merged)
+    return _render_toml_with_signature(config_type, merged)
 
 
 # ── 后台任务 ───────────────────────────────────────────────
@@ -133,26 +143,6 @@ def feed_watchdog(stream_id: str) -> None:
 # ── stream loop 控制 ───────────────────────────────────────
 
 
-async def restart_stream_loop(stream_id: str) -> None:
-    """重启目标 stream 的 chatter 循环，让缓存的旧 chatter 生成器作废。
-
-    当前框架公开 API 尚未提供 ``chat_api.restart_stream_loop``。
-
-    ``StreamLoopManager`` 会缓存 ``chatter.execute()`` 返回的异步生成器。直接
-    换 chatter 实例**不会**让下一 tick 用上新 chatter——旧生成器仍在被 ``asend``
-    推进。重启循环即清掉这份缓存。
-
-    Args:
-        stream_id: 目标聊天流 ID。
-    """
-
-    from src.core.transport.distribution.stream_loop_manager import (
-        get_stream_loop_manager,
-    )
-
-    await get_stream_loop_manager().restart_stream_loop(stream_id)
-
-
 def wake_stream_from_wait(stream_id: str, *, only_if_new_unreads: bool = True) -> bool:
     """让 stream loop 解除当前的 ``Wait()`` 状态并立即推进 chatter。
 
@@ -218,51 +208,41 @@ def wake_stream_from_wait(stream_id: str, *, only_if_new_unreads: bool = True) -
         return False
 
 
-# ── Message 构造 ───────────────────────────────────────────
+def wait_state_snapshot(stream_id: str) -> tuple[bool, float | None]:
+    """查询 stream 当前的 Wait 状态快照（唤醒必达的确认依据）。
 
-
-def build_notice_message(
-    *,
-    message_id: str,
-    content: str,
-    platform: str,
-    stream_id: str,
-    sender_id: str = "system",
-    sender_name: str = "系统通知",
-    time: float | None = None,
-) -> "Message":
-    """构造一条 ``NOTICE`` 类型的 Message，用于向历史注入语境边界。
-
-    当前框架公开 API 尚未提供 ``message_api.create_notice_message``。
-    [`voice_call/lifecycle.py`](voice_call/lifecycle.py:1) 在通话开始 / 结束时
-    用它写入"系统标注"，让切回来的其他 chatter 能看到通话边界。
+    与 :func:`wake_stream_from_wait` 一样访问 ``StreamLoopManager`` 私有结构
+    ``_wait_states``，属于同一处集中收敛的兼容层 hack；框架公开 API 落地后
+    一并替换。
 
     Args:
-        message_id: 消息 ID。
-        content: 标注正文。
-        platform: 平台标识。
-        stream_id: 所属聊天流。
-        sender_id: 发送方 ID，默认 ``"system"``。
-        sender_name: 发送方显示名，默认 ``"系统通知"``。
-        time: Unix 时间戳；``None`` 时由框架填充。
+        stream_id: 目标 stream。
 
     Returns:
-        构造好的 ``NOTICE`` 类型 Message。
+        ``(is_waiting, unread_count_at_yield)``：``is_waiting`` 表示当前处于
+        Wait 状态；``unread_count_at_yield`` 为 yield 时刻的未读计数（仅
+        waiting 时有意义）。框架结构不可读时抛出 ``RuntimeError``——由调用
+        方记 ERROR，不伪装成"已脱离 Wait"（那会把唤醒失败伪装成成功）。
+
+    Raises:
+        RuntimeError: 框架内部结构已变更，无法读取 Wait 状态。
     """
 
-    from src.core.models.message import Message, MessageType
+    try:
+        from src.core.transport.distribution.stream_loop_manager import (
+            get_stream_loop_manager,
+        )
 
-    return Message(
-        message_id=message_id,
-        content=content,
-        processed_plain_text=content,
-        message_type=MessageType.NOTICE,
-        platform=platform,
-        stream_id=stream_id,
-        sender_id=sender_id,
-        sender_name=sender_name,
-        time=time,
-    )
+        wait_state = get_stream_loop_manager()._wait_states.get(stream_id)
+        if wait_state is None:
+            return False, None
+        _, _, unread_count_at_yield = wait_state
+        return True, unread_count_at_yield
+    except (AttributeError, ImportError, KeyError, TypeError, ValueError) as exc:
+        logger.warning(
+            f"读取 Wait 状态失败（框架内部结构可能已变更）stream={stream_id}: {exc}",
+        )
+        raise RuntimeError("Wait 状态快照不可用：框架内部结构可能已变更") from exc
 
 
 # ── 全局配置 ───────────────────────────────────────────────

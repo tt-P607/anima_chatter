@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -19,9 +22,9 @@ from plugins.anima_chatter.chatter.session_bridge import (
 )
 from plugins.anima_chatter.config import AnimaChatterConfig
 from plugins.anima_chatter.plugin import AnimaChatterPlugin
+from plugins.anima_chatter.prompts import scenes
 from plugins.anima_chatter.protocol import require_plugin
-from plugins.anima_chatter.runtime import call_state, pipeline_state, sung_history
-
+from plugins.anima_chatter.runtime import pipeline_state, sung_history
 
 # ── 插件装配 ───────────────────────────────────────────────
 
@@ -53,28 +56,69 @@ def test_no_components_when_plugin_disabled() -> None:
     assert AnimaChatterPlugin(config).get_components() == []
 
 
-def test_plugin_declares_required_metadata() -> None:
-    """插件类必须声明规范要求的三个元数据属性。"""
+def test_live_plugin_registers_only_live_components() -> None:
+    """直播插件不注册通话动作或普通聊天测试命令。"""
 
-    assert AnimaChatterPlugin.plugin_name == "anima_chatter"
-    assert AnimaChatterPlugin.plugin_description
-    assert AnimaChatterPlugin.plugin_version
+    components = AnimaChatterPlugin(AnimaChatterConfig()).get_components()
+    names = {component.name for component in components}
+
+    assert {"anima_chatter", "say_and_perform", "sing_song", "pass_and_wait"} <= names
+    assert not {"say", "start_voice_call", "end_voice_call", "vtb", "voice"} & names
+    assert cast(Any, AnimaChatterPlugin).dependent_components == []
+
+
+def test_live_scene_exports_have_no_removed_mode_templates() -> None:
+    """场景公开入口只导出存在的直播能力。"""
+
+    assert all(hasattr(scenes, name) for name in scenes.__all__)
+    assert not {"VOICE_SCENE_GUIDE", "VTB_SCENE_GUIDE"} & set(scenes.__all__)
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """拒绝组件清单中的重复 JSON 键。"""
+
+    result: dict[str, Any] = {}
+    for name, value in pairs:
+        assert name not in result, f"重复的 manifest 键：{name}"
+        result[name] = value
+    return result
+
+
+def test_plugin_declares_required_metadata() -> None:
+    """插件身份与 manifest 一致，版本和描述以 manifest 为准。"""
+
+    manifest_path = Path(__file__).resolve().parents[1] / "manifest.json"
+    manifest = json.loads(
+        manifest_path.read_text(encoding="utf-8"), object_pairs_hook=_unique_json_object
+    )
+
+    assert manifest["name"] == AnimaChatterPlugin.plugin_name == "anima_chatter"
+    assert manifest["description"]
+    assert manifest["version"]
+    registered_names = {
+        component.name
+        for component in AnimaChatterPlugin(AnimaChatterConfig()).get_components()
+    }
+    assert {entry["component_name"] for entry in manifest["include"]} == registered_names
+    assert "asr_adapter_anima" not in manifest["dependencies"]["plugins"]
+    assert "tts_http_server" not in manifest["dependencies"]["plugins"]
+    assert "tts_voice_plugin-neo" in manifest["dependencies"]["plugins"]
+    assert "tts_voice_plugin-neo:service:speech" in manifest["dependencies"]["components"]
 
 
 async def test_unload_releases_runtime_resources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """无活跃通话时卸载应清理流水线、VTS 与运行时缓存。"""
+    """卸载仅清理本插件流水线、VTS 与运行时缓存。"""
 
     clear_all = AsyncMock()
     monkeypatch.setattr(pipeline_state, "clear_all", clear_all)
-    monkeypatch.setattr(call_state, "get_active_call", AsyncMock(return_value=None))
 
     performer = SimpleNamespace(shutdown=AsyncMock())
-    plugin = AnimaChatterPlugin(AnimaChatterConfig())
-    plugin.vts_performer = performer  # type: ignore[assignment]
-    plugin.audio_player = object()  # type: ignore[assignment]
-    plugin.song_library = object()  # type: ignore[assignment]
+    plugin: Any = AnimaChatterPlugin(AnimaChatterConfig())
+    plugin.vts_performer = performer
+    plugin.audio_player = object()
+    plugin.song_library = object()
     plugin.tts_capabilities = {"provider": "demo"}
 
     await plugin.on_plugin_unloaded()
@@ -213,7 +257,7 @@ def test_bypass_probability_is_capped_at_one() -> None:
 
 
 def test_reply_bonus_applies_once() -> None:
-    """"刚回复"加成只在下一次计算时生效一次。"""
+    """ "刚回复"加成只在下一次计算时生效一次。"""
 
     stream = _chat_stream()
     baseline, _ = compute_bypass_probability([_message("嗯")], stream)
@@ -227,16 +271,10 @@ def test_reply_bonus_applies_once() -> None:
     assert after == pytest.approx(baseline)
 
 
-@pytest.mark.parametrize(
-    ("mode", "expected_suffix"),
-    [("vtb", "_vtb"), ("vtb_live", "_vtb_live")],
-)
-def test_sub_agent_prompt_source_matches_mode(
-    mode: str, expected_suffix: str
-) -> None:
-    """决策 prompt 应按模式选择对应模板。"""
+def test_sub_agent_prompt_source_is_live_only() -> None:
+    """注意力决策只使用直播模板。"""
 
-    template_name, fallback = resolve_sub_agent_prompt_source(mode)  # type: ignore[arg-type]
+    template_name, fallback = resolve_sub_agent_prompt_source()
 
-    assert template_name.endswith(expected_suffix)
+    assert template_name.endswith("_vtb_live")
     assert fallback

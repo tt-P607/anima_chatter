@@ -2,7 +2,7 @@
 
 职责边界：本文件**只**负责资源装配（prompt 注册 + 音频 / VTS / 歌库 / TTS 能力
 初始化）与组件清单，不含任何对话逻辑——那些在 [`chatter/`](chatter/__init__.py:1)、
-[`speech/`](speech/__init__.py:1)、[`voice_call/`](voice_call/__init__.py:1) 三个
+[`speech/`](speech/__init__.py:1)、[`vts/`](vts/__init__.py:1) 三个
 子包里。
 """
 
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.api.service_api import get_service
@@ -25,11 +25,8 @@ from ._internal_compat import (
 )
 from .actions import (
     AnimaPassAndWaitAction,
-    EndVoiceCallAction,
-    SayAction,
     SayAndPerformAction,
     SingSongAction,
-    StartVoiceCallAction,
 )
 from .audio import AudioPlayer
 from .chatter import AnimaChatter
@@ -42,18 +39,17 @@ from .chatter.ndfc_handlers import (
     AnimaInjectUsablesHandler,
     AnimaPreprocessHandler,
 )
-from .commands import VTBCommand, VoiceCommand
 from .config import AnimaChatterConfig
 from .prompts import (
-    MODE_PROMPT_PROFILES,
+    LIVE_USER_PROMPT_PROFILE,
     SYSTEM_PROMPT,
     USER_PROMPT_TEMPLATE,
 )
-from .prompts.sub_agent import SUB_AGENT_PROMPT_LIVE, SUB_AGENT_PROMPT_VTB
-from .runtime import call_state, pipeline_state, sung_history
+from .prompts.sub_agent import SUB_AGENT_PROMPT_LIVE
+from .runtime import pipeline_state, sung_history
 from .song_library import SongLibrary
+from .speech.playback import activate_playback, close_playback
 from .vts import VTSPerformer
-
 
 logger = get_logger("anima_chatter.plugin")
 
@@ -61,7 +57,7 @@ logger = get_logger("anima_chatter.plugin")
 __all__ = ["AnimaChatterPlugin"]
 
 
-_TTS_REGISTRY_SERVICE = "tts_http_server:service:tts_provider_registry"
+_TTS_SERVICE = "tts_voice_plugin-neo:service:speech"
 
 # 歌库目录（相对项目根）。放在全局 data 目录下，避免污染插件代码目录。
 _SONGS_RELATIVE_PATH = ("data", "anima_chatter", "songs")
@@ -69,13 +65,13 @@ _SONGS_RELATIVE_PATH = ("data", "anima_chatter", "songs")
 
 @register_plugin
 class AnimaChatterPlugin(BasePlugin):
-    """装配 Anima 聊天器、语音动作、命令与本地表演资源。"""
+    """装配直播聊天器、表演动作与本地直播资源。"""
 
     plugin_name = "anima_chatter"
-    configs = [AnimaChatterConfig]
-    dependent_components = ["asr_adapter_anima:adapter:asr_adapter_anima"]
+    configs: ClassVar[list[type]] = [AnimaChatterConfig]
+    dependent_components: ClassVar[list[str]] = []
 
-    # vtb 系模式的运行时资源，由 on_plugin_loaded 按配置初始化。
+    # 直播运行时资源，由 on_plugin_loaded 按配置初始化。
     audio_player: AudioPlayer | None = None
     vts_performer: VTSPerformer | None = None
     song_library: SongLibrary | None = None
@@ -92,34 +88,26 @@ class AnimaChatterPlugin(BasePlugin):
 
         config = self.config
         if not isinstance(config, AnimaChatterConfig):
-            logger.warning("插件配置加载异常，VTB 模式将无法播放音频或驱动 VTS")
+            logger.warning("插件配置加载异常，直播将无法播放音频或驱动 VTS")
             return
 
         pipeline_state.configure(config.pipelining)
+        activate_playback()
         await self._init_audio_resources(config)
 
         if config.plugin.enable_singing:
             self._init_song_library()
         else:
-            logger.info("唱歌能力已通过 plugin.enable_singing=false 关闭，跳过歌库初始化")
+            logger.info(
+                "唱歌能力已通过 plugin.enable_singing=false 关闭，跳过歌库初始化"
+            )
 
         self._init_tts_capabilities()
 
     async def on_plugin_unloaded(self) -> None:
-        """终止通话并释放流水线、VTS、音频与歌库资源。"""
+        """释放本插件的直播流水线、VTS、音频与歌库资源。"""
 
-        active_call = await call_state.get_active_call()
-        if active_call is not None:
-            from .protocol import require_plugin
-            from .voice_call import finalize_call
-
-            await finalize_call(
-                stream_id=active_call.caller_stream_id,
-                farewell="服务正在停止，本次通话已结束。",
-                end_reason="plugin_unload",
-                plugin=require_plugin(self),
-            )
-
+        await close_playback()
         await pipeline_state.clear_all()
         await sung_history.clear()
 
@@ -147,13 +135,8 @@ class AnimaChatterPlugin(BasePlugin):
 
         components: list[type] = [
             AnimaChatter,
-            SayAction,
             SayAndPerformAction,
             AnimaPassAndWaitAction,
-            StartVoiceCallAction,
-            EndVoiceCallAction,
-            VTBCommand,
-            VoiceCommand,
             # NDFC 事件 seam 转发 handler：把 neo_default_chatter:* 事件转发到
             # AnimaChatter 的 adapter 方法（prompt / 注意力 / 工具 / 未读等）。
             AnimaPreprocessHandler,
@@ -184,9 +167,7 @@ class AnimaChatterPlugin(BasePlugin):
     def _register_prompts(self) -> None:
         """注册本插件在 prompt manager 上的全部模板。
 
-        - system prompt：1 个，三模式共用（场景段在运行时按模式注入）。
-        - user prompt：3 个（voice / vtb / vtb_live），由模式配置表数据驱动。
-        - sub-agent prompt：2 个（vtb / vtb_live），分别用群聊与直播话术。
+        注册直播 system、user 与弹幕注意力判定三个模板。
         """
 
         personality = get_personality()
@@ -212,27 +193,27 @@ class AnimaChatterPlugin(BasePlugin):
             },
         )
 
-        for profile in MODE_PROMPT_PROFILES.values():
-            prompt_manager.get_or_create(
-                name=profile["template_name"],
-                template=USER_PROMPT_TEMPLATE,
-                policies={
-                    "stream_name": prompt_optional(profile["stream_name_default"]),
-                    "current_time": prompt_optional("未知时间"),
-                    "platform": prompt_optional(""),
-                    "history": prompt_optional("")
-                    .then(prompt_min_len(2))
-                    .then(prompt_wrap(profile["history_wrap_prefix"], "\n")),
-                    "unreads": prompt_optional("")
-                    .then(prompt_min_len(2))
-                    .then(prompt_wrap(profile["unreads_wrap_prefix"], "\n")),
-                    "extra": prompt_optional("")
-                    .then(prompt_min_len(2))
-                    .then(prompt_wrap("# 额外提醒\n", "\n")),
-                    "mode_header": prompt_optional(profile["mode_header"]),
-                    "section_tail": prompt_optional(profile["section_tail"]),
-                },
-            )
+        profile = LIVE_USER_PROMPT_PROFILE
+        prompt_manager.get_or_create(
+            name=profile["template_name"],
+            template=USER_PROMPT_TEMPLATE,
+            policies={
+                "stream_name": prompt_optional(profile["stream_name_default"]),
+                "current_time": prompt_optional("未知时间"),
+                "platform": prompt_optional(""),
+                "history": prompt_optional("")
+                .then(prompt_min_len(2))
+                .then(prompt_wrap(profile["history_wrap_prefix"], "\n")),
+                "unreads": prompt_optional("")
+                .then(prompt_min_len(2))
+                .then(prompt_wrap(profile["unreads_wrap_prefix"], "\n")),
+                "extra": prompt_optional("")
+                .then(prompt_min_len(2))
+                .then(prompt_wrap("# 额外提醒\n", "\n")),
+                "mode_header": prompt_optional(profile["mode_header"]),
+                "section_tail": prompt_optional(profile["section_tail"]),
+            },
+        )
 
         sub_agent_policies = {
             "nickname": prompt_optional(personality.nickname),
@@ -245,13 +226,11 @@ class AnimaChatterPlugin(BasePlugin):
                 personality.personality_side
             ).then(prompt_wrap("它的人格侧面是：", "\n")),
         }
-        for name, template in (
-            ("anima_chatter_sub_agent_prompt_vtb", SUB_AGENT_PROMPT_VTB),
-            ("anima_chatter_sub_agent_prompt_vtb_live", SUB_AGENT_PROMPT_LIVE),
-        ):
-            prompt_manager.get_or_create(
-                name=name, template=template, policies=sub_agent_policies
-            )
+        prompt_manager.get_or_create(
+            name="anima_chatter_sub_agent_prompt_vtb_live",
+            template=SUB_AGENT_PROMPT_LIVE,
+            policies=sub_agent_policies,
+        )
 
     # ── 资源初始化 ──────────────────────────────────────
 
@@ -304,7 +283,9 @@ class AnimaChatterPlugin(BasePlugin):
 
         song_count = len(self.song_library.get_song_names())
         if song_count > 0:
-            logger.info(f"清唱歌库已加载 {song_count} 首：{self.song_library.songs_dir}")
+            logger.info(
+                f"清唱歌库已加载 {song_count} 首：{self.song_library.songs_dir}"
+            )
         else:
             logger.info(
                 f"清唱歌库为空（路径：{self.song_library.songs_dir}），"
@@ -321,34 +302,23 @@ class AnimaChatterPlugin(BasePlugin):
         ``tts_capabilities`` 保持 ``None``，Action 的 ``to_schema`` 会懒加载兜底。
         """
 
-        registry = get_service(_TTS_REGISTRY_SERVICE)
-        if registry is None:
-            logger.debug("TTS registry service 未注册，跳过 capabilities 查询")
+        service = get_service(_TTS_SERVICE)
+        if service is None:
+            logger.debug("TTS speech service 未注册，跳过 capabilities 查询")
             return
 
-        get_provider = getattr(registry, "get_provider", None)
-        if not callable(get_provider):
-            logger.debug("TTS registry 无 get_provider 方法，跳过")
-            return
-
-        provider = get_provider()
-        if provider is None:
-            logger.debug("无 TTS Provider 注册，capabilities 将在 to_schema 时懒加载")
-            return
-
-        get_capabilities = getattr(provider, "get_capabilities", None)
+        get_capabilities = getattr(service, "get_capabilities", None)
         caps = get_capabilities() if callable(get_capabilities) else None
-        provider_name = str(getattr(provider, "provider_name", "") or "unknown")
 
         if caps is None:
             logger.info(
-                f"TTS Provider '{provider_name}' 未提供 capabilities，"
+                "TTS speech service 未提供 capabilities，"
                 "Action schema 将使用默认参数描述"
             )
             return
 
         self.tts_capabilities = caps
         logger.info(
-            f"已从 TTS Provider '{provider_name}' 获取能力元数据，"
+            "已从 TTS speech service 获取能力元数据，"
             "Action schema 将动态注入参数说明"
         )

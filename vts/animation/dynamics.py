@@ -67,7 +67,9 @@ class SecondOrderDynamics:
 
         # 隐式欧拉法迭代位置与速度。
         self.y = self.y + dt * self.yd
-        self.yd = self.yd + dt * (x + self.k3 * xd - self.y - self.k1 * self.yd) / self.k2
+        self.yd = (
+            self.yd + dt * (x + self.k3 * xd - self.y - self.k1 * self.yd) / self.k2
+        )
         return self.y
 
 

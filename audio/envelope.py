@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -113,6 +114,12 @@ class EnvelopeTracker:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._envelope: list[float] = []
+        self._stream_frames: deque[float] = deque()
+        self._stream_frame_start = 0
+        self._stream_samples = np.empty(0, dtype=np.float32)
+        self._stream_sample_rate = 0
+        self._stream_hop_size = 0
+        self._stream_prev_rms = 0.0
         self._hop_seconds: float = 1.0 / 30.0
         self._start_time: Optional[float] = None
         self._prev_rms: float = 0.0
@@ -122,15 +129,66 @@ class EnvelopeTracker:
 
         with self._lock:
             self._envelope = list(envelope) if envelope else []
+            self._stream_frames.clear()
+            self._stream_samples = np.empty(0, dtype=np.float32)
+            self._stream_sample_rate = 0
+            self._stream_hop_size = 0
             self._hop_seconds = max(1e-3, hop_seconds)
             self._start_time = time.monotonic() if self._envelope else None
             self._prev_rms = 0.0
+
+    def begin_stream(self, samplerate: int, hop_seconds: float = 1.0 / 30.0) -> None:
+        """初始化按实际输出增量更新的包络追踪。"""
+
+        with self._lock:
+            self._envelope = []
+            self._stream_frames.clear()
+            self._stream_frame_start = 0
+            self._stream_samples = np.empty(0, dtype=np.float32)
+            self._stream_sample_rate = samplerate
+            self._stream_hop_size = max(1, int(samplerate * hop_seconds))
+            self._stream_prev_rms = 0.0
+            self._hop_seconds = max(1e-3, hop_seconds)
+            self._start_time = None
+
+    def append_stream_pcm(self, data: np.ndarray) -> None:
+        """将已经写入设备的 PCM 追加到有界包络窗口。"""
+
+        if data.size == 0:
+            return
+        mono = data if data.ndim == 1 else data.mean(axis=1)
+        with self._lock:
+            now = time.monotonic()
+            emitted_frames = self._stream_frame_start + len(self._stream_frames)
+            if self._start_time is None:
+                self._start_time = now
+            elif now - self._start_time > emitted_frames * self._hop_seconds:
+                self._start_time = now - emitted_frames * self._hop_seconds
+            combined = np.concatenate((self._stream_samples, mono.astype(np.float32)))
+            frame_count = len(combined) // self._stream_hop_size
+            for index in range(frame_count):
+                start = index * self._stream_hop_size
+                samples = combined[start : start + self._stream_hop_size]
+                raw_rms = float(np.sqrt(np.mean(samples * samples) + 1e-12))
+                self._stream_prev_rms = (
+                    0.3 * raw_rms + 0.7 * self._stream_prev_rms
+                )
+                self._stream_frames.append(min(1.0, self._stream_prev_rms))
+            self._stream_samples = combined[frame_count * self._stream_hop_size :]
+            max_frames = max(1, int(2.0 / self._hop_seconds))
+            while len(self._stream_frames) > max_frames:
+                self._stream_frames.popleft()
+                self._stream_frame_start += 1
 
     def end(self) -> None:
         """音频结束：标记 tracker 不再活跃，让 ``current()`` 返回 0。"""
 
         with self._lock:
             self._envelope = []
+            self._stream_frames.clear()
+            self._stream_samples = np.empty(0, dtype=np.float32)
+            self._stream_sample_rate = 0
+            self._stream_hop_size = 0
             self._start_time = None
             self._prev_rms = 0.0
 
@@ -139,7 +197,9 @@ class EnvelopeTracker:
         """是否处于播放中（有 envelope 且未越界）。"""
 
         with self._lock:
-            return self._start_time is not None and bool(self._envelope)
+            return self._start_time is not None and bool(
+                self._envelope or self._stream_frames
+            )
 
     def current(self) -> EnvelopeFrame:
         """根据当前 monotonic 时间查表，返回这一帧的包络值。
@@ -149,12 +209,22 @@ class EnvelopeTracker:
         """
 
         with self._lock:
-            if self._start_time is None or not self._envelope:
+            if self._start_time is None:
                 return EnvelopeFrame()
 
             elapsed = time.monotonic() - self._start_time
             idx = int(elapsed / self._hop_seconds)
             if idx < 0:
+                return EnvelopeFrame()
+            if self._stream_sample_rate:
+                offset = idx - self._stream_frame_start
+                if offset < 0 or offset >= len(self._stream_frames):
+                    return EnvelopeFrame()
+                rms = self._stream_frames[offset]
+                velocity = abs(rms - self._prev_rms)
+                self._prev_rms = rms
+                return EnvelopeFrame(rms=rms, velocity=velocity)
+            if not self._envelope:
                 return EnvelopeFrame()
             if idx >= len(self._envelope):
                 # 音频已播完但 end() 还没被调用——返回 0，让动画自然渐回。

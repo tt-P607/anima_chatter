@@ -1,27 +1,14 @@
-"""anima_chatter 三种运行模式各自的"场景与工具协议"文案。
-
-每个常量对应一种 :data:`~plugins.anima_chatter.modes.ChatterMode`，由
-:meth:`prompts.builder.AnimaChatterPromptBuilder.get_scene_guide` 按 mode 选取。
-
-修改文案就改这里——不要在 `builder.py` 里硬塞场景细节。
-
-模板组织：把多个场景共享的"工具协议片段"（intent / emotion / [motion] / TTS
-标点）抽成顶层常量；各场景的 ``<scene>`` 段落只描述场景本身，``<tool_protocol>``
-段落用拼接的方式按需组合，避免在 VTB / VTB_LIVE 之间复制粘贴整段说明。
-"""
+"""直播来源、互动礼仪和虚拟形象工具协议文案。"""
 
 from __future__ import annotations
 
 from ..constants import INTENT_REGISTRY
 
-
 # ── intent 清单生成（从 INTENT_REGISTRY 派生，避免三处文案不同步） ──
 
-def _format_intent_list(*, live: bool) -> str:
-    """从 :data:`INTENT_REGISTRY` 按 group 分组生成 intent 清单文案。
 
-    Args:
-        live: ``True`` 用直播语境描述，``False`` 用 VTB 语境描述。
+def _format_intent_list() -> str:
+    """从 :data:`INTENT_REGISTRY` 按 group 分组生成 intent 清单文案。
 
     Returns:
         渲染好的 intent 清单段落（含标题 + 分组 + 条目），可直接拼进场景 prompt。
@@ -39,12 +26,11 @@ def _format_intent_list(*, live: bool) -> str:
                 lines.append("")
             lines.append(f"【{meta.group}】")
             current_group = meta.group
-        lines.append(f"- {meta.name}（{meta.desc_live if live else meta.desc_vtb}）")
+        lines.append(f"- {meta.name}（{meta.desc_live}）")
     return "\n".join(lines)
 
 
-_INTENT_LIST_VTB: str = _format_intent_list(live=False)
-_INTENT_LIST_LIVE: str = _format_intent_list(live=True)
+_INTENT_LIST_LIVE: str = _format_intent_list()
 
 
 def _build_intent_schema_desc() -> str:
@@ -57,7 +43,7 @@ def _build_intent_schema_desc() -> str:
         渲染好的 intent 说明。
     """
 
-    items = " / ".join(f"{meta.name}（{meta.desc_vtb}）" for meta in INTENT_REGISTRY)
+    items = " / ".join(f"{meta.name}（{meta.desc_live}）" for meta in INTENT_REGISTRY)
     return (
         "动作意图，决定头部姿态 + 眼神方向。"
         f"从 {len(INTENT_REGISTRY)} 个里选一个（详见 system 提示词的 intent 段）：\n"
@@ -74,12 +60,6 @@ _EMOTION_PROTOCOL_BASE = """# emotion 参数（情绪 + 强度，必填）
 - 2 级：明显表现（推荐默认值）
 - 3 级：强烈表现（happy:3 头会随说话左右摆动；angry:3 头部会颤动；surprised:3 大幅抬头）"""
 
-_EMOTION_PROTOCOL_VTB = (
-    _EMOTION_PROTOCOL_BASE
-    + "\n- 平静叙述时使用 `neutral:1`。\n"
-    "- 例子：`happy:2`（开心微笑）、`sad:2`（低落叹息）、`angry:3`（强烈愤怒）、`surprised:2`（惊讶）、`neutral:1`（平静）"
-)
-
 _EMOTION_PROTOCOL_LIVE = (
     _EMOTION_PROTOCOL_BASE
     + "\n- 例子：`happy:2`（开心微笑）、`sad:2`（共情低落）、`surprised:2`（惊讶）、`neutral:1`（平静叙述）\n"
@@ -88,22 +68,6 @@ _EMOTION_PROTOCOL_LIVE = (
 
 
 # ── 共享：emotion / intent 搭配建议 ──
-
-_INTENT_USAGE_VTB = """# 协调使用
-emotion 决定"心情和表现幅度"，intent 决定"头部姿态和眼神方向"。两者要配套：
-- 高兴回复：emotion=happy:2 intent=EXCITED
-- 安慰、共情：emotion=sad:1 intent=NARRATING
-- 思考、卡壳：emotion=neutral:1 intent=THINKING
-- 困惑、反问：emotion=neutral:1 intent=CONFUSED
-- 害羞被夸：emotion=happy:1 intent=SHY_DOWN
-- 得意 / 自夸：emotion=happy:2 intent=PROUD_LIFT
-- 调皮玩笑：emotion=happy:2 intent=PLAYFUL_TILT
-- 走神 / 没听清：emotion=neutral:1 intent=DREAMY_GAZE
-- 紧张害怕：emotion=sad:2 intent=SCARED_SHRINK
-- 普通回应：emotion=neutral:1 intent=NARRATING
-
-不要刻意每条都换花样——大部分回应用 NARRATING / EXCITED / THINKING 这三个就够，
-只有真情绪到位才用其他的，否则会显得装。"""
 
 _INTENT_USAGE_LIVE = """# 协调使用（直播常用搭配）
 emotion 决定"心情和表现幅度"，intent 决定"头部姿态和眼神方向"。两者要配套：
@@ -128,23 +92,6 @@ content 里可以用 ``[motion:NAME]...[/motion]`` 在一段话中**临时切换
 - 不必每段都用——只在一句话里语义明显切换时用，过度切换反而显得机械。"""
 
 
-# ── 共享：TTS 标点规范（VTB / VTB_LIVE 都要） ──
-
-_TTS_PUNCTUATION_PROTOCOL = """# 标点规范（TTS 极其重要）
-你的文本会**逐字送进 TTS**，TTS 靠**标点**判断断句与停顿——没有标点的文字连成一片听不清。
-- **可用标点**：`，` `。` `！` `？` `……` `、` `—` `~` — 这些是 TTS 识别的有效停顿 / 分句信号。
-- **不要用**非标准符号替代标点——emoji、颜文字、特殊装饰符 TTS 一律跳过，不产生停顿。"""
-
-
-# ── 共享：多语言分段准则（VTB / VTB_LIVE 都要） ──
-
-_MULTILANGUAGE_PROTOCOL = """# 多语言准则
-- **非必要不要用 ``auto`` 语言模式**——自动识别准确率不如指定语言，且可能导致语码切换不自然。
-- **需要切换语言时拆分为多次调用**：每次调用只包含一种语言的文本，用对应的 ``language`` 参数。
-  - 例如先说中文再说日语 → 拆成两次调用：第一次 ``language=all_zh`` + 中文文本，第二次 ``language=all_ja`` + 日语文本。
-- 多次调用的音频会按顺序自动播放 / 拼接，不需要你手动处理。"""
-
-
 # ── action 参数公共描述（schema 注入用） ──
 
 # intent schema 描述（精简版）——从 :data:`INTENT_REGISTRY` 派生。
@@ -158,73 +105,9 @@ EMOTION_SCHEMA_DESC = (
 )
 
 # 注意：language 和 style 参数的实际描述由 TTS Provider 通过
-# ``get_capabilities()`` 动态注入（见 SayAction / SayAndPerformAction 的
+# ``get_capabilities()`` 动态注入（见 SayAndPerformAction 的
 # ``to_schema`` 覆写）。Annotated 里的 description 仅作为 schema 序列化的
 # 类型元数据，不会展示给模型——``to_schema`` 会用 TTS 真实能力覆盖它。
-
-
-# ── voice 模式 ──
-
-VOICE_SCENE_GUIDE = """<voice_call_scene>
-这是实时语音通话场景。用户的话来自 ASR 识别，可能存在错字、漏字、断句错误、口语省略或半句话。
-请结合上下文理解用户真实意图，不要因为一两个识别错误就机械纠正对方。
-你的回复会被送入 TTS 播放，因此要适合朗读：短句、自然、口语化，避免 Markdown、大段列表、复杂括号和难读符号。
-
-通话场景有两种来源：
-- **本地直接通话**：用户启动了本地 ASR 适配器在和你直接说话，platform=local_asr。
-- **从文字聊天升级到通话**：用户原本在 QQ 等平台和你打字聊天，你（或用户）发起了 ``start_voice_call``
-  让对话临时切到语音模式。此时 platform 仍是 qq 等，但你是在"打电话"——
-  回复同样只走 TTS 不发文本，对面只能听见声音。
-两种情况下表达风格一致：把对方当作"已经接通的电话另一端"。
-</voice_call_scene>
-
-<tool_protocol>
-你必须通过 say action 输出要说的话，不要直接输出纯文本。
-say 的 content 可以包含语音标记：
-- [wait:1] 表示下一段语音播放前等待 1 秒，只影响语音播放间隔，不影响聊天流等待，一般建议 0.3 秒。
-如果你说完后要等待用户继续说话，必须调用 pass_and_wait。
-
-# 通话挂断
-当对话告一段落、用户说要挂电话、或者你判断没有继续语音的必要时，调用 ``end_voice_call``
-让通话回到原来的文字聊天界面。挂断时给一句自然告别就够，不要拖泥带水。
-（``end_voice_call`` 仅在通话进行中可见——本地直接通话场景下看不到这个 action。）
-</tool_protocol>"""
-
-
-# ── vtb 模式 ──
-
-VTB_SCENE_GUIDE = f"""<vtb_scene>
-**重要：你现在正在以 VTube Studio 虚拟形象的身份与观众互动**（无论这是私聊还是群聊）。
-
-- 你的输出会被同时做三件事：
-  1. **文本**：直接发送到当前聊天里，所有人都能看到字。
-  2. **TTS 朗读**：用你的声音朗读出来，给虚拟形象的"嘴"提供声音。
-  3. **VTube Studio 表演**：嘴型自动同步，按你指定的 `emotion` 调整表情/嘴型/身体晃动幅度，
-     按你指定的 `intent` 调整头部姿态与眼神方向。
-- 因此：
-  - 回复必须**适合朗读**：短句、自然、口语化，避免 Markdown、大段列表、复杂括号和难读符号。
-  - 回复内容也会**被群里所有人看到**：不要假装在做"只能听见的旁白"，文字与声音是同一份。
-  - 如果当前是群聊，要意识到这是公开互动；不要无视他人也不要逐条点评所有人。
-- {_TTS_PUNCTUATION_PROTOCOL}
-
-{_MULTILANGUAGE_PROTOCOL}
-</vtb_scene>
-
-<tool_protocol>
-你必须通过 say_and_perform action 输出要说的话，不要直接输出纯文本。
-say_and_perform 的 content 可以包含 [wait:0.5] 这样的停顿标记。
-
-{_EMOTION_PROTOCOL_VTB}
-
-{_INTENT_LIST_VTB}
-
-{_INTENT_USAGE_VTB}
-
-说完后要等待用户继续说话时，必须调用 pass_and_wait。
-具体的 emotion / intent / language 取值范围与拆分规则见 say_and_perform 工具自身的 schema 描述。
-
-{_INLINE_MOTION_PROTOCOL}
-</tool_protocol>"""
 
 
 # ── vtb_live 模式 ──
@@ -273,25 +156,19 @@ def _build_sources_intro(sources: list[str]) -> str:
 
     if not sources:
         # 没有活跃直播平台 → 通用文案兜底（一般不会进 vtb_live 模式，但保险）
-        return (
-            "1. **直播间弹幕**（user prompt 里的 ``platform`` 字段为 ``live``）：直播间正在发的弹幕。"
-        )
+        return "1. **直播间弹幕**（user prompt 里的 ``platform`` 字段为 ``live``）：直播间正在发的弹幕。"
 
     if len(sources) == 1:
         meta = _LIVE_SOURCE_META.get(sources[0])
         label = meta["label"] if meta else sources[0]
-        return (
-            f"1. **直播间弹幕**：本次直播只接入 **{label}**（user prompt 里的 ``platform`` 字段固定为 ``live``，``additional_config.source_platform`` 永远是 ``{sources[0]}``）。直播间正在发的弹幕，可能短时间内并发很多条。"
-        )
+        return f"1. **直播间弹幕**：本次直播只接入 **{label}**（user prompt 里的 ``platform`` 字段固定为 ``live``，``additional_config.source_platform`` 永远是 ``{sources[0]}``）。直播间正在发的弹幕，可能短时间内并发很多条。"
 
     # 多平台同播
     label_list = "、".join(
         _LIVE_SOURCE_META[p]["label"] if p in _LIVE_SOURCE_META else p for p in sources
     )
     source_value_list = " / ".join(f"``{p}``" for p in sources)
-    return (
-        f"1. **直播间弹幕**：本次直播同时接入 **{label_list}**（user prompt 里的 ``platform`` 字段统一为 ``live``，``additional_config.source_platform`` 会标明真实来源 {source_value_list}）。多平台弹幕会汇入**同一个会话**给你，由你统一回应。"
-    )
+    return f"1. **直播间弹幕**：本次直播同时接入 **{label_list}**（user prompt 里的 ``platform`` 字段统一为 ``live``，``additional_config.source_platform`` 会标明真实来源 {source_value_list}）。多平台弹幕会汇入**同一个会话**给你，由你统一回应。"
 
 
 def _build_multi_source_note(sources: list[str]) -> str:
@@ -369,7 +246,9 @@ def _build_memory_id_section(sources: list[str]) -> str:
     for src in sources:
         meta = _LIVE_SOURCE_META.get(src)
         if meta is None:
-            bullet_lines.append(f"  - ``<{src}>[xxx]`` → ``person_id`` 写 ``{src}:xxx``。")
+            bullet_lines.append(
+                f"  - ``<{src}>[xxx]`` → ``person_id`` 写 ``{src}:xxx``。"
+            )
         else:
             bullet_lines.append(
                 f"  - ``<{src}>[xxx]`` → ``{meta['user_id_field']}``"
@@ -443,7 +322,9 @@ def _build_cross_platform_section(sources: list[str]) -> str:
     )
 
 
-def build_vtb_live_scene_guide(active_sources: frozenset[str] | set[str] | None = None) -> str:
+def build_vtb_live_scene_guide(
+    active_sources: frozenset[str] | set[str] | None = None,
+) -> str:
     """根据当前实际启用的直播平台动态生成 ``vtb_live`` 场景 prompt。
 
     Args:
@@ -466,11 +347,8 @@ def build_vtb_live_scene_guide(active_sources: frozenset[str] | set[str] | None 
 
 - 消息来源：
   {sources_intro_block}
-  2. **群组消息**（platform=qq 等）：粉丝群在直播期间互动。
-  3. **私聊**（chat_type=private）：单个观众/朋友私聊。
-  统一处理——都视为"看直播 / 关注你的人"在跟你说话。
-- 传播链路：你的回复 → **TTS 朗读**（直播间观众只听得见声音）→ **VTube Studio 表演**（嘴型 / 表情 / 姿态按 `emotion` + `intent` 同步）→ 如果消息来自外部群聊 / 私聊，**同时**把文字发回原会话。
-- 与普通群聊的关键差异：**直播间观众只能听 TTS，看不到你的文字**——所以**自然带出你要回的那条弹幕的核心意思**（"刚才有人在问 XX"），不逐字复述、不挨个点评，也不要用"如上所述"这种依赖文字回看的措辞。观众多为陌生人，不假设互相熟悉；群组朋友可亲近些但别太私密（直播间在听）。{multi_source_note}
+- 传播链路：你的回复 → **TTS 朗读**（直播间观众只听得见声音）→ **VTube Studio 表演**（嘴型 / 表情 / 姿态按 `emotion` + `intent` 同步）。
+- **直播间观众只能听 TTS，看不到你的文字**——所以**自然带出你要回的那条弹幕的核心意思**（"刚才有人在问 XX"），不逐字复述、不挨个点评，也不要用"如上所述"这种依赖文字回看的措辞。观众多为陌生人，不假设互相熟悉。{multi_source_note}
 
 # 弹幕节奏与回应策略
 - **没有外部过滤器**——每条弹幕都送你面前，但**绝不条条都回**。挑这几类开口：
@@ -487,11 +365,6 @@ def build_vtb_live_scene_guide(active_sources: frozenset[str] | set[str] | None 
 - 梗 / 颜文字念不顺时委婉说"这个没太看懂"或"这串符号怪怪的"，**不要硬念**。
 - 回避：政治、宗教、地域攻击、未成年充值诱导、隐私窥探、平台敏感词。被带节奏也不接。
 - 遇到攻击 / 阴阳怪气：礼貌带过或忽略，不正面对线。
-
-# 标点规范
-{_TTS_PUNCTUATION_PROTOCOL}
-
-{_MULTILANGUAGE_PROTOCOL}
 
 {spoken_alias_section}
 
@@ -521,7 +394,5 @@ def build_vtb_live_scene_guide(active_sources: frozenset[str] | set[str] | None 
 __all__ = [
     "EMOTION_SCHEMA_DESC",
     "INTENT_SCHEMA_DESC",
-    "VOICE_SCENE_GUIDE",
-    "VTB_SCENE_GUIDE",
     "build_vtb_live_scene_guide",
 ]

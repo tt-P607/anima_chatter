@@ -23,8 +23,10 @@ from typing import TYPE_CHECKING, Any
 from src.app.plugin_system.api import chat_api
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BaseEventHandler
-from src.app.plugin_system.types import LLMPayload, ROLE, Text
+from src.app.plugin_system.types import ROLE, LLMPayload, Text
 from src.kernel.event import EventDecision
+
+from ..runtime import pipeline_state
 
 if TYPE_CHECKING:
     from ..chatter import AnimaChatter
@@ -39,6 +41,7 @@ _EVT_CREATE_REQUEST = "neo_default_chatter:create_request"
 _EVT_FETCH_UNREADS = "neo_default_chatter:fetch_unreads"
 _EVT_FORMAT_UNREAD_LINE = "neo_default_chatter:format_unread_line"
 _EVT_BUILD_HISTORY_TEXT = "neo_default_chatter:build_history_text"
+_EVT_SESSION_TRANSITION = "neo_default_chatter:session_transition"
 
 # 所有 anima 转发 handler 的统一权重：高于 NDFC 内置 handler，先执行并以
 # STOP 短路默认实现。
@@ -107,13 +110,13 @@ class AnimaPreprocessHandler(BaseEventHandler):
             setattr(context, _HISTORY_TEXT_ATTR, history_text)
 
         # 用 anima 的消息格式化逻辑逐条拼 unread_lines，供 sub_actor 决策模型使用。
-        unread_lines = "\n".join(
-            chatter.format_message_line(msg) for msg in unreads
-        )
+        unread_lines = "\n".join(chatter.format_message_line(msg) for msg in unreads)
         try:
             decision = await chatter.sub_agent(unread_lines, list(unreads), chat_stream)
         except Exception as exc:  # noqa: BLE001 - 决策失败不应拦截消息
-            logger.warning(f"anima 注意力决策失败，按放行处理 stream={stream_id}: {exc}")
+            logger.warning(
+                f"anima 注意力决策失败，按放行处理 stream={stream_id}: {exc}"
+            )
             params["proceed"] = True
             params["reason"] = "anima 注意力决策异常，默认放行"
             return EventDecision.STOP, params
@@ -128,17 +131,18 @@ class AnimaPreprocessHandler(BaseEventHandler):
 
 
 class AnimaInjectUnreadPayloadHandler(BaseEventHandler):
-    """转发 ``:inject_unread_payload``——注入 anima 三模式 USER prompt。
+    """转发 ``:inject_unread_payload``，注入直播 USER prompt。
 
     复用 :meth:`AnimaChatter._build_system_prompt` / :meth:`AnimaChatter._build_user_prompt`
     / :meth:`AnimaChatter._build_negative_behaviors_extra`，直接改写共享的
     ``response``：把 NDFC 默认塞入的 SYSTEM payload 替换为 anima 的模板，
-    并用自己的 USER prompt 注入，保证三模式场景文案、VTS 动作表、通话状态
-    全部生效。
+    并用自己的 USER prompt 注入直播场景文案与 VTS 动作表。
     """
 
     name = "anima_inject_unread_payload"
-    description = "转发 neo_default_chatter:inject_unread_payload 到 AnimaChatter prompt 构建"
+    description = (
+        "转发 neo_default_chatter:inject_unread_payload 到 AnimaChatter prompt 构建"
+    )
     weight = _HANDLER_WEIGHT
     init_subscribe = [_EVT_INJECT_UNREAD_PAYLOAD]
 
@@ -205,7 +209,9 @@ class AnimaInjectUsablesHandler(BaseEventHandler):
     """
 
     name = "anima_inject_usables"
-    description = "转发 neo_default_chatter:inject_usables 到 AnimaChatter.inject_usables"
+    description = (
+        "转发 neo_default_chatter:inject_usables 到 AnimaChatter.inject_usables"
+    )
     weight = _HANDLER_WEIGHT
     init_subscribe = [_EVT_INJECT_USABLES]
 
@@ -238,7 +244,9 @@ class AnimaCreateRequestHandler(BaseEventHandler):
     """
 
     name = "anima_create_request"
-    description = "转发 neo_default_chatter:create_request 到 AnimaChatter.create_request"
+    description = (
+        "转发 neo_default_chatter:create_request 到 AnimaChatter.create_request"
+    )
     weight = _HANDLER_WEIGHT
     init_subscribe = [_EVT_CREATE_REQUEST]
 
@@ -265,7 +273,7 @@ class AnimaCreateRequestHandler(BaseEventHandler):
 
 
 class AnimaFetchUnreadsHandler(BaseEventHandler):
-    """转发 ``:fetch_unreads``——拉未读 + 通话入档 + vtb_live 流水线门。
+    """转发 ``:fetch_unreads``，通过直播排播门后读取未读消息。
 
     复用 :meth:`AnimaChatter.fetch_unreads`。
     """
@@ -273,15 +281,28 @@ class AnimaFetchUnreadsHandler(BaseEventHandler):
     name = "anima_fetch_unreads"
     description = "转发 neo_default_chatter:fetch_unreads 到 AnimaChatter.fetch_unreads"
     weight = _HANDLER_WEIGHT
-    init_subscribe = [_EVT_FETCH_UNREADS]
+    init_subscribe = [_EVT_FETCH_UNREADS, _EVT_SESSION_TRANSITION]
+    # fetch_unreads 的容量门可能等待长歌曲进入尾段，时间可超过 EventBus 默认超时。
+    # 若被超时截断，wait_gate 被取消、本 handler 被跳过，主流程拿不到聚合
+    # 未读 → 假死。此处禁用超时以匹配其"等门到点/本轮被取消"的声明的行为。
+    timeout = 0
 
     async def execute(
         self, event_name: str, params: dict[str, Any]
     ) -> tuple[EventDecision, dict[str, Any]]:
-        """拉取未读消息，把 messages 填入 payload。"""
+        """处理回复轮入口或拉取未读消息。"""
         stream_id = str(params.get("stream_id") or "")
         chatter = _get_anima_chatter(stream_id)
         if chatter is None:
+            return EventDecision.PASS, params
+
+        if event_name == _EVT_SESSION_TRANSITION:
+            from_phase = params.get("from_phase")
+            to_phase = params.get("to_phase")
+            if from_phase == "wait_user" and to_phase == "model_turn":
+                await chatter.prepare_response_round()
+            elif from_phase == "tool_exec" and to_phase == "wait_user":
+                await pipeline_state.seal_empty_round(stream_id)
             return EventDecision.PASS, params
 
         try:

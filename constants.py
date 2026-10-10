@@ -1,4 +1,4 @@
-﻿"""anima_chatter 共享常量与归一化工具。
+"""anima_chatter 共享常量与归一化工具。
 
 汇总 intent / emotion 的合法值定义与归一化逻辑，以及 chatter 组件签名，供插
 件其它模块统一引用，避免出现"新增 intent 必须两处都加"这类同步契约。

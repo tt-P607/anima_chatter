@@ -1,37 +1,37 @@
-﻿"""anima_chatter 插件配置——全插件配置字段的**唯一真源**。
+"""anima_chatter 直播插件配置——全插件配置字段的**唯一真源**。
 
 所有配置节都定义在模块顶层，供其它模块直接 import 做类型标注，从而避免
 ``getattr(cfg, "field", default)`` 这种"第二份默认值"。任何需要读配置的代码
 都应该接收具体的 Section 类型并直接访问字段。
 
-支持三种运行模式（详见 [`modes.py`](modes.py:1)）：
+本配置仅用于直播模式 ``vtb_live``。
 
-- ``voice``：``platform == "local_asr"`` 或通话进行中，ASR 实时语音通话。
-- ``vtb``：被 ``/vtb on`` 接管的普通群聊 / 私聊（VTube Studio 表演但不直播）。
-- ``vtb_live``：直播平台，观众是直播间弹幕。
-
-配置区段（共 7 个）：
+配置区段（共 6 个）：
 
 ============================ ===================================================
 section                       适用模式 / 用途
 ============================ ===================================================
 ``[plugin]``                  通用 chatter 行为（tick / buffer / 重试 / 挂起开关）
-``[tts]``                     TTS HTTP 后端（三种模式共用）
 ``[vts]``                     VTube Studio 连接 + 本地音频输出 + Hotkey 映射
-                              （仅 vtb / vtb_live 生效）
-``[vtb_attention]``           vtb / vtb_live 模式的"是否回复"过滤器
-``[audio_drive]``             音频驱动律动（vtb / vtb_live 表演时让形象跟着声音动）
-``[pipelining]``              vtb_live 流水线优化（让 LLM 推理与音频播放并行）
-``[idle_animation]``          待机动画频率与幅度（vtb / vtb_live 共用）
+                              （直播表演）
+``[vtb_attention]``           直播弹幕"是否回复"过滤器
+``[audio_drive]``             音频驱动律动（直播表演时让形象跟着声音动）
+``[pipelining]``              直播流水线优化（让 LLM 推理与音频播放并行）
+``[idle_animation]``          直播待机动画频率与幅度
 ============================ ===================================================
 """
 
 from __future__ import annotations
 
-from typing import ClassVar
+import os
+import tempfile
+import tomllib
+from pathlib import Path
+from typing import ClassVar, Self
 
 from src.app.plugin_system.base import BaseConfig, Field, SectionBase, config_section
 
+from ._internal_compat import render_plugin_config
 
 __all__ = [
     "AnimaChatterConfig",
@@ -39,7 +39,6 @@ __all__ = [
     "IdleAnimationSection",
     "PipeliningSection",
     "PluginSection",
-    "TTSSection",
     "VTBAttentionSection",
     "VTSSection",
 ]
@@ -47,14 +46,13 @@ __all__ = [
 
 @config_section("plugin", title="插件设置", tag="plugin")
 class PluginSection(SectionBase):
-    """插件基础配置（三模式共享）。"""
+    """直播插件基础配置。"""
 
     enabled: bool = Field(default=True, description="是否启用本 chatter")
     tick_interval: float = Field(
         default=1.0,
         description=(
-            "vtb / vtb_live 模式下的 tick 间隔（秒）。"
-            "voice 模式始终强制为 0.1，无法被此项影响。"
+            "直播模式下的 tick 间隔（秒）。"
         ),
         ge=0.05,
         le=60.0,
@@ -62,7 +60,7 @@ class PluginSection(SectionBase):
     allow_message_buffer: bool = Field(
         default=True,
         description=(
-            "vtb / vtb_live 模式下是否允许消息缓冲。voice 模式始终强制为 False。"
+            "直播模式下是否允许消息缓冲。"
         ),
     )
     plain_text_retry_limit: int = Field(
@@ -91,20 +89,15 @@ class PluginSection(SectionBase):
     custom_prompt: str = Field(
         default="",
         description=(
-            "自定义提示词。会以 ``<custom_instructions>`` 块形式追加到指定模式的 "
+            "自定义提示词。启用后会以 ``<custom_instructions>`` 块形式追加到直播 "
             "system prompt 末尾，用来声明部署独有的行为（口癖、台风、回复策略等）。"
             "支持多行；可以写 markdown / 标签等任意格式，模型会原样收到。"
-            "留空则不注入；具体在哪些模式生效由 ``custom_prompt_modes`` 控制。"
+            "留空则不注入。"
         ),
     )
-    custom_prompt_modes: list[str] = Field(
-        default_factory=lambda: ["voice", "vtb", "vtb_live"],
-        description=(
-            "``custom_prompt`` 生效的模式列表。可选值：``voice`` / ``vtb`` / ``vtb_live``。"
-            "默认三种模式都注入；想只在某些模式下生效就改成对应子集，"
-            "比如只想直播时生效就写 ``[\"vtb_live\"]``。"
-            "空列表 ``[]`` 等于完全禁用 ``custom_prompt``（即便其内容非空）。"
-        ),
+    custom_prompt_enabled: bool = Field(
+        default=True,
+        description="是否在直播 system prompt 中注入自定义提示词。",
     )
     model_task: str = Field(
         default="actor",
@@ -128,45 +121,6 @@ class PluginSection(SectionBase):
         description="最大输出 token 数，仅在 models 非空时生效",
         ge=1,
         le=200000,
-    )
-
-
-@config_section("tts", title="TTS 设置")
-class TTSSection(SectionBase):
-    """TTS HTTP 后端配置（三模式共享）。"""
-
-    endpoint: str = Field(
-        default="http://127.0.0.1:8000/router/tts_http_server/api/tts/v1/synthesize",
-        description="TTS HTTP 合成接口地址",
-    )
-    timeout: float = Field(
-        default=30.0,
-        description="TTS HTTP 请求超时时间（秒）",
-        ge=1.0,
-        le=300.0,
-    )
-    max_parallel_segments: int = Field(
-        default=4,
-        description="最大并行合成句子数",
-        ge=1,
-        le=32,
-    )
-    empty_audio_retry_count: int = Field(
-        default=1,
-        description="TTS 返回空音频时的重试次数",
-        ge=0,
-        le=5,
-    )
-    sentence_split_enabled: bool = Field(
-        default=True, description="是否按句切分并并行合成"
-    )
-    mime_type: str = Field(default="audio/wav", description="TTS 音频 MIME 类型")
-    provider: str = Field(
-        default="qwen_tts",
-        description="TTS provider 名称，留空则使用服务端默认 provider",
-    )
-    emit_text_on_tts_failure: bool = Field(
-        default=False, description="TTS 失败时是否回退发送文本"
     )
 
 
@@ -321,81 +275,24 @@ class AudioDriveSection(SectionBase):
 
 @config_section("pipelining", title="vtb_live 流水线优化")
 class PipeliningSection(SectionBase):
-    """**仅 ``vtb_live`` 模式**生效的"动作流水线"优化。
+    """直播回复轮次的音频容量上限和歌曲尾段准备窗口。"""
 
-    痛点：直播 TTS 经常一段 30 秒以上、唱歌 1~3 分钟，原阻塞模式下 Bot 在
-    播放期间完全不能响应新弹幕，弹幕会堆到队尾才被处理。
-
-    优化思路：让 Action 派发完后台播放任务后**立即返回**，并在 LLM 即将发起
-    新一轮调用前阻塞到累积播放进度达到 ``trigger_percent`` 才放行。这样物理
-    音频仍按队列串行播放，但 LLM 推理与音频播放重叠，弹幕也能被聚合处理。
-
-    其他模式（``voice`` / ``vtb``）始终按原阻塞模式工作，不受本配置影响。
-    """
-
-    enabled: bool = Field(
-        default=True,
-        description=(
-            "vtb_live 流水线总开关。关闭后所有 Action 走原阻塞模式"
-            "（Action 阻塞到播放结束才返回），适合调试或不希望弹幕聚合的场景。"
-        ),
-    )
-    trigger_percent: float = Field(
-        default=0.6,
-        ge=0.0,
-        le=1.0,
-        description=(
-            "本轮累积音频时长达到此比例时触发 LLM 流水线门放行（0~1）。"
-            "默认 0.6 表示总播放时长 60% 时让 LLM 醒来准备新一轮。"
-            "调小（如 0.4）→ LLM 更激进，转场更紧凑但可能偶尔抢话；"
-            "调大（如 0.8）→ LLM 更保守，节奏稳但流水线收益变小。"
-        ),
-    )
-    silence_gap_seconds: float = Field(
-        default=7.0,
-        ge=0.0,
-        le=120.0,
-        description=(
-            "**跨轮**音频之间的强制静默间隔（秒）。上一轮所有音频播完后等"
-            "这么久才放下一轮第一段，避免接得太急显得机械。"
-            "**不影响轮内**：同一次 LLM 响应里多个 Action 紧接排队不加间隔。"
-            "**实际生效值会按 ``silence_gap_jitter`` 加随机波动**。"
-        ),
-    )
-    silence_gap_jitter: float = Field(
-        default=2.0,
-        ge=0.0,
-        le=120.0,
-        description=(
-            "跨轮静默间隔的随机抖动幅度（秒）。每次跨轮 reserve 时实际间隔 = "
-            "``silence_gap_seconds + uniform(-jitter, +jitter)``。"
-            "默认 2.0 表示在 7±2 秒之间随机；设为 0 关闭抖动让间隔严格固定。"
-            "调大让节奏更不规律（更像真人主播），调小让节奏更稳定。"
-        ),
-    )
-    min_remaining_seconds: float = Field(
+    song_prepare_lead_seconds: float = Field(
         default=25.0,
         ge=0.0,
         le=600.0,
         description=(
-            "**距结束最少剩余秒数**——本轮播放结束前至少留这么多秒给 LLM 推理。\n"
-            "实际门时刻 = ``max(trigger_percent_gate, finish_at - min_remaining_seconds)``\n"
-            "—— trigger_percent 算出的时刻和'结束前 N 秒'取**较晚者**，"
-            "尽可能多吞吐弹幕：\n"
-            "- 短回复（30s, trigger=60%）：18s 触发（按比例）\n"
-            "- 长歌曲（180s, trigger=60%）：155s 触发（结束前 25s 唤醒）\n"
-            "默认 25 秒；设 0 或负数关闭，完全按 trigger_percent 等待。"
+            "歌曲实际起播后，距预计结束此秒数时允许准备下一回复轮。"
         ),
     )
-    min_duration_seconds: float = Field(
-        default=10.0,
-        ge=0.0,
-        le=600.0,
+    max_backlog_seconds: float = Field(
+        default=60.0,
+        ge=1.0,
+        le=86400.0,
         description=(
-            "最低门槛（秒）：本轮累积音频时长低于此值时**不启用**流水线，"
-            "Action 走原阻塞模式（直接等播完才返回）。"
-            "防止短句也参与流水线导致没必要的复杂状态切换。"
-            "建议保持 10s 左右；调到 0 等于『任何时长都启用流水线』。"
+            "播放队列最大积压秒数（背压上限）。队列剩余播放时长超过此值时，"
+            "新播放请求被拒排并把背压信号反馈给模型，让输出量自然收敛——"
+            "高压弹幕下队列不再无限增长。设为 86400 等价于关闭背压。"
         ),
     )
 
@@ -458,7 +355,9 @@ class IdleAnimationSection(SectionBase):
 
     # 宏观动作（重心斜 / 好奇歪头 / 害羞回避等）触发频率（秒）。
     macro_min_interval: float = Field(default=6.0, description="宏观动作最小间隔（秒）")
-    macro_max_interval: float = Field(default=15.0, description="宏观动作最大间隔（秒）")
+    macro_max_interval: float = Field(
+        default=15.0, description="宏观动作最大间隔（秒）"
+    )
 
     motion_speed_scale: float = Field(
         default=2.0, description="宏观动作执行速度倍率（>1 加快，<1 放慢）"
@@ -493,7 +392,8 @@ class IdleAnimationSection(SectionBase):
         default=0.3, description="侧倾跟随权重：头侧歪时身体侧向跟随比例"
     )
     body_follow_head_w_comp: float = Field(
-        default=0.08, description="重心代偿权重：头部横向转时身体反向微补偿（重心侧移感）"
+        default=0.08,
+        description="重心代偿权重：头部横向转时身体反向微补偿（重心侧移感）",
     )
 
     # ── 身体常驻律动 ──────────────────────────────
@@ -501,7 +401,8 @@ class IdleAnimationSection(SectionBase):
     # 用 value noise 三轴独立生成常驻身体摇摆，让待机不再"钉在原地"，逼近
     # Neuro-sama 那种"始终在活"的质感。幅度默认给到能明显感知但不过度。
     body_idle_enabled: bool = Field(
-        default=True, description="待机身体常驻律动总开关（关闭后退回仅有呼吸的可察觉极弱摆动）"
+        default=True,
+        description="待机身体常驻律动总开关（关闭后退回仅有呼吸的可察觉极弱摆动）",
     )
     body_idle_scale: float = Field(
         default=1.0, description="身体常驻律动总幅度倍率；调大更明显，调小更安静"
@@ -533,14 +434,68 @@ class AnimaChatterConfig(BaseConfig):
     """anima_chatter 插件配置。"""
 
     name: ClassVar[str] = "config"
-    description: ClassVar[str] = (
-        "anima_chatter 插件配置（语音通话 + VTB 表演 + 直播弹幕，三种模式共用）"
-    )
+    description: ClassVar[str] = "anima_chatter 直播、VTube Studio 与歌曲排播配置"
 
     plugin: PluginSection = Field(default_factory=PluginSection)
-    tts: TTSSection = Field(default_factory=TTSSection)
     vts: VTSSection = Field(default_factory=VTSSection)
     vtb_attention: VTBAttentionSection = Field(default_factory=VTBAttentionSection)
     audio_drive: AudioDriveSection = Field(default_factory=AudioDriveSection)
     pipelining: PipeliningSection = Field(default_factory=PipeliningSection)
     idle_animation: IdleAnimationSection = Field(default_factory=IdleAnimationSection)
+
+    @classmethod
+    def load(cls, path: str | Path, *, auto_update: bool = False) -> Self:
+        """在签名同步之前备份旧模式配置并保留直播提示词作用域。
+
+        Args:
+            path: TOML 配置文件路径。
+            auto_update: 是否将迁移结果和模型签名写回配置。
+
+        Returns:
+            已校验的直播配置实例。
+        """
+
+        config_path = Path(path)
+        if not config_path.exists():
+            return super().load(config_path, auto_update=auto_update)
+        original_bytes = config_path.read_bytes()
+        raw_config = tomllib.loads(original_bytes.decode("utf-8"))
+        plugin_config = raw_config.get("plugin")
+        if not isinstance(plugin_config, dict) or "custom_prompt_modes" not in plugin_config:
+            return super().load(config_path, auto_update=auto_update)
+
+        legacy_modes = plugin_config.pop("custom_prompt_modes")
+        if not isinstance(legacy_modes, list):
+            raise TypeError("custom_prompt_modes 必须是字符串列表")
+        plugin_config.setdefault(
+            "custom_prompt_enabled",
+            "vtb_live" in {str(mode).strip().lower() for mode in legacy_modes},
+        )
+        rendered = render_plugin_config(cls, raw_config)
+        migrated = cls.from_dict(tomllib.loads(rendered))
+        if not auto_update:
+            return migrated
+
+        backup_path = config_path.with_name(f"{config_path.name}.anima_voice.bak")
+        if backup_path.exists():
+            if backup_path.read_bytes() != original_bytes:
+                raise FileExistsError("旧配置备份已存在且内容不同：config.toml.anima_voice.bak")
+        else:
+            with backup_path.open("xb") as backup_file:
+                backup_file.write(original_bytes)
+
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="\n", dir=config_path.parent,
+                prefix=f".{config_path.name}.", suffix=".tmp", delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(rendered)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            os.replace(temporary_path, config_path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+        return migrated

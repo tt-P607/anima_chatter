@@ -1,14 +1,7 @@
-"""模型输出中的内联标记解析与句子切分。
+"""语音文本的显式停顿与内联表演标记解析。
 
-支持三类内联标记：
-
-- ``[wait:n]``：下一段播放前等待 n 秒
-- ``[emotion:NAME]...[/emotion]``：包内段使用指定情绪
-- ``[motion:NAME]...[/motion]``：包内段使用指定动作意图（intent）
-
-motion 与 emotion 可以同时存在。解析顺序为外到内：先按 motion 切块，每块内
-再按 emotion 切，最后处理 wait + 句子切分。motion 不允许嵌套；模型若多嵌一
-层内层 motion 会被外层吞掉。
+直播使用 ``parse_pause_segments``，仅按 ``[wait:n]`` 切分，剥离行内表演标记。
+``parse_speech_segments`` 保留完整音频辅助接口的表演分段与可选句子切分行为。
 """
 
 from __future__ import annotations
@@ -17,9 +10,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-
 __all__ = [
     "SpeechSegment",
+    "parse_pause_segments",
     "parse_speech_segments",
     "split_complete_sentences",
     "strip_markers",
@@ -48,9 +41,7 @@ _STRIP_WAIT_RE = re.compile(r"\[wait\s*:\s*[0-9.]+\]", re.IGNORECASE)
 _STRIP_EMOTION_RE = re.compile(
     r"\[/?emotion(?:\s*:\s*[a-zA-Z0-9_\-]+)?\]", re.IGNORECASE
 )
-_STRIP_MOTION_RE = re.compile(
-    r"\[/?motion(?:\s*:\s*[a-zA-Z0-9_\-]+)?\]", re.IGNORECASE
-)
+_STRIP_MOTION_RE = re.compile(r"\[/?motion(?:\s*:\s*[a-zA-Z0-9_\-]+)?\]", re.IGNORECASE)
 
 
 # 仅含标点 / 空白的字符集合：合并相邻段时用来识别"零碎段"。这些段独立送 TTS
@@ -80,8 +71,7 @@ class SpeechSegment:
 def strip_markers(text: str) -> str:
     """把三类内联标记一次性剥离。
 
-    用于把整段文本发到聊天界面，或在 :func:`parse_speech_segments` 没解析出
-    片段时兜底。
+    用于提取朗读正文和聊天文本，支持未闭合的表演标记。
 
     Args:
         text: 含标记的原始文本。
@@ -122,6 +112,32 @@ def split_complete_sentences(text: str) -> list[str]:
     if tail:
         chunks.append(tail)
     return chunks
+
+
+def parse_pause_segments(content: str) -> list[SpeechSegment]:
+    """仅按显式停顿切分朗读文本，剥离句中表演标记。
+
+    Args:
+        content: 同一次说话动作的完整文本。
+
+    Returns:
+        停顿分隔的片段；连续停顿累加，末尾停顿保留为空文本片段。
+    """
+
+    segments: list[SpeechSegment] = []
+    pending_wait = 0.0
+    cursor = 0
+    for match in _WAIT_RE.finditer(content):
+        text = strip_markers(content[cursor : match.start()])
+        if text:
+            segments.append(SpeechSegment(text=text, wait_before=pending_wait))
+            pending_wait = 0.0
+        pending_wait += float(match.group(1))
+        cursor = match.end()
+    text = strip_markers(content[cursor:])
+    if text or pending_wait > 0:
+        segments.append(SpeechSegment(text=text, wait_before=pending_wait))
+    return segments
 
 
 def parse_speech_segments(

@@ -106,24 +106,20 @@ class SpeechAnimator(BaseAnimator):
             "NARRATING": {"x": 0, "y": 0, "z": 0, "ex": 0, "ey": 0},
             "THINKING": {"x": 3.5, "y": 3.0, "z": -2.5, "ex": -0.2, "ey": 0.15},
             "CONFUSED": {"x": -2.5, "y": 2.0, "z": 3.0, "ex": 0.2, "ey": 0.1},
-
             # ── 高表现力情绪（2） ───────────────────────
             "EXCITED": {"x": 0, "y": 0.5, "z": 0, "ex": 0, "ey": 0.08},
             "SURPRISED": {"x": 0, "y": 0.5, "z": 0, "ex": 0, "ey": 0.2},
-
             # ── 眼神类：方向性凝视（5） ─────────────────
             "PEEK_LEFT": {"x": -5.0, "y": 0, "z": 0, "ex": -0.3, "ey": 0},
             "PEEK_RIGHT": {"x": 5.0, "y": 0, "z": 0, "ex": 0.3, "ey": 0},
             "LOOKAWAY": {"x": -3.5, "y": -1.5, "z": 0, "ex": -0.2, "ey": -0.1},
             "STARE_DOWN": {"x": 0, "y": -4.5, "z": 0, "ex": 0, "ey": -0.3},
             "DREAMY_GAZE": {"x": 3.0, "y": 2.0, "z": -1.5, "ex": 0.15, "ey": 0.2},
-
             # ── 态度类：情感倾向（4） ───────────────────
             "PROUD_LIFT": {"x": 0, "y": 4.0, "z": 0, "ex": 0, "ey": 0.1},
             "WORRIED_TILT": {"x": 0, "y": -1.5, "z": 4.0, "ex": 0, "ey": -0.1},
             "SHY_DOWN": {"x": 0, "y": -3.0, "z": 2.0, "ex": -0.15, "ey": -0.15},
             "ATTENTIVE": {"x": 0, "y": 1.5, "z": 0, "ex": 0, "ey": 0.05},
-
             # ── 调皮 / 紧张（3） ────────────────────────
             "PLAYFUL_TILT": {"x": 0, "y": 1.0, "z": 6.0, "ex": 0.15, "ey": 0.1},
             "MISCHIEF": {"x": 0, "y": -1.0, "z": -3.0, "ex": 0.2, "ey": -0.05},
@@ -222,15 +218,27 @@ class SpeechAnimator(BaseAnimator):
                 current_lerp = self.recovery_lerp_factor
 
         intent_cfg = self.intent_map.get(self.intent, self.intent_map["IDLE"])
-        emo_table = self.emotion_matrix.get(self.emotion_type, self.emotion_matrix["neutral"])
+        emo_table = self.emotion_matrix.get(
+            self.emotion_type, self.emotion_matrix["neutral"]
+        )
         emo_cfg = emo_table.get(self.emotion_level, emo_table[2])
-        mouth_min, mouth_max, emo_head_x, emo_head_y, emo_head_z, emo_eye_x, emo_eye_y = emo_cfg
+        (
+            mouth_min,
+            mouth_max,
+            emo_head_x,
+            emo_head_y,
+            emo_head_z,
+            emo_eye_x,
+            emo_eye_y,
+        ) = emo_cfg
 
         # 嘴型基准 + 微小肌肉颤动
         elapsed = time.time()
         mouth_base = (mouth_min + mouth_max) / 2
         mouth_amp = (mouth_max - mouth_min) / 2
-        current_mouth_target = mouth_base + math.sin(elapsed * math.pi * 1.0) * mouth_amp
+        current_mouth_target = (
+            mouth_base + math.sin(elapsed * math.pi * 1.0) * mouth_amp
+        )
 
         self.target_params["v_head_x"] = float(intent_cfg["x"]) + emo_head_x
         self.target_params["v_head_y"] = float(intent_cfg["y"]) + emo_head_y
@@ -282,24 +290,26 @@ class SpeechAnimator(BaseAnimator):
             frame = self._envelope_tracker.current()
             if frame.rms > 0.0:
                 attenuation = (
-                    self._neutral_attenuation
-                    if self.emotion_type == "neutral"
-                    else 1.0
+                    self._neutral_attenuation if self.emotion_type == "neutral" else 1.0
                 )
                 # 主频带：rms 直接驱动头部前后倾。声音大时头微抬，自然感。
                 dynamic_y += frame.rms * self._head_y_gain * attenuation
                 # 横向轻微摆头：用一个慢振荡 + rms 振幅，让侧脸也有动作。
                 dynamic_x += (
-                    math.sin(time.time() * 4.0) * frame.rms
-                    * self._head_x_gain * attenuation
+                    math.sin(time.time() * 4.0)
+                    * frame.rms
+                    * self._head_x_gain
+                    * attenuation
                 )
                 # 身体律动：用 velocity（变化率）驱动。突变量大 = 节奏感强。
                 dynamic_body_y += frame.velocity * self._body_y_gain * attenuation
                 # 韵律向上半身扩散：音量 → 横向轻摆；volume → 上下弹跳；
                 # velocity → 节拍侧向。三路默认增益保守，避免抢过口型 / 头部。
                 dynamic_body_x += (
-                    math.sin(time.time() * 4.0) * frame.rms
-                    * self._body_x_gain * attenuation
+                    math.sin(time.time() * 4.0)
+                    * frame.rms
+                    * self._body_x_gain
+                    * attenuation
                 )
                 dynamic_body_y += frame.rms * self._body_bounce_k * attenuation
                 dynamic_body_z += frame.velocity * self._body_z_gain * attenuation

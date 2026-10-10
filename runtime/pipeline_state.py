@@ -1,40 +1,10 @@
-"""anima_chatter vtb_live 音频流水线状态机。
-
-仅在 ``vtb_live`` 模式下生效，目的是让"Action 提前返回 + 后台音频持续播放"
-不打架——按 stream 维护两个时间戳：
-
-- ``audio_finish_at``：物理音频队列里最后一段音频**预计播完**的时刻；下一次
-  ``reserve`` 的新音频从这里之后开始排队。
-- ``round_start_at``：**本轮 LLM 调用**第一次 ``reserve`` 的起点；据此算出
-  "流水线门"时刻，LLM 到点才被放行去准备下一轮。
-
-关键语义：
-
-1. **轮内**多个 Action 的 reserve 紧接排队，不加 silence_gap（同一轮连贯输出）。
-2. **跨轮**第一个 reserve 加 silence_gap（可带随机抖动），避免接得太急。
-3. 本轮累积时长低于 ``min_duration_seconds`` 时不启用流水线，门时刻返回 0。
-4. 跨轮判定由调用方显式调 :func:`reset_round` 标记。
-
-Action 内的协议::
-
-    start_at, finish_at = await reserve(stream_id, duration)
-    # 派发后台 task：等到 start_at → 播放 → 直到 finish_at
-    # Action 立即返回，**不**等待 finish_at
-
-LLM 入口的协议::
-
-    await wait_gate(stream_id)   # 阻塞直到门时刻
-    await reset_round(stream_id) # 通过门 → 标记新一轮
-
-用模块级状态而非 Service 的理由同 :mod:`.call_state`。
-"""
+"""anima_chatter 语音回复轮次的音频容量状态机。"""
 
 from __future__ import annotations
 
 import asyncio
-import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from src.app.plugin_system.api.log_api import get_logger
@@ -43,6 +13,7 @@ from .._internal_compat import (
     BackgroundTaskHandle,
     cancel_background_task,
     create_background_task,
+    wait_state_snapshot,
     wake_stream_from_wait,
 )
 from .heartbeat import feed_watchdog_during
@@ -56,8 +27,11 @@ __all__ = [
     "clear_all",
     "configure",
     "is_gate_pending",
+    "relinquish",
+    "report_actual",
     "reserve",
     "reset_round",
+    "seal_empty_round",
     "wait_gate",
 ]
 
@@ -69,31 +43,41 @@ logger = get_logger("anima_chatter.pipeline")
 class _StreamState:
     """单条 stream 的流水线状态。"""
 
-    audio_finish_at: float = 0.0
-    """物理音频队列中最后一段音频预计播完的 ``time.monotonic()`` 时刻。"""
-
-    round_start_at: float = 0.0
-    """本轮 LLM 调用第一次 reserve 的起点（用于计算门时刻）。"""
-
-    round_accumulated: float = 0.0
-    """本轮累积音频时长（秒，不含 silence_gap）。:func:`reset_round` 时清零。"""
-
-    is_round_first: bool = True
-    """下一次 reserve 是否为本轮第一次。控制 silence_gap 是否加入起点。"""
-
-    last_silence_gap_used: float = 0.0
-    """最近一次跨轮 reserve 实际使用的 silence_gap（含抖动），仅供日志。"""
-
     wakeup_handle: BackgroundTaskHandle | None = None
-    """当前轮的门到点唤醒任务句柄；每次 reserve 重新调度。"""
+    """当前容量门唤醒任务句柄。"""
+
+    round_id: int = 0
+    current_round_id: int = 0
+    next_round_id: int | None = None
+    current_round_started: bool = False
+    target_round_id: int = 0
+    target_round_sealed: bool = False
+    change_event: asyncio.Event = field(default_factory=asyncio.Event)
+    reservations: dict[str, _Reservation] = field(default_factory=dict)
+    next_track_id: int = 0
 
 
-_section: "PipeliningSection | None" = None
+@dataclass(slots=True)
+class _Reservation:
+    """单条音频在回复轮中的容量占用与实际播放事件。"""
+
+    round_id: int
+    duration: float
+    kind: str
+    started_at: float | None = None
+    finished_at: float | None = None
+
+
+_section: PipeliningSection | None = None
 _states: dict[str, _StreamState] = {}
 _lock = asyncio.Lock()
 
+# 唤醒必达：注入唤醒后确认 stream 已脱离 Wait 的重试参数。
+_WAKEUP_CONFIRM_INTERVAL = 0.5
+_WAKEUP_CONFIRM_ATTEMPTS = 10
 
-def configure(section: "PipeliningSection") -> None:
+
+def configure(section: PipeliningSection) -> None:
     """注入 ``[pipelining]`` 配置段。插件 ``on_plugin_loaded`` 时调用一次。
 
     重复调用以最后一次为准；不清空已有状态——配置改了状态依然有效。
@@ -105,11 +89,22 @@ def configure(section: "PipeliningSection") -> None:
     global _section
     _section = section
     logger.info(
-        f"流水线配置已应用: enabled={section.enabled}, "
-        f"trigger_percent={section.trigger_percent:.2f}, "
-        f"silence_gap={section.silence_gap_seconds:.1f}s, "
-        f"min_duration={section.min_duration_seconds:.1f}s"
+        f"流水线配置已应用: song_prepare_lead="
+        f"{section.song_prepare_lead_seconds:.1f}s, "
+        f"max_backlog={_max_backlog_unlocked():.0f}s"
     )
+
+
+def _max_backlog_unlocked() -> float:
+    """读取积压上限配置。
+
+    Returns:
+        最大允许积压秒数；未 configure 时不限制积压。
+    """
+
+    if _section is None:
+        return float("inf")
+    return float(_section.max_backlog_seconds)
 
 
 def _get_state_unlocked(stream_id: str) -> _StreamState:
@@ -129,56 +124,6 @@ def _get_state_unlocked(stream_id: str) -> _StreamState:
     return state
 
 
-def _gate_at_unlocked(state: _StreamState) -> float:
-    """**不加锁**地计算流水线门时刻。
-
-    门时刻取 ``max(trigger_percent 时刻, 结束前 min_remaining_seconds 时刻)``
-    ——两者取**较晚者**，尽可能多吞吐弹幕：
-
-    - 短回复（30s, trigger=60%）：trigger 给 +18s，"结束前 25s" 给 +5s → 取 +18s
-    - 长歌曲（180s, trigger=60%）：trigger 给 +108s，"结束前 25s" 给 +155s → 取 +155s
-
-    Args:
-        state: 目标 stream 的状态。
-
-    Returns:
-        ``time.monotonic()`` 口径的门时刻；返回 ``0.0`` 表示本轮不启用流水线。
-    """
-
-    if _section is None or not _section.enabled:
-        return 0.0
-    if state.round_accumulated < _section.min_duration_seconds:
-        return 0.0
-
-    trigger_gate = (
-        state.round_start_at + state.round_accumulated * _section.trigger_percent
-    )
-    min_remaining = _section.min_remaining_seconds
-    if min_remaining <= 0:
-        return trigger_gate
-    # finish_at 即 round_start_at + round_accumulated（轮内没有插入间隔）。
-    late_gate = state.round_start_at + state.round_accumulated - min_remaining
-    return max(trigger_gate, late_gate)
-
-
-async def is_gate_pending(stream_id: str) -> bool:
-    """返回指定流是否存在尚未通过的有效流水线门。
-
-    Args:
-        stream_id: 目标聊天流 ID。
-
-    Returns:
-        存在未到点的门时返回 ``True``。
-    """
-
-    async with _lock:
-        state = _states.get(stream_id)
-        if state is None:
-            return False
-        gate = _gate_at_unlocked(state)
-    return gate > time.monotonic()
-
-
 def _cancel_wakeup_unlocked(state: _StreamState) -> None:
     """取消状态关联的唤醒任务并清空句柄。
 
@@ -191,213 +136,75 @@ def _cancel_wakeup_unlocked(state: _StreamState) -> None:
     cancel_background_task(handle)
 
 
-def _schedule_wakeup_unlocked(stream_id: str, state: _StreamState) -> None:
-    """**不加锁**地（重新）调度"门到点唤醒 stream loop"的后台任务。
+async def _wake_and_confirm(stream_id: str) -> None:
+    """注入唤醒并轮询确认 stream 已脱离 Wait；失败重复注入（唤醒必达）。
 
-    每次 reserve 后调用：先取消之前调度的任务（累积时长变化会推迟门时刻），
-    再按当前门时刻重新起一个。门时刻为 0（未启用 / 累积不足）时不起任务。
-
-    必须在已持有 :data:`_lock` 的上下文中调用。
+    only_if_new_unreads=True：仅在确实有新弹幕时唤醒，避免 LLM 没事找事
+    主动发起对话。若注入时 stream 恰好不在 Wait 状态（上一轮 LLM 还没返回），
+    事件会被框架丢弃——确认时以**注入前的未读计数基线**为对照：仍在 Wait
+    且未读计数未推进，才能判定注入真被消费（或已进入新一轮 Wait）；仅
+    "仍处于 Wait" 不够——旧 Wait + 未消费的注入事件也表现为 waiting=True。
 
     Args:
         stream_id: 目标聊天流 ID。
-        state: 该 stream 的状态。
     """
 
-    _cancel_wakeup_unlocked(state)
-
-    gate = _gate_at_unlocked(state)
-    if gate <= 0:
-        return
-
-    now = time.monotonic()
-    wait_seconds = max(0.0, gate - now)
-
-    async def _wakeup() -> None:
-        """到点后按需唤醒 stream loop。"""
-
+    baseline: float | None = None
+    confirm_error_logged = False
+    for attempt in range(1, _WAKEUP_CONFIRM_ATTEMPTS + 1):
         try:
-            if wait_seconds > 0:
-                await asyncio.sleep(wait_seconds)
-            # only_if_new_unreads=True：仅在确实有新弹幕时唤醒，避免 LLM
-            # 没事找事主动发起对话。
-            if wake_stream_from_wait(stream_id, only_if_new_unreads=True):
+            _, baseline = wait_state_snapshot(stream_id)
+            woke = wake_stream_from_wait(stream_id, only_if_new_unreads=True)
+            if not woke:
+                # 无新弹幕或无 wait 状态可解除：无事可做。
                 logger.info(
-                    f"[pipeline {stream_id[:8]}] 流水线门到点（{wait_seconds:.2f}s 后）"
-                    "+ 检测到新累积弹幕 → 主动唤醒 stream loop 处理"
-                )
-            else:
-                logger.info(
-                    f"[pipeline {stream_id[:8]}] 流水线门到点（{wait_seconds:.2f}s 后）"
+                    f"[pipeline {stream_id[:8]}] 流水线门到点，"
                     "但无新弹幕累积，继续保持 Wait"
                 )
-        except asyncio.CancelledError:
-            pass
+                return
+        except RuntimeError as exc:
+            # 兼容层结构失效：不可伪装成成功，也不能多重试——每轮都会同样
+            # 失败。记 ERROR 并终止本轮确认（S1 hack 失效应有可见性）。
+            logger.error(
+                f"[pipeline {stream_id[:8]}] 唤醒确认失败：{exc}（兼容层失效，"
+                "本轮放弃确认循环；请检查框架 stream loop 结构变更）"
+            )
+            return
 
-    state.wakeup_handle = create_background_task(
-        _wakeup(),
-        name=f"anima_chatter.pipeline_wakeup.{stream_id[:8]}",
-        metadata={"stream_id": stream_id, "kind": "pipeline_wakeup"},
+        logger.info(
+            f"[pipeline {stream_id[:8]}] 流水线门到点，已注入唤醒"
+            f"（第 {attempt} 次），等待 stream loop 响应"
+        )
+        # 确认：等待一小段时间后检查 Wait 状态是否已被消费。
+        await asyncio.sleep(_WAKEUP_CONFIRM_INTERVAL)
+        try:
+            waiting, unread_at_yield = wait_state_snapshot(stream_id)
+        except RuntimeError as exc:
+            if not confirm_error_logged:
+                logger.error(
+                    f"[pipeline {stream_id[:8]}] 唤醒后确认快照不可用: {exc}"
+                    "（注入已发出，跳过后续确认）"
+                )
+                confirm_error_logged = True
+            return
+        if not waiting:
+            logger.info(
+                f"[pipeline {stream_id[:8]}] 唤醒已确认：stream loop 已脱离 Wait"
+            )
+            return
+        # 仍在 Wait——两种情况：注入被消费后进入新一轮 Wait（未读计数推进），
+        # 或注入被丢弃（旧 Wait + 计数未推进）。与注入前基线比较才能区分。
+        if unread_at_yield is not None and unread_at_yield != baseline:
+            logger.info(
+                f"[pipeline {stream_id[:8]}] stream 处于新一轮 Wait"
+                "（未读计数已推进），唤醒视为已生效"
+            )
+            return
+
+    logger.error(
+        f"[pipeline {stream_id[:8]}] 唤醒注入 {_WAKEUP_CONFIRM_ATTEMPTS} 次"
+        "均未确认生效——stream loop 可能假死，请检查日志中上一轮 LLM 调用状态"
     )
-
-
-def _resolve_round_base_unlocked(state: _StreamState, now: float) -> float:
-    """计算本次 reserve 的起播时刻。
-
-    跨轮第一次：等上一轮播完再加 silence_gap（含随机抖动）；轮内后续：紧接
-    队列尾，不加间隔。
-
-    Args:
-        state: 目标 stream 的状态。
-        now: 当前 ``time.monotonic()``。
-
-    Returns:
-        本段音频应该开始播放的时刻。
-    """
-
-    if not state.is_round_first:
-        return max(now, state.audio_finish_at)
-
-    if state.audio_finish_at > now and _section is not None:
-        gap = _section.silence_gap_seconds
-        jitter = _section.silence_gap_jitter
-        if jitter > 0:
-            gap = max(0.0, gap + random.uniform(-jitter, jitter))
-        state.last_silence_gap_used = gap
-        base = state.audio_finish_at + gap
-    else:
-        state.last_silence_gap_used = 0.0
-        base = now
-
-    state.round_start_at = base
-    state.is_round_first = False
-    return base
-
-
-async def reserve(stream_id: str, duration: float) -> tuple[float, float]:
-    """预约一段音频在播放队列中的位置。
-
-    Args:
-        stream_id: 目标聊天流 ID。
-        duration: 该段音频的物理时长（秒），**不含**任何 silence_gap。
-
-    Returns:
-        ``(start_at, finish_at)`` —— ``time.monotonic()`` 口径的起播与结束时刻。
-        调用方应立即派发后台 task（睡到 ``start_at`` → 播放），Action 自身**不**
-        等待 ``finish_at``。
-    """
-
-    duration = max(0.0, float(duration))
-    if duration == 0.0:
-        now = time.monotonic()
-        return now, now
-
-    async with _lock:
-        state = _get_state_unlocked(stream_id)
-        now = time.monotonic()
-
-        start_at = _resolve_round_base_unlocked(state, now)
-        finish_at = start_at + duration
-        state.audio_finish_at = finish_at
-        state.round_accumulated += duration
-
-        is_round_first_log = state.round_accumulated == duration
-        round_marker = "新一轮第一段" if is_round_first_log else "同轮追加"
-        gap_info = (
-            f", silence_gap={state.last_silence_gap_used:.2f}s"
-            if is_round_first_log and state.last_silence_gap_used > 0
-            else ""
-        )
-        logger.info(
-            f"[pipeline {stream_id[:8]}] reserve {round_marker}: "
-            f"duration={duration:.2f}s, start_in={start_at - now:.2f}s, "
-            f"finish_in={finish_at - now:.2f}s, "
-            f"round_acc={state.round_accumulated:.2f}s{gap_info}"
-        )
-
-        # 累计时长变化会推迟门时刻，需要重新调度唤醒任务。
-        _schedule_wakeup_unlocked(stream_id, state)
-
-        return start_at, finish_at
-
-
-async def wait_gate(stream_id: str) -> None:
-    """阻塞直到流水线门时刻到达。
-
-    在即将发起新一轮 LLM 调用前调用，让 LLM 等到累积音频播放到
-    ``trigger_percent`` 之后再执行。以下情况立即返回：流水线未启用、本轮累积
-    时长不足 ``min_duration_seconds``、门时刻已过。
-
-    本函数**不**调用 :func:`reset_round`——由上层在通过门后自行决定是否标记
-    新一轮，避免在 timer 唤醒等"非真正消费"路径误清状态。
-
-    Args:
-        stream_id: 目标聊天流 ID。
-
-    Raises:
-        asyncio.CancelledError: 流被取消时透传，不阻塞清理路径。
-    """
-
-    async with _lock:
-        state = _get_state_unlocked(stream_id)
-        gate = _gate_at_unlocked(state)
-        accumulated = state.round_accumulated
-
-    if gate <= 0:
-        return
-
-    now = time.monotonic()
-    if gate <= now:
-        logger.info(
-            f"[pipeline {stream_id[:8]}] 流水线门已过（直通）: "
-            f"gate-now={gate - now:.2f}s"
-        )
-        return
-
-    wait_seconds = gate - now
-    trigger_percent = _section.trigger_percent if _section is not None else 0.0
-    logger.info(
-        f"[pipeline {stream_id[:8]}] LLM 等流水线门：阻塞 {wait_seconds:.2f}s "
-        f"(累计 {trigger_percent * 100:.0f}% 触发点；本轮总时长 ≈ {accumulated:.1f}s)"
-    )
-
-    # 门可能阻塞数十秒，期间 chatter 主循环没机会 yield 心跳——必须主动喂
-    # watchdog，避免触发框架的 stream 重启阈值。
-    try:
-        async with feed_watchdog_during(stream_id, interval=5.0):
-            await asyncio.sleep(wait_seconds)
-        logger.info(f"[pipeline {stream_id[:8]}] 流水线门通过，LLM 开始新一轮调用")
-    except asyncio.CancelledError:
-        logger.info(f"[pipeline {stream_id[:8]}] wait_gate 被取消")
-        raise
-
-
-async def reset_round(stream_id: str) -> None:
-    """标记下一次 reserve 是新一轮的开始。
-
-    通常在通过 :func:`wait_gate` 之后立即调用——让下一次 reserve 计算起点时把
-    silence_gap 加进去。清理本轮累积，但**不**清 ``audio_finish_at``（队列里
-    还有未播完的音频，新轮 reserve 必须基于它排队）。
-
-    Args:
-        stream_id: 目标聊天流 ID。
-    """
-
-    async with _lock:
-        state = _get_state_unlocked(stream_id)
-        had_round = state.round_accumulated > 0
-        state.is_round_first = True
-        state.round_accumulated = 0.0
-        state.round_start_at = 0.0
-        remaining = max(0.0, state.audio_finish_at - time.monotonic())
-        # 本轮的门已经用完，取消它的唤醒任务。
-        _cancel_wakeup_unlocked(state)
-
-    if had_round:
-        logger.info(
-            f"[pipeline {stream_id[:8]}] reset_round：本轮累积清零，"
-            f"队列剩余 {remaining:.1f}s 音频未播完"
-        )
 
 
 async def clear(stream_id: str) -> None:
@@ -412,6 +219,7 @@ async def clear(stream_id: str) -> None:
     async with _lock:
         state = _states.pop(stream_id, None)
         if state is not None:
+            state.change_event.set()
             _cancel_wakeup_unlocked(state)
     if state is not None:
         logger.info(f"[pipeline {stream_id[:8]}] 状态已彻底清空")
@@ -424,6 +232,293 @@ async def clear_all() -> None:
         states = list(_states.values())
         _states.clear()
         for state in states:
+            state.change_event.set()
             _cancel_wakeup_unlocked(state)
     if states:
         logger.info(f"流水线状态已全部清空，共 {len(states)} 条流")
+
+
+async def is_gate_pending(stream_id: str) -> bool:
+    """判断是否尚不能准备唯一的下一回复轮。"""
+
+    async with _lock:
+        state = _states.get(stream_id)
+        return state is not None and not _gate_open_unlocked(state, time.monotonic())
+
+
+def _active_round_unlocked(
+    state: _StreamState,
+) -> list[_Reservation]:
+    """返回当前轮尚未结束的项目。"""
+
+    return [
+        item
+        for item in state.reservations.values()
+        if item.round_id == state.current_round_id and item.finished_at is None
+    ]
+
+
+def _gate_open_unlocked(state: _StreamState, now: float) -> bool:
+    """按实际起播和当前轮存量判断下一轮容量。"""
+
+    if state.next_round_id is not None:
+        return False
+    active = _active_round_unlocked(state)
+    if not active:
+        return True
+    lead = _section.song_prepare_lead_seconds if _section is not None else 25.0
+    for item in active:
+        if item.kind == "song" and (
+            item.started_at is None
+            or item.started_at + item.duration - lead > now
+        ):
+            return False
+    return any(item.started_at is not None for item in active) or state.current_round_started
+
+
+def _schedule_wakeup_unlocked(stream_id: str, state: _StreamState) -> None:
+    """状态变化时循环检查容量并恢复有新未读的 stream。"""
+
+    state.change_event.set()
+    handle = state.wakeup_handle
+    task = getattr(handle, "task", None) if handle is not None else None
+    if task is not None and not task.done():
+        return
+
+    async def _wakeup() -> None:
+        """等待状态开放或歌曲进入尾段。"""
+
+        while True:
+            async with _lock:
+                current = _states.get(stream_id)
+                if current is None or _gate_open_unlocked(current, time.monotonic()):
+                    break
+                current.change_event.clear()
+                change_event = current.change_event
+                lead = _section.song_prepare_lead_seconds if _section else 25.0
+                deadlines = [
+                    item.started_at + item.duration - lead
+                    for item in _active_round_unlocked(current)
+                    if item.kind == "song" and item.started_at is not None
+                ]
+                remaining = (
+                    max(0.05, min(deadlines) - time.monotonic())
+                    if deadlines
+                    else 0.5
+                )
+            async with feed_watchdog_during(stream_id, interval=5.0):
+                try:
+                    await asyncio.wait_for(change_event.wait(), timeout=remaining)
+                except TimeoutError:
+                    pass
+        await _wake_and_confirm(stream_id)
+
+    state.wakeup_handle = create_background_task(
+        _wakeup(),
+        name=f"anima_chatter.pipeline_wakeup.{stream_id[:8]}",
+        metadata={"stream_id": stream_id, "kind": "pipeline_wakeup"},
+    )
+
+
+async def reserve(
+    stream_id: str,
+    duration: float,
+    *,
+    track_id: str = "",
+    kind: str = "speech",
+) -> tuple[float, float] | None:
+    """登记单项音频容量并返回仅供估算的时刻区间。"""
+
+    duration = max(0.0, float(duration))
+    if duration == 0.0:
+        now = time.monotonic()
+        return now, now
+    async with _lock:
+        state = _get_state_unlocked(stream_id)
+        now = time.monotonic()
+        if state.target_round_id == 0:
+            if state.current_round_id == 0:
+                state.round_id += 1
+                state.current_round_id = state.round_id
+            state.target_round_id = state.current_round_id
+        round_id = state.target_round_id
+        claim_next_round = (
+            round_id != state.current_round_id and state.next_round_id is None
+        )
+        if claim_next_round and not _gate_open_unlocked(state, now):
+            return None
+        backlog = sum(
+            item.duration
+            for item in state.reservations.values()
+            if item.finished_at is None
+            and (
+                item.round_id != state.current_round_id
+                or item.kind != "song"
+            )
+        )
+        added_backlog = (
+            duration
+            if round_id != state.current_round_id or kind != "song"
+            else 0.0
+        )
+        if (
+            _section is not None
+            and backlog + added_backlog > _section.max_backlog_seconds
+        ):
+            return None
+        state.next_track_id += 1
+        track_id = track_id or f"{stream_id}:{state.next_track_id}"
+        if track_id in state.reservations:
+            return None
+        if claim_next_round:
+            state.next_round_id = round_id
+        state.reservations[track_id] = _Reservation(round_id, duration, kind)
+        _schedule_wakeup_unlocked(stream_id, state)
+        return now, now + duration
+
+
+async def report_actual(
+    stream_id: str,
+    *,
+    track_id: str,
+    started_at: float | None = None,
+    finished_at: float | None = None,
+) -> None:
+    """更新该音频项实际起播或结束时间，单项结束不影响同轮其他项。"""
+
+    async with _lock:
+        state = _states.get(stream_id)
+        item = state.reservations.get(track_id) if state is not None else None
+        if item is None:
+            return
+        reservation = item
+        if started_at is not None:
+            reservation.started_at = started_at
+            if reservation.round_id == state.current_round_id:
+                state.current_round_started = True
+            if reservation.round_id == state.next_round_id:
+                state.current_round_id = reservation.round_id
+                state.next_round_id = None
+                state.current_round_started = True
+        if finished_at is not None:
+            reservation.finished_at = finished_at
+        if reservation.finished_at is not None:
+            state.reservations.pop(track_id, None)
+            if (
+                reservation.round_id == state.current_round_id
+                and not _active_round_unlocked(state)
+                and state.next_round_id is not None
+            ):
+                state.current_round_id = state.next_round_id
+                state.next_round_id = None
+                state.current_round_started = False
+        _schedule_wakeup_unlocked(stream_id, state)
+
+
+async def relinquish(
+    stream_id: str,
+    *,
+    track_id: str,
+    reserved_until: float | None = None,
+) -> None:
+    """只释放指定的失败或取消项目。"""
+
+    del reserved_until
+    async with _lock:
+        state = _states.get(stream_id)
+        if state is None:
+            return
+        item = state.reservations.pop(track_id, None)
+        if item is not None and item.round_id == state.next_round_id and not any(
+            reservation.round_id == state.next_round_id
+            for reservation in state.reservations.values()
+        ):
+            state.next_round_id = None
+        if (
+            item is not None
+            and item.round_id == state.current_round_id
+            and not _active_round_unlocked(state)
+            and state.next_round_id is not None
+        ):
+            state.current_round_id = state.next_round_id
+            state.next_round_id = None
+            state.current_round_started = False
+        if item is not None:
+            _schedule_wakeup_unlocked(stream_id, state)
+
+
+async def wait_gate(stream_id: str) -> None:
+    """等待容量条件变化；循环重查且不绕过长歌曲门。"""
+
+    async with feed_watchdog_during(stream_id, interval=5.0):
+        while True:
+            async with _lock:
+                state = _states.get(stream_id)
+                if state is None or _gate_open_unlocked(state, time.monotonic()):
+                    return
+                state.change_event.clear()
+                change_event = state.change_event
+                lead = _section.song_prepare_lead_seconds if _section else 25.0
+                deadlines = [
+                    item.started_at + item.duration - lead
+                    for item in _active_round_unlocked(state)
+                    if item.kind == "song" and item.started_at is not None
+                ]
+                timeout = (
+                    max(0.05, min(deadlines) - time.monotonic())
+                    if deadlines
+                    else None
+                )
+            try:
+                await asyncio.wait_for(change_event.wait(), timeout=timeout)
+            except TimeoutError:
+                continue
+
+
+async def reset_round(stream_id: str) -> None:
+    """标记一次真实 Actor 生成轮次；FOLLOW_UP 不应调用。"""
+
+    async with _lock:
+        state = _get_state_unlocked(stream_id)
+        if state.target_round_sealed:
+            state.round_id += 1
+            state.target_round_id = state.round_id
+            state.target_round_sealed = False
+            _cancel_wakeup_unlocked(state)
+            return
+        if state.next_round_id is not None:
+            state.current_round_id = state.next_round_id
+            state.next_round_id = None
+            state.target_round_id = state.current_round_id
+            state.current_round_started = False
+            _cancel_wakeup_unlocked(state)
+            return
+        if state.current_round_id == 0:
+            state.round_id += 1
+            state.current_round_id = state.round_id
+            state.target_round_id = state.round_id
+        elif state.target_round_id == state.current_round_id and state.current_round_started:
+            state.round_id += 1
+            state.target_round_id = state.round_id
+        _cancel_wakeup_unlocked(state)
+
+
+async def seal_empty_round(stream_id: str) -> None:
+    """封存未登记任何音频的 Actor 轮，供 NDFC 回到 WAIT_USER 时调用。"""
+
+    async with _lock:
+        state = _states.get(stream_id)
+        if state is None:
+            return
+        if any(
+            item.round_id == state.target_round_id
+            for item in state.reservations.values()
+        ):
+            return
+        if (
+            state.target_round_id == state.current_round_id
+            and state.current_round_started
+        ):
+            return
+        state.target_round_sealed = True
+        state.change_event.set()

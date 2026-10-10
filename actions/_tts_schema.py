@@ -1,8 +1,7 @@
 """Action 共享的 TTS schema 注入工具。
 
-``say`` 与 ``say_and_perform`` 都不预设任何 TTS 参数——参数集完全由 TTS Provider
-的 ``get_capabilities()`` 定义，在 ``to_schema()`` 时动态注入。这样换 provider
-时无需改插件代码。
+直播语音参数由 TTS Provider 的 ``get_capabilities()`` 动态注入，
+仅暴露 PCM 流支持的参数。
 """
 
 from __future__ import annotations
@@ -14,17 +13,16 @@ from src.app.plugin_system.api.service_api import get_service
 
 from .._internal_compat import get_anima_chatter_plugin
 
-
 logger = get_logger("anima_chatter.action.tts_schema")
 
 
 __all__ = ["get_tts_capabilities", "inject_tts_params"]
 
 
-_TTS_REGISTRY_SERVICE = "tts_http_server:service:tts_provider_registry"
+_TTS_SERVICE = "tts_voice_plugin-neo:service:speech"
 
 # 注入顺序固定，保证模型每次看到的参数排列一致。
-_PARAM_ORDER = ("style", "language", "speed", "effects", "aux_refer_wav_paths")
+_PARAM_ORDER = ("style", "language", "speed", "aux_refer_wav_paths")
 
 
 def get_tts_capabilities() -> Any | None:
@@ -41,18 +39,11 @@ def get_tts_capabilities() -> Any | None:
     if plugin is not None and plugin.tts_capabilities is not None:
         return plugin.tts_capabilities
 
-    registry = get_service(_TTS_REGISTRY_SERVICE)
-    if registry is None:
+    service = get_service(_TTS_SERVICE)
+    if service is None:
         return None
 
-    get_provider = getattr(registry, "get_provider", None)
-    if not callable(get_provider):
-        return None
-    provider = get_provider()
-    if provider is None:
-        return None
-
-    get_capabilities = getattr(provider, "get_capabilities", None)
+    get_capabilities = getattr(service, "get_capabilities", None)
     caps = get_capabilities() if callable(get_capabilities) else None
     if caps is not None and plugin is not None:
         plugin.tts_capabilities = caps

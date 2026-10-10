@@ -1,26 +1,16 @@
 """anima_chatter 的本地音频播放器。
 
-把 TTS 合成出来的 WAV bytes 输出到指定的 sounddevice 设备（通常是
-VB-Audio Cable Input），让 VTube Studio 的麦克风输入听到声音从而驱动嘴型。
-
-实现移植自 D:\\Desktop\\soul_chatter_plugin\\services\\audio_player.py，
-仅做以下调整：
-
-- ``get_logger`` 改为 ``src.kernel.logger.get_logger``。
-- 构造参数改为接收 ``output_device: str``，不再读裸 dict，方便插件层注入。
-- 单例式 ``_play_lock`` 保留，确保播放严格按顺序串行。
-
-降级策略：
-
-1. 优先按 ``设备名@WASAPI`` 匹配，并请求 ``latency='high'`` 缓冲，最稳。
-2. WASAPI 失败时尝试 MME。
-3. 最后回退到系统默认设备。
+PCM 连续流、整轨音频和双轨歌曲共用播放锁，输出到配置的 sounddevice 设备。
+播放包络供 VTube Studio 动画使用；取消时等待输出线程结束后释放资源。
 """
 
 from __future__ import annotations
 
 import asyncio
 import io
+import queue
+import threading
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import numpy as np
@@ -29,8 +19,8 @@ import soundfile as sf  # type: ignore
 
 from src.app.plugin_system.api.log_api import get_logger
 
+from .._internal_compat import create_background_task
 from .envelope import EnvelopeTracker, compute_envelope
-
 
 logger = get_logger("anima_chatter.audio_player")
 
@@ -38,6 +28,12 @@ logger = get_logger("anima_chatter.audio_player")
 # envelope 计算 / 消费的步长，与 VTSConnection._animation_loop 的 30Hz 对齐。
 # 改这个值需要同时改 SpeechAnimator 那边的查询节奏。
 _ENVELOPE_HOP_SECONDS = 1.0 / 30.0
+
+# 设备故障熔断：连续 N 次播放失败后进入熔断，期间跳过播放直达 ERROR，
+# 每隔冷却秒数放行一次重试探测（避免设备持续故障时每条音频都触发
+# PortAudio 全量重启）。
+_DEVICE_FAILURE_THRESHOLD = 3
+_DEVICE_RETRY_INTERVAL = 60.0
 
 
 class AudioPlayer:
@@ -81,6 +77,10 @@ class AudioPlayer:
         self._prefer_fallback: bool = False
         self._fallback_device_id: int | None = None
 
+        # 设备故障熔断状态：连续失败计数 + 最近一次成功 / 熔断开启时刻。
+        self._device_failures = 0
+        self._device_open_until = 0.0
+
         # 音频包络追踪器。播放期间由动画器（SpeechAnimator）按 30Hz 查询，
         # 用来驱动头部 / 身体的"语调微动"，让 VTB 看起来"跟着声音动"。
         # 与 sounddevice 的 sd.play 异步，但有共享线程锁；查询安全。
@@ -88,6 +88,177 @@ class AudioPlayer:
 
         self._resolve_device()
         self._resolve_inst_device()
+
+    async def play_pcm_stream(
+        self,
+        chunks: AsyncIterator[bytes],
+        *,
+        sample_rate: int,
+        channels: int = 1,
+        sample_format: str = "s16le",
+        on_started: Callable[[], Awaitable[None]] | None = None,
+        start_after_frames: int = 0,
+    ) -> int:
+        """独立供给单个 PCM 输出流，反馈不阻塞供音，返回写出的帧数。
+
+        Args:
+            chunks: 音频及显式静音组成的 PCM 流。
+            sample_rate: 输出采样率。
+            channels: 声道数。
+            sample_format: PCM 格式，必须为 s16le。
+            on_started: 首次非前置静音写入后的回调，在调用任务中执行。
+            start_after_frames: 起播反馈前需要写出的前置静音帧数。
+
+        Returns:
+            包含显式静音的实际输出帧数。
+        """
+
+        if sample_rate <= 0 or channels <= 0 or sample_format != "s16le":
+            raise ValueError("PCM metadata must specify positive rate/channels and s16le")
+        if start_after_frames < 0:
+            raise ValueError("start_after_frames must not be negative")
+
+        async with self._play_lock:
+            output_queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=4)
+            stop_event = threading.Event()
+            ready_event = threading.Event()
+            first_write_event = threading.Event()
+            worker_error: list[BaseException] = []
+            frames_written = 0
+            output_underflows = 0
+            self.envelope_tracker.begin_stream(sample_rate, _ENVELOPE_HOP_SECONDS)
+
+            def write_output() -> None:
+                """在线程中写入 PCM 并记录输出进度。"""
+
+                nonlocal frames_written, output_underflows
+                device = self.output_device_id
+                if self._prefer_fallback:
+                    fallback_id = self._resolve_fallback_device_id()
+                    if fallback_id is not None:
+                        device = fallback_id
+                try:
+                    with sd.OutputStream(
+                        samplerate=sample_rate,
+                        channels=channels,
+                        dtype="float32",
+                        device=device,
+                        latency="high",
+                        extra_settings=self._build_extra_settings(device),
+                    ) as stream:
+                        ready_event.set()
+                        while not stop_event.is_set():
+                            try:
+                                block = output_queue.get(timeout=0.05)
+                            except queue.Empty:
+                                continue
+                            if block is None:
+                                break
+                            if stream.write(block):
+                                output_underflows += 1
+                            frames_written += len(block)
+                            self.envelope_tracker.append_stream_pcm(block)
+                            if frames_written > start_after_frames:
+                                first_write_event.set()
+                except Exception as exc:
+                    worker_error.append(exc)
+                    logger.error(f"PCM output stream failed: {exc}", exc_info=True)  # noqa: G201
+                finally:
+                    ready_event.set()
+                    first_write_event.set()
+
+            writer = threading.Thread(
+                target=write_output, name="anima-pcm-writer", daemon=True
+            )
+            writer.start()
+            frame_bytes = 2 * channels
+            block_bytes = max(frame_bytes, sample_rate * frame_bytes // 10)
+            block_bytes -= block_bytes % frame_bytes
+
+            async def enqueue(block: bytes | None) -> None:
+                """转换 PCM 字节并写入有界设备队列，None 表示结束。"""
+
+                pcm = (
+                    (np.frombuffer(block, dtype="<i2").astype(np.float32) / 32768.0)
+                    .reshape(-1, channels)
+                    if block is not None else None
+                )
+                while True:
+                    if worker_error:
+                        raise RuntimeError("PCM output stream failed") from worker_error[0]
+                    if stop_event.is_set():
+                        raise RuntimeError("PCM output stream stopped")
+                    try:
+                        await asyncio.to_thread(output_queue.put, pcm, True, 0.1)
+                        return
+                    except queue.Full:
+                        continue
+
+            async def feed_pcm() -> None:
+                """持续填充声卡队列，不等待文本或表演反馈。"""
+
+                pending = bytearray()
+                received_pcm = False
+                first_block_sent = False
+                try:
+                    async for chunk in chunks:
+                        if not isinstance(chunk, bytes):
+                            raise TypeError("PCM chunks must be bytes")
+                        pending.extend(chunk)
+                        usable = len(pending) - len(pending) % frame_bytes
+                        if usable and not received_pcm:
+                            received_pcm = True
+                            await asyncio.to_thread(ready_event.wait)
+                            if worker_error:
+                                raise RuntimeError("PCM output stream failed") from worker_error[0]
+                        while usable >= block_bytes or (not first_block_sent and usable):
+                            send_bytes = min(block_bytes, usable)
+                            raw = bytes(pending[:send_bytes])
+                            del pending[:send_bytes]
+                            await enqueue(raw)
+                            first_block_sent = True
+                            usable = len(pending) - len(pending) % frame_bytes
+
+                    if len(pending) % frame_bytes:
+                        raise ValueError("PCM stream ended with a partial sample frame")
+                    if not received_pcm:
+                        raise ValueError("PCM stream is empty")
+                    if pending:
+                        await enqueue(bytes(pending))
+                    await enqueue(None)
+                    await asyncio.to_thread(writer.join)
+                finally:
+                    first_write_event.set()
+
+            feeder = create_background_task(
+                feed_pcm(), name="anima_chatter.pcm_feed",
+            ).task
+            try:
+                await asyncio.to_thread(first_write_event.wait)
+                if worker_error:
+                    raise RuntimeError("PCM output stream failed") from worker_error[0]
+                if frames_written > start_after_frames and on_started is not None:
+                    await on_started()
+                await feeder
+                if worker_error:
+                    raise RuntimeError("PCM output stream failed") from worker_error[0]
+                logger.info(
+                    f"PCM 输出结束：frames={frames_written}, "
+                    f"underflows={output_underflows}"
+                )
+                return frames_written
+            finally:
+                stop_event.set()
+                if not feeder.done():
+                    feeder.cancel()
+                await asyncio.gather(feeder, return_exceptions=True)
+                try:
+                    close = getattr(chunks, "aclose", None)
+                    if close is not None:
+                        await close()
+                finally:
+                    await asyncio.to_thread(writer.join)
+                    self.envelope_tracker.end()
 
     def _resolve_inst_device(self) -> None:
         """解析伴奏专用输出设备 id；为空或找不到时退回系统默认（None）。"""
@@ -147,7 +318,9 @@ class AudioPlayer:
         if (
             "@" in self.output_device_name
             and self.output_device_name.split("@", 1)[1].strip().lower() == "wasapi"
-            and self._looks_like_virtual_device(self.output_device_name.split("@", 1)[0])
+            and self._looks_like_virtual_device(
+                self.output_device_name.split("@", 1)[0]
+            )
         ):
             logger.warning(
                 f"检测到虚拟声卡 '{self.output_device_name}' 配置为 WASAPI——"
@@ -218,9 +391,7 @@ class AudioPlayer:
             if "@" in name_part:
                 target_device, target_api = name_part.split("@", 1)
 
-            logger.debug(
-                f"搜索音频设备: target={target_device!r} api={target_api!r}"
-            )
+            logger.debug(f"搜索音频设备: target={target_device!r} api={target_api!r}")
 
             for idx, dev in enumerate(devices):
                 max_out = self._read_attr(dev, "max_output_channels", 0)
@@ -249,7 +420,44 @@ class AudioPlayer:
             logger.error(f"查找音频设备时出错: {exc}")
             return None
 
-    async def play_audio(self, audio_data: bytes) -> None:
+    def _note_device_result(self, played: bool) -> None:
+        """记录一次播放结果，维护设备故障熔断状态。
+
+        Args:
+            played: 本次播放（含重试后）是否成功。
+        """
+
+        if played:
+            self._device_failures = 0
+            return
+        self._device_failures += 1
+        if self._device_failures >= _DEVICE_FAILURE_THRESHOLD:
+            import time as _time
+
+            self._device_open_until = _time.monotonic() + _DEVICE_RETRY_INTERVAL
+            logger.error(
+                f"音频设备连续失败 {self._device_failures} 次，熔断 "
+                f"{_DEVICE_RETRY_INTERVAL:.0f}s（期间播放直接跳过，"
+                "请检查输出设备连接）"
+            )
+
+    def _device_tripped(self) -> bool:
+        """设备熔断是否处于激活期。
+
+        Returns:
+            熔断激活（应跳过本次播放）时返回 ``True``。
+        """
+
+        import time as _time
+
+        return _time.monotonic() < self._device_open_until
+
+    async def play_audio(
+        self,
+        audio_data: bytes,
+        *,
+        on_started: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         """异步播放音频 bytes（任何 ``soundfile`` 能解码的格式），等待播放完成。
 
         播放前会按 ``loudness_target_dbfs`` 把响度归一化到统一目标——TTS
@@ -258,10 +466,15 @@ class AudioPlayer:
         """
 
         if not audio_data:
-            logger.warning("接收到的音频数据为空，跳过播放。")
-            return
+            raise ValueError("音频数据为空")
+
+        if self._device_tripped():
+            raise RuntimeError("音频设备熔断中，无法播放")
 
         async with self._play_lock:
+            started_event = asyncio.Event()
+            stop_event = threading.Event()
+            loop = asyncio.get_running_loop()
             try:
                 with io.BytesIO(audio_data) as buf:
                     data, samplerate = sf.read(buf)
@@ -300,37 +513,65 @@ class AudioPlayer:
                     f"(device_id={self.output_device_id}) envelope_frames={len(envelope)}"
                 )
 
-                loop = asyncio.get_running_loop()
-                # 设备热拔插（拔蓝牙 / USB 耳机）会让本次播放失败。失败后重新
-                # 初始化 PortAudio 刷新设备拓扑，再用**同一段音频**重试一次，
-                # 避免这一条语音被直接丢掉。
-                played = False
-                try:
-                    played = await loop.run_in_executor(
-                        None, self._play_sync, data, samplerate
-                    )
-                    if not played:
-                        logger.warning(
-                            "首次播放失败，重新初始化音频后端后重试同一段音频…"
-                        )
-                        await loop.run_in_executor(None, self._reset_audio_backend)
-                        played = await loop.run_in_executor(
-                            None, self._play_sync, data, samplerate
-                        )
-                finally:
-                    # 不论播放成功失败，都把 tracker 清空，避免 SpeechAnimator
-                    # 卡在最后一帧的包络值上。
-                    self.envelope_tracker.end()
-                if played:
-                    logger.info("音频播放完成。")
-                else:
-                    logger.error("重试后仍无法播放该段音频，已跳过。")
-            except Exception as exc:
-                # 异常路径下也要确保 tracker 清干净。
-                self.envelope_tracker.end()
-                logger.error(f"播放音频时发生错误: {exc}")
+                def notify_started() -> None:
+                    loop.call_soon_threadsafe(started_event.set)
 
-    async def play_dual(self, vocal_data: bytes, inst_data: bytes) -> None:
+                playback = loop.run_in_executor(
+                    None,
+                    self._play_sync,
+                    data,
+                    samplerate,
+                    stop_event,
+                    notify_started,
+                )
+                started_wait = create_background_task(
+                    started_event.wait(),
+                    name="anima_chatter.audio_start",
+                    metadata={"kind": "audio_start"},
+                ).task
+                try:
+                    done, _ = await asyncio.wait(
+                        (playback, started_wait),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if playback in done:
+                        played = await playback
+                        if not played:
+                            raise RuntimeError("音频设备未能写入音频")
+                        await started_event.wait()
+                        if on_started is not None:
+                            await on_started()
+                    elif on_started is not None:
+                        await on_started()
+                    played = await asyncio.shield(playback)
+                    if not played:
+                        raise RuntimeError("音频设备未能完成播放")
+                    self._note_device_result(True)
+                    logger.info("音频播放完成。")
+                finally:
+                    started_wait.cancel()
+                    await asyncio.gather(started_wait, return_exceptions=True)
+                    if not playback.done():
+                        stop_event.set()
+                    try:
+                        await asyncio.shield(playback)
+                    except Exception:
+                        if not playback.cancelled():
+                            raise
+            except BaseException:
+                self.envelope_tracker.end()
+                self._note_device_result(False)
+                raise
+            finally:
+                self.envelope_tracker.end()
+
+    async def play_dual(
+        self,
+        vocal_data: bytes,
+        inst_data: bytes,
+        *,
+        on_started: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         """双轨同步播放：人声进 VB-Cable（驱动口型），伴奏进系统扬声器。
 
         用于完整翻唱——伴奏不进 VB-Cable，VTS uLipSync 只听到人声，嘴只跟人声
@@ -371,30 +612,25 @@ class AudioPlayer:
         if not vocal_data:
             logger.warning("play_dual 人声为空，退回单轨伴奏播放。")
             if inst_data:
-                await self.play_audio(inst_data)
+                await self.play_audio(inst_data, on_started=on_started)
             return
         if not inst_data:
             logger.warning("play_dual 伴奏为空，退回单轨人声播放。")
-            await self.play_audio(vocal_data)
+            await self.play_audio(vocal_data, on_started=on_started)
             return
 
-        # 设备热拔插会让双轨播放失败；失败后重新初始化 PortAudio 刷新设备
-        # 拓扑再重试整段，避免这次翻唱被直接丢掉。_play_dual_once 自带锁，
-        # 两次调用顺序获取 / 释放，不会死锁。
-        played = await self._play_dual_once(vocal_data, inst_data)
-        if not played:
-            logger.warning("双轨播放失败，重新初始化音频后端后重试整段…")
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self._reset_audio_backend)
-            played = await self._play_dual_once(vocal_data, inst_data)
-        if not played:
-            logger.error("重试后双轨播放仍失败，已跳过该段翻唱。")
+        await self._play_dual_once(vocal_data, inst_data, on_started=on_started)
 
-    async def _play_dual_once(self, vocal_data: bytes, inst_data: bytes) -> bool:
+    async def _play_dual_once(
+        self,
+        vocal_data: bytes,
+        inst_data: bytes,
+        *,
+        on_started: Callable[[], Awaitable[None]] | None = None,
+    ) -> bool:
         """执行一次双轨同步播放，返回两路是否都成功写入。
 
-        从 :meth:`play_dual` 主体抽出以支持设备热拔插失败后的重试；自带
-        ``_play_lock``，保证与单轨 :meth:`play_audio` 串行。
+        自带 ``_play_lock``，保证与单轨 :meth:`play_audio` 串行。
         """
 
         async with self._play_lock:
@@ -450,10 +686,15 @@ class AudioPlayer:
                     try:
                         vocal_dev_info = sd.query_devices(vocal_device_id)
                         v_target_rate = int(
-                            float(self._read_attr(vocal_dev_info, "default_samplerate", 44100))
+                            float(
+                                self._read_attr(
+                                    vocal_dev_info, "default_samplerate", 44100
+                                )
+                            )
                         )
                         v_target_channels = int(
-                            self._read_attr(vocal_dev_info, "max_output_channels", 2) or 2
+                            self._read_attr(vocal_dev_info, "max_output_channels", 2)
+                            or 2
                         )
                         if abs(v_sr - v_target_rate) > 10:
                             vocal, v_sr = self._resample(vocal, v_sr, v_target_rate)
@@ -511,10 +752,36 @@ class AudioPlayer:
 
                 latency_barrier = threading.Barrier(2)
                 start_barrier = threading.Barrier(2)
+                stop_event = threading.Event()
+                device_started = threading.Event()
+                started_event = asyncio.Event()
+                loop = asyncio.get_running_loop()
+
+                def notify_started() -> None:
+                    device_started.set()
+                    loop.call_soon_threadsafe(started_event.set)
+
+                def write_blocks(stream: Any, data: Any, samplerate: int) -> None:
+                    block_frames = max(1, samplerate // 10)
+                    for offset in range(0, len(data), block_frames):
+                        if stop_event.is_set():
+                            return
+                        stream.write(data[offset : offset + block_frames])
+                        if not device_started.is_set():
+                            notify_started()
+
+                started_callback_called = False
+
+                async def call_started_callback() -> None:
+                    nonlocal started_callback_called
+                    if on_started is not None and not started_callback_called:
+                        started_callback_called = True
+                        await on_started()
+
                 # 共享延迟交换区：{"vocal": 秒, "inst": 秒}。两条线程各写一格，
                 # 在 latency_barrier 之后两格都已就绪，可安全读取。
                 latencies: dict[str, float] = {}
-                # 两路播放成功标记；任一路失败则整段判失败，交由 play_dual 重试。
+                # 两路播放成功标记；任一路失败都会使本次播放失败。
                 results: dict[str, bool] = {"vocal": False, "inst": False}
 
                 def _stream_output_latency(stream: Any) -> float:
@@ -555,7 +822,10 @@ class AudioPlayer:
                         except threading.BrokenBarrierError:
                             return
                         results["vocal"] = self._play_sync(
-                            vocal_data_final, vocal_sr_final
+                            vocal_data_final,
+                            vocal_sr_final,
+                            stop_event,
+                            notify_started,
                         )
                         return
                     try:
@@ -577,17 +847,16 @@ class AudioPlayer:
                                 )
                             # 阶段二：对齐 write 起跑。
                             start_barrier.wait()
-                            stream.write(data)
+                            write_blocks(stream, data, vocal_sr_final)
                             results["vocal"] = True
                     except threading.BrokenBarrierError:
                         return
                     except Exception as exc:
                         logger.error(f"人声同步播放失败: {exc}")
+                        stop_event.set()
                         for b in (latency_barrier, start_barrier):
-                            try:
-                                b.abort()
-                            except Exception:
-                                pass
+                            b.abort()
+                        raise
 
                 def _play_inst_synced() -> None:
                     try:
@@ -609,32 +878,80 @@ class AudioPlayer:
                                 )
                             # 阶段二：对齐 write 起跑。
                             start_barrier.wait()
-                            stream.write(data)
+                            write_blocks(stream, data, i_sr)
                             results["inst"] = True
                     except threading.BrokenBarrierError:
                         return
                     except Exception as exc:
                         logger.error(f"伴奏同步播放失败: {exc}")
+                        stop_event.set()
                         for b in (latency_barrier, start_barrier):
-                            try:
-                                b.abort()
-                            except Exception:
-                                pass
+                            b.abort()
+                        raise
 
-                loop = asyncio.get_running_loop()
+                writers = asyncio.gather(
+                    loop.run_in_executor(None, _play_vocal_synced),
+                    loop.run_in_executor(None, _play_inst_synced),
+                    return_exceptions=True,
+                )
+                started_wait = create_background_task(
+                    started_event.wait(),
+                    name="anima_chatter.dual_start",
+                    metadata={"kind": "audio_start"},
+                ).task
                 try:
-                    await asyncio.gather(
-                        loop.run_in_executor(None, _play_vocal_synced),
-                        loop.run_in_executor(None, _play_inst_synced),
+                    done, _ = await asyncio.wait(
+                        (writers, started_wait),
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
+                    if writers in done:
+                        writer_results = await asyncio.shield(writers)
+                        writer_error = next(
+                            (
+                                result
+                                for result in writer_results
+                                if isinstance(result, BaseException)
+                            ),
+                            None,
+                        )
+                        if writer_error is not None:
+                            raise writer_error
+                        if not all(results.values()):
+                            raise RuntimeError("双轨设备未能完成播放")
+                        await started_event.wait()
+                    if started_event.is_set():
+                        await call_started_callback()
+                    writer_results = await asyncio.shield(writers)
+                    writer_error = next(
+                        (
+                            result
+                            for result in writer_results
+                            if isinstance(result, BaseException)
+                        ),
+                        None,
+                    )
+                    if writer_error is not None:
+                        raise writer_error
+                    if not all(results.values()):
+                        raise RuntimeError("双轨设备未能完成播放")
+                except BaseException:
+                    stop_event.set()
+                    for barrier in (latency_barrier, start_barrier):
+                        barrier.abort()
+                    await asyncio.shield(writers)
+                    if device_started.is_set():
+                        await call_started_callback()
+                    raise
                 finally:
+                    started_wait.cancel()
+                    await asyncio.gather(started_wait, return_exceptions=True)
                     self.envelope_tracker.end()
                 logger.info("双轨播放完成。")
                 return bool(results["vocal"] and results["inst"])
             except Exception as exc:
                 self.envelope_tracker.end()
                 logger.error(f"双轨播放时发生错误: {exc}")
-                return False
+                raise
 
     def _decode_and_normalize(self, audio_data: bytes) -> tuple[Any, int]:
         """解码 bytes → float32 PCM 并按统一目标做响度归一化。"""
@@ -697,120 +1014,62 @@ class AudioPlayer:
         except Exception as exc:
             logger.error(f"伴奏播放到系统默认设备失败: {exc}")
 
-    def _play_sync(self, data: Any, samplerate: int) -> bool:
-        """同步播放，并依次尝试配置设备、MME 设备和系统默认设备。
+    def _play_sync(
+        self,
+        data: Any,
+        samplerate: int,
+        stop_event: threading.Event | None = None,
+        notify_started: Callable[[], None] | None = None,
+    ) -> bool:
+        """将整轨 PCM 分块写入单个显式设备流。"""
 
-        每次播放前重新解析 device id，避免 Windows 音频设备变动后缓存标识失效。
-
-        Returns:
-            ``True`` 表示某条路径成功播放完成；``False`` 表示所有设备路径均失败。
-        """
-
-        # 1) 每次播放前重新解析 device id——避免缓存过期。
+        stop_event = stop_event or threading.Event()
         if self._prefer_fallback:
             self._fallback_device_id = self._resolve_fallback_device_id()
             target_device_id = self._fallback_device_id
         else:
-            target_device_id = self._find_device_id(self.output_device_name) if self.output_device_name else None
+            target_device_id = (
+                self._find_device_id(self.output_device_name)
+                if self.output_device_name
+                else None
+            )
             self.output_device_id = target_device_id  # 同步更新缓存
 
-        if target_device_id is not None:
-            try:
-                dev_info = sd.query_devices(target_device_id)
-                default_rate = self._read_attr(dev_info, "default_samplerate", 44100)
-                target_rate = int(float(default_rate))
-                target_channels = int(
-                    self._read_attr(dev_info, "max_output_channels", 1) or 1
-                )
-
-                # 1) 采样率适配：差距 > 10Hz 就重采样到设备默认值。
-                #    WASAPI shared mode 严格要求采样率 = Windows mixer 当前值（一般 48kHz），
-                #    送 32kHz 进去会被 KS pin 直接拒绝。
-                if abs(samplerate - target_rate) > 10:
-                    data, samplerate = self._resample(data, samplerate, target_rate)
-
-                # 2) 通道适配：mono → stereo 等。WASAPI shared mode 对通道数一样
-                #    严格——VB-Cable 的 WASAPI 输出通常 max_output_channels=2，
-                #    送 mono PCM 进去会触发 "WdmSyncIoctl: DeviceIoControl GLE=0x00000490
-                #    Windows WDM-KS error 0"（KS pin 属性拒绝）。
-                data = self._adapt_channels(data, target_channels)
-            except Exception as exc:
-                logger.warning(f"采样率/通道自动适配失败: {exc}")
-
-        # 2) 已记忆要走 MME 备用路径 → 直接播
-        if self._prefer_fallback and self._fallback_device_id is not None:
-            try:
-                sd.play(
-                    data,
-                    samplerate,
-                    device=self._fallback_device_id,
-                    latency="high",
-                )
-                sd.wait()
-                return True
-            except Exception as exc:
-                logger.error(f"MME 备用路径播放失败: {exc}")
-                # 保留 _prefer_fallback=True；继续走最终回退。
-
-        # 3) 主路径：按 host API 选最合适的 extra_settings。
-        #
-        #    WASAPI shared mode 严格——即使我们已对齐了采样率 + 通道数，VB-Cable
-        #    这种虚拟设备在底层查 KS pin 属性时仍可能抛 ``WdmSyncIoctl GLE 0x490
-        #    [Windows WDM-KS error 0]``。最稳的做法是显式构造
-        #    ``WasapiSettings(exclusive=False, auto_convert=True)``——让 WASAPI
-        #    在内核层自动做格式协商（SRC + channel mapping + sample format），
-        #    应用层就完全不必担心格式不匹配。
-        extra_settings = self._build_extra_settings(self.output_device_id)
-        if not self._prefer_fallback:
-            try:
-                sd.play(
-                    data,
-                    samplerate,
-                    device=self.output_device_id,
-                    latency="high",
-                    extra_settings=extra_settings,
-                )
-                sd.wait()
-                return True
-            except Exception as exc:
-                # 对虚拟声卡（VB-Cable）来说，WASAPI 失败是**预期行为**（见
-                # _resolve_device 的说明），不是真正的错误——降级为 WARNING，
-                # 避免在终端刷红色 ERROR 吓人。真实硬件设备失败才是值得关注的。
-                if self._looks_like_virtual_device(self.output_device_name):
-                    logger.warning(
-                        f"WASAPI 主路径对虚拟声卡不可用（预期，将走 MME）: {exc}"
-                    )
-                else:
-                    logger.error(f"底层播放调用失败: {exc}")
-                # 一次失败即标记走 MME 备用路径，避免后续每次都浪费 1 秒。
-                self._cache_fallback_device_id()
-                if self._fallback_device_id is not None:
-                    self._prefer_fallback = True
-                    logger.info(
-                        "主路径不可用，已切换为 MME 备用路径"
-                        f"（device_id={self._fallback_device_id}）。"
-                    )
-                    try:
-                        sd.play(
-                            data,
-                            samplerate,
-                            device=self._fallback_device_id,
-                            latency="high",
-                        )
-                        sd.wait()
-                        return True
-                    except Exception as exc2:
-                        logger.error(f"MME 备用路径首次切换播放也失败: {exc2}")
-
-        # 4) 最后尝试系统默认设备（可能丢失口型同步）
-        try:
-            logger.warning("尝试使用系统默认输出设备")
-            sd.play(data, samplerate, device=None, latency="high")
-            sd.wait()
-            return True
-        except Exception as exc:
-            logger.error(f"所有播放尝试均告失败: {exc}")
-            return False
+        dev_info = sd.query_devices(
+            target_device_id if target_device_id is not None else "output"
+        )
+        target_rate = int(
+            float(self._read_attr(dev_info, "default_samplerate", samplerate))
+        )
+        target_channels = int(
+            self._read_attr(dev_info, "max_output_channels", 1) or 1
+        )
+        if abs(samplerate - target_rate) > 10:
+            data, samplerate = self._resample(data, samplerate, target_rate)
+        data = self._adapt_channels(data, target_channels)
+        channels = 1 if data.ndim == 1 else int(data.shape[1])
+        block_frames = max(1, samplerate // 10)
+        wrote_audio = False
+        with sd.OutputStream(
+            samplerate=samplerate,
+            channels=channels,
+            dtype="float32",
+            device=target_device_id,
+            latency="high",
+            extra_settings=self._build_extra_settings(target_device_id),
+        ) as stream:
+            for offset in range(0, len(data), block_frames):
+                if stop_event.is_set():
+                    return wrote_audio
+                block = data[offset : offset + block_frames]
+                stream.write(block)
+                if not wrote_audio:
+                    wrote_audio = True
+                    if notify_started is not None:
+                        notify_started()
+        if not wrote_audio:
+            raise RuntimeError("音频不包含可播放的采样帧")
+        return True
 
     def _build_extra_settings(self, device_id: int | None) -> Any:
         """根据目标设备的 host API 构造 sounddevice ``extra_settings``。
@@ -947,7 +1206,9 @@ class AudioPlayer:
             if data.ndim == 2:
                 channels: list[np.ndarray] = []
                 for c in range(data.shape[1]):
-                    channels.append(np.interp(indices, np.arange(len(data)), data[:, c]))
+                    channels.append(
+                        np.interp(indices, np.arange(len(data)), data[:, c])
+                    )
                 new_data = np.stack(channels, axis=1)
             else:
                 new_data = np.interp(indices, np.arange(len(data)), data)

@@ -1,19 +1,7 @@
-"""音频播放的**唯一**实现——阻塞模式与 vtb_live 流水线模式共用。
+"""直播语音与歌曲的 FIFO、任务所有权和真实播放事件。
 
-三个 Action（``say`` / ``say_and_perform`` / ``sing_song``）此前各自实现了一套
-"合成 → reserve → 派发后台 / 阻塞播放"的流程，逻辑高度重叠且行为已出现漂移。
-本模块把它们收敛为两个入口：
-
-- :func:`play_segments_blocking` —— 在 chatter generator 内播完才返回（voice /
-  vtb 模式，以及流水线退化路径）。
-- :func:`dispatch_segments_pipelined` —— reserve 占位后派发后台任务，Action
-  立即返回（vtb_live 流水线模式）。
-
-歌曲播放走 :func:`play_track_blocking` / :func:`dispatch_track_pipelined`，与
-分段语音共享同一套 reserve / 后台派发 / watchdog 逻辑。
-
-**物理串行保证**：无论走哪条路径，音频都由 ``AudioPlayer`` 的播放锁 +
-``VTSPerformer`` 的表演锁双重串行，绝不会重叠，只会排队。
+接收与物理播放分别串行，歌曲与 PCM 语音共享物理播放顺序。
+Action 返回接收结果，后台任务在实际起播、结束或取消时释放轮次容量。
 """
 
 from __future__ import annotations
@@ -21,7 +9,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import Coroutine
+import uuid
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -34,24 +23,160 @@ from ..runtime.heartbeat import feed_watchdog_during
 
 if TYPE_CHECKING:
     from ..audio import AudioPlayer
-    from ..config import PipeliningSection
     from ..vts import VTSPerformer
-    from .backend import TTSArtifact
     from .markers import SpeechSegment
 
 
 __all__ = [
     "PerformanceStyle",
-    "dispatch_segments_pipelined",
     "dispatch_track_pipelined",
     "estimate_segments_duration",
-    "play_segments_blocking",
     "play_track_blocking",
-    "should_use_pipeline",
 ]
 
 
 logger = get_logger("anima_chatter.speech.playback")
+
+PlaybackTurn = tuple[asyncio.Future[None], asyncio.Future[None] | None]
+_playback_tail: asyncio.Future[None] | None = None
+_receive_tail: asyncio.Future[None] | None = None
+_playback_tasks: set[asyncio.Task[Any]] = set()
+_playback_cleanup_tasks: set[asyncio.Task[Any]] = set()
+_playback_closed = False
+
+
+def activate_playback() -> None:
+    """允许加载后的直播播放并重置已结束的顺序门。"""
+
+    global _playback_closed, _playback_tail, _receive_tail
+    _playback_closed = False
+    _playback_tail = None
+    _receive_tail = None
+
+
+def reserve_playback_turn() -> PlaybackTurn:
+    """为说话或唱歌分配调用顺序，不提前打开音频或网络流。"""
+
+    global _playback_tail
+    if _playback_closed:
+        raise RuntimeError("直播播放已关闭")
+    previous = _playback_tail
+    ticket = asyncio.get_running_loop().create_future()
+    _playback_tail = ticket
+    return ticket, previous
+
+
+def _release_playback_turn(turn: PlaybackTurn) -> None:
+    """释放当前顺序门，取消排队项时保留其前驱的顺序。"""
+
+    ticket, previous = turn
+    if ticket.done():
+        return
+    if previous is not None and not previous.done():
+        previous.add_done_callback(lambda _: _release_playback_turn(turn))
+    else:
+        ticket.set_result(None)
+
+
+def reserve_receive_turn() -> PlaybackTurn:
+    """按提交顺序串行接收 TTS，接收结束后不等待设备排空。"""
+
+    global _receive_tail
+    if _playback_closed:
+        raise RuntimeError("直播播放已关闭")
+    previous = _receive_tail
+    ticket = asyncio.get_running_loop().create_future()
+    _receive_tail = ticket
+    return ticket, previous
+
+
+@contextlib.asynccontextmanager
+async def playback_turn(turn: PlaybackTurn) -> AsyncIterator[None]:
+    """等待此前播放项结束并在退出或取消时释放顺序门。"""
+
+    task = asyncio.current_task()
+    if task is None:
+        raise RuntimeError("直播播放必须在任务中执行")
+    _playback_tasks.add(task)
+    try:
+        if turn[1] is not None:
+            await asyncio.shield(turn[1])
+        if _playback_closed:
+            raise RuntimeError("直播播放已关闭")
+        yield
+    finally:
+        _release_playback_turn(turn)
+        _playback_tasks.discard(task)
+
+
+def create_playback_task(
+    factory: Callable[[], Awaitable[None]],
+    *,
+    name: str,
+    turn: PlaybackTurn,
+    cleanup: Callable[[], Awaitable[None]],
+) -> asyncio.Task[Any]:
+    """派发归本插件所有的播放任务并处理起跑前取消的顺序门。"""
+
+    cleanup_started = False
+
+    async def finalize() -> None:
+        """每项只回收一次排播占位。"""
+
+        nonlocal cleanup_started
+        if not cleanup_started:
+            cleanup_started = True
+            await cleanup()
+
+    async def run() -> None:
+        """延迟创建播放协程并在退出时完成清理。"""
+
+        try:
+            await factory()
+        finally:
+            await finalize()
+
+    coro = run()
+    try:
+        handle = create_background_task(coro, name=name, metadata={"kind": "playback"})
+    except Exception:
+        coro.close()
+        _release_playback_turn(turn)
+        raise
+    task = handle.task
+    _playback_tasks.add(task)
+
+    def completed(finished: asyncio.Task[Any]) -> None:
+        """回收播放任务及其顺序门。"""
+
+        _playback_tasks.discard(finished)
+        _release_playback_turn(turn)
+        coro.close()
+        if not cleanup_started:
+            handle = create_background_task(
+                finalize(), name=f"{name}.cleanup", metadata={"kind": "playback_cleanup"}
+            )
+            _playback_cleanup_tasks.add(handle.task)
+            handle.task.add_done_callback(_playback_cleanup_tasks.discard)
+
+    task.add_done_callback(completed)
+    return task
+
+
+async def close_playback() -> None:
+    """取消并等待本插件的在途及排队播放，不关闭共享 Provider。"""
+
+    global _playback_closed
+    _playback_closed = True
+    current = asyncio.current_task()
+    tasks = [task for task in _playback_tasks if task is not current and not task.done()]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    cleanup_tasks = list(_playback_cleanup_tasks)
+    if cleanup_tasks:
+        await asyncio.gather(*cleanup_tasks)
 
 
 @dataclass(slots=True)
@@ -103,9 +228,7 @@ class TimelineRunner(Protocol):
 def estimate_segments_duration(segments: list["SpeechSegment"]) -> float:
     """按字数粗估分段语音的总播放时长（含段间静默）。
 
-    用于 reserve 之前的占位——真实时长要等合成完才知道，但流水线需要在合成前
-    就占好时间轴位置以保证多个 Action 的先后顺序。估算只影响门的软触发时刻，
-    物理播放顺序由播放锁保证。
+    仅用于容量背压，不作为起播时刻、等待期限或 Actor 放行比例。
 
     Args:
         segments: 待播放片段列表。
@@ -120,234 +243,6 @@ def estimate_segments_duration(segments: list["SpeechSegment"]) -> float:
     )
 
 
-def should_use_pipeline(
-    *,
-    is_live_mode: bool,
-    section: "PipeliningSection",
-    estimated_duration: float,
-) -> bool:
-    """判断本次播放是否走流水线模式。
-
-    Args:
-        is_live_mode: 当前是否为 ``vtb_live`` 模式。
-        section: 插件配置的 ``pipelining`` 段。
-        estimated_duration: 本次播放的估算总时长（秒）。
-
-    Returns:
-        三个条件（直播模式 / 配置启用 / 时长达标）同时满足时返回 ``True``。
-    """
-
-    if not is_live_mode or not section.enabled:
-        return False
-    if estimated_duration < section.min_duration_seconds:
-        logger.info(
-            f"流水线退化：估算总时长 {estimated_duration:.2f}s < "
-            f"min_duration {section.min_duration_seconds:.2f}s，本次走阻塞模式"
-        )
-        return False
-    return True
-
-
-# ── 分段语音 ───────────────────────────────────────────────
-
-
-async def _consume_segments(
-    *,
-    tasks: list["asyncio.Task[TTSArtifact]"],
-    segments: list["SpeechSegment"],
-    performer: "VTSPerformer | None",
-    audio_player: "AudioPlayer | None",
-    style: PerformanceStyle,
-) -> int:
-    """按索引顺序消费合成结果并播放（流式：第一段好就播）。
-
-    行内 motion 标记处理：每段播放前按 ``segment.motion`` 切 intent + expression；
-    为 ``None`` 时用顶层 intent。没有 performer（VTS 未连）时退回纯音频播放。
-
-    Args:
-        tasks: 与 ``segments`` 同序的合成任务列表。
-        segments: 片段列表。
-        performer: VTS 表演器；``None`` 表示只播音频不驱动形象。
-        audio_player: 本地音频播放器；``performer`` 为 ``None`` 时必须提供。
-        style: 顶层表演参数。
-
-    Returns:
-        实际播放成功的片段数。
-    """
-
-    played = 0
-    for index, task in enumerate(tasks):
-        artifact = await task
-        segment = segments[index]
-
-        audio = artifact.audio
-        if not artifact.is_playable or audio is None:
-            logger.error(f"跳过不可播放片段 {index}: {segment.text[:30]}...")
-            continue
-
-        if segment.wait_before >= 0.1:
-            await asyncio.sleep(segment.wait_before)
-
-        segment_intent = segment.motion or style.intent
-        if performer is not None:
-            # 关键时序：首段音频"已经合成完准备播放"时才真正触发 VTS 动作链。
-            # start_speech_playback 幂等，后续段调用是 no-op。
-            await performer.start_speech_playback()
-            await performer.switch_segment_intent(
-                segment_intent,
-                emotion_main_for_expression=style.emotion_main,
-            )
-            await performer.play(audio)
-        elif audio_player is not None:
-            await audio_player.play_audio(audio)
-        else:
-            logger.error("performer 与 audio_player 均不可用，无法播放")
-            continue
-
-        played += 1
-        logger.info(
-            f"已播放段 {index}: {segment.text[:20]}... "
-            f"emotion={style.emotion} intent={segment_intent}"
-        )
-    return played
-
-
-async def _run_segments(
-    *,
-    tasks: list["asyncio.Task[TTSArtifact]"],
-    segments: list["SpeechSegment"],
-    performer: "VTSPerformer | None",
-    audio_player: "AudioPlayer | None",
-    style: PerformanceStyle,
-) -> int:
-    """在 ``speaking_session``（如有 performer）内消费并播放全部片段。
-
-    Args:
-        tasks: 合成任务列表。
-        segments: 片段列表。
-        performer: VTS 表演器；``None`` 时跳过 session。
-        audio_player: 本地音频播放器。
-        style: 顶层表演参数。
-
-    Returns:
-        实际播放成功的片段数。
-    """
-
-    if performer is None:
-        return await _consume_segments(
-            tasks=tasks,
-            segments=segments,
-            performer=None,
-            audio_player=audio_player,
-            style=style,
-        )
-
-    async with performer.speaking_session(emotion=style.emotion, intent=style.intent):
-        return await _consume_segments(
-            tasks=tasks,
-            segments=segments,
-            performer=performer,
-            audio_player=audio_player,
-            style=style,
-        )
-
-
-async def play_segments_blocking(
-    *,
-    stream_id: str,
-    tasks: list["asyncio.Task[TTSArtifact]"],
-    segments: list["SpeechSegment"],
-    performer: "VTSPerformer | None",
-    audio_player: "AudioPlayer | None",
-    style: PerformanceStyle,
-) -> tuple[bool, str]:
-    """阻塞模式播放分段语音：播完才返回。
-
-    整段播放期间 chatter generator 不会 yield，需要主动喂 watchdog 避免触发框架
-    的 stream 重启阈值。
-
-    Args:
-        stream_id: 所属聊天流。
-        tasks: 合成任务列表。
-        segments: 片段列表。
-        performer: VTS 表演器。
-        audio_player: 本地音频播放器。
-        style: 顶层表演参数。
-
-    Returns:
-        ``(是否成功, 给模型的执行结果描述)``。
-    """
-
-    async with feed_watchdog_during(stream_id):
-        played = await _run_segments(
-            tasks=tasks,
-            segments=segments,
-            performer=performer,
-            audio_player=audio_player,
-            style=style,
-        )
-    return True, f"已播放 {played}/{len(segments)} 段"
-
-
-async def dispatch_segments_pipelined(
-    *,
-    stream_id: str,
-    tasks: list["asyncio.Task[TTSArtifact]"],
-    segments: list["SpeechSegment"],
-    performer: "VTSPerformer | None",
-    audio_player: "AudioPlayer | None",
-    style: PerformanceStyle,
-    estimated_duration: float,
-) -> tuple[bool, str]:
-    """流水线模式播放分段语音：reserve 占位后派发后台任务，立即返回。
-
-    Args:
-        stream_id: 所属聊天流。
-        tasks: 合成任务列表（已在并发合成中）。
-        segments: 片段列表。
-        performer: VTS 表演器。
-        audio_player: 本地音频播放器。
-        style: 顶层表演参数。
-        estimated_duration: 估算总时长（秒），用于 reserve 占位。
-
-    Returns:
-        ``(True, 给模型的执行结果描述)``。
-    """
-
-    logger.info(
-        f"进入流水线：{len(segments)} 段，估算总时长 {estimated_duration:.2f}s，开始 reserve"
-    )
-    start_at, finish_at = await pipeline_state.reserve(stream_id, estimated_duration)
-
-    async def _background() -> None:
-        """后台流式播放：等到 start_at → 按段顺序等合成结果并播放。"""
-
-        await _wait_until(start_at, stream_id=stream_id, finish_at=finish_at)
-        played = await _run_segments(
-            tasks=tasks,
-            segments=segments,
-            performer=performer,
-            audio_player=audio_player,
-            style=style,
-        )
-        logger.info(f"[bg_play {stream_id[:8]}] 后台流式播放完成（{played} 段）")
-
-    create_background_task(
-        _guard_background(_background(), stream_id=stream_id, label="bg_play"),
-        name=f"anima_chatter.background_play.{stream_id[:8]}",
-        metadata={"stream_id": stream_id, "kind": "background_play"},
-    )
-
-    logger.info(
-        f"已派发后台流式播放、Action 立即返回"
-        f"（{len(segments)} 段，估算 {estimated_duration:.2f}s）"
-    )
-    return True, (
-        f"已派发 {len(segments)} 段到后台流式播放队列"
-        f"（估算总时长 {estimated_duration:.2f}s，流水线已启用）"
-    )
-
-
 # ── 整轨音频（唱歌） ───────────────────────────────────────
 
 
@@ -359,6 +254,7 @@ async def _play_track(
     performer: "VTSPerformer | None",
     timeline: TimelineRunner | None,
     song_name: str,
+    on_started: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """播放一整轨音频（可选双轨 + 动作时间轴）。
 
@@ -375,29 +271,43 @@ async def _play_track(
         song_name: 歌名，仅用于日志。
     """
 
-    async def _emit() -> None:
+    async def _emit(start_callback: Callable[[], Awaitable[None]]) -> None:
         """按是否有伴奏选择单轨 / 双轨播放。"""
 
         if inst_bytes:
-            await audio_player.play_dual(audio_bytes, inst_bytes)
+            await audio_player.play_dual(
+                audio_bytes, inst_bytes, on_started=start_callback
+            )
         else:
-            await audio_player.play_audio(audio_bytes)
+            await audio_player.play_audio(audio_bytes, on_started=start_callback)
 
     if performer is None:
-        await _emit()
+        if on_started is None:
+            async def start_callback() -> None:
+                return None
+
+            await _emit(start_callback)
+        else:
+            await _emit(on_started)
         return
 
     stop_event = asyncio.Event()
     async with performer.speaking_session(emotion="happy:1", intent="NARRATING"):
         timeline_handle = None
-        if timeline is not None:
-            timeline_handle = create_background_task(
-                timeline.run(performer, stop_event),
-                name=f"anima_chatter.sing_timeline.{song_name[:20]}",
-                metadata={"kind": "sing_timeline"},
-            )
+
+        async def handle_started() -> None:
+            nonlocal timeline_handle
+            if timeline is not None:
+                timeline_handle = create_background_task(
+                    timeline.run(performer, stop_event),
+                    name=f"anima_chatter.sing_timeline.{song_name[:20]}",
+                    metadata={"kind": "sing_timeline"},
+                )
+            if on_started is not None:
+                await on_started()
+
         try:
-            await _emit()
+            await _emit(handle_started)
         finally:
             stop_event.set()
             if timeline_handle is not None:
@@ -418,6 +328,7 @@ async def play_track_blocking(
     timeline: TimelineRunner | None,
     pre_delay: float,
     song_name: str,
+    on_started: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[bool, str]:
     """阻塞模式播放整轨音频：播完才返回。
 
@@ -435,11 +346,11 @@ async def play_track_blocking(
         ``(是否成功, 给模型的执行结果描述)``。
     """
 
-    if pre_delay > 0:
-        logger.info(f"开场停顿 {pre_delay:.1f}s 后开始播放《{song_name}》")
-        await asyncio.sleep(pre_delay)
-
-    async with feed_watchdog_during(stream_id):
+    turn = reserve_playback_turn()
+    async with feed_watchdog_during(stream_id), playback_turn(turn):
+        if pre_delay > 0:
+            logger.info(f"开场停顿 {pre_delay:.1f}s 后开始播放《{song_name}》")
+            await asyncio.sleep(pre_delay)
         await _play_track(
             audio_bytes=audio_bytes,
             inst_bytes=inst_bytes,
@@ -447,6 +358,7 @@ async def play_track_blocking(
             performer=performer,
             timeline=timeline,
             song_name=song_name,
+            on_started=on_started,
         )
 
     logger.info(f"歌曲播放完成：《{song_name}》")
@@ -464,10 +376,11 @@ async def dispatch_track_pipelined(
     pre_delay: float,
     song_duration: float,
     song_name: str,
+    on_started: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[bool, str]:
     """流水线模式播放整轨音频：reserve 占位后派发后台任务，立即返回。
 
-    ``pre_delay`` 也算进 reserve 总时长——后台任务才会真正等待这段静默。
+    队列积压超限时拒排（背压反馈），起播 / 播完回写实际进度。
 
     Args:
         stream_id: 所属聊天流。
@@ -481,73 +394,82 @@ async def dispatch_track_pipelined(
         song_name: 歌名。
 
     Returns:
-        ``(True, 给模型的执行结果描述)``。
+        ``(是否成功, 给模型的执行结果描述)``。
     """
 
-    total_duration = pre_delay + song_duration
+    track_id = f"track_{uuid.uuid4().hex[:12]}"
     logger.info(
-        f"进入流水线：《{song_name}》总 {total_duration:.1f}s "
-        f"（{pre_delay:.1f}s 静默 + {song_duration:.1f}s 歌曲），开始 reserve"
+        f"进入流水线：《{song_name}》（歌曲 {song_duration:.1f}s），开始 reserve"
     )
-    start_at, finish_at = await pipeline_state.reserve(stream_id, total_duration)
+    reserved = await pipeline_state.reserve(
+        stream_id, song_duration, track_id=track_id, kind="song"
+    )
+    if reserved is None:
+        return False, (
+            "播放队列已满（积压超过上限），本轮歌曲未排入队列——"
+            "请稍后再唱，等待当前队列消化"
+        )
+    _, finish_at = reserved
+    turn = reserve_playback_turn()
+    started = False
+
+    async def finalize() -> None:
+        """释放未起播占位或记录歌曲的实际结束时间。"""
+
+        if started:
+            await pipeline_state.report_actual(
+                stream_id, track_id=track_id, finished_at=time.monotonic()
+            )
+        else:
+            await pipeline_state.relinquish(
+                stream_id, track_id=track_id, reserved_until=finish_at
+            )
 
     async def _background() -> None:
-        """后台播放：等到 start_at → 开场静默 → 播放整轨。"""
+        """按调用顺序等待起播、开场静默并播放整轨。"""
 
-        await _wait_until(start_at, stream_id=stream_id, finish_at=finish_at)
-        if pre_delay > 0:
-            logger.info(
-                f"[bg_sing {stream_id[:8]}] 开场停顿 {pre_delay:.1f}s 后开唱《{song_name}》"
+        nonlocal started
+        async with playback_turn(turn):
+            if pre_delay > 0:
+                await asyncio.sleep(pre_delay)
+
+            async def report_started() -> None:
+                nonlocal started
+                started = True
+                await pipeline_state.report_actual(
+                    stream_id, track_id=track_id, started_at=time.monotonic()
+                )
+                if on_started is not None:
+                    await on_started()
+
+            await _play_track(
+                audio_bytes=audio_bytes,
+                inst_bytes=inst_bytes,
+                audio_player=audio_player,
+                performer=performer,
+                timeline=timeline,
+                song_name=song_name,
+                on_started=report_started,
             )
-            await asyncio.sleep(pre_delay)
-        logger.info(f"[bg_sing {stream_id[:8]}] 开唱：《{song_name}》")
-        await _play_track(
-            audio_bytes=audio_bytes,
-            inst_bytes=inst_bytes,
-            audio_player=audio_player,
-            performer=performer,
-            timeline=timeline,
-            song_name=song_name,
-        )
         logger.info(f"[bg_sing {stream_id[:8]}] 唱完了：《{song_name}》")
 
-    create_background_task(
-        _guard_background(_background(), stream_id=stream_id, label="bg_sing"),
+    create_playback_task(
+        lambda: _guard_background(_background(), stream_id=stream_id, label="bg_sing"),
         name=f"anima_chatter.background_sing.{stream_id[:8]}",
-        metadata={"stream_id": stream_id, "kind": "background_sing"},
+        turn=turn,
+        cleanup=finalize,
     )
 
     logger.info(
-        f"已派发后台播放、Action 立即返回（《{song_name}》，预计 {total_duration:.1f}s）"
+        f"已派发后台播放、Action 立即返回（《{song_name}》，预计 {song_duration:.1f}s）"
     )
     return True, (
         f"已派发歌曲《{song_name}》到后台播放队列"
-        f"（总时长 {total_duration:.1f}s，流水线已启用）"
+        f"（歌曲时长 {song_duration:.1f}s，流水线已启用）"
     )
 
 
 # ── 后台任务共享工具 ───────────────────────────────────────
-
-
-async def _wait_until(start_at: float, *, stream_id: str, finish_at: float) -> None:
-    """睡到 reserve 给出的起播时刻。
-
-    Args:
-        start_at: ``time.monotonic()`` 口径的起播时刻。
-        stream_id: 所属聊天流，仅用于日志。
-        finish_at: 预计结束时刻，仅用于日志。
-    """
-
-    now = time.monotonic()
-    wait = start_at - now
-    if wait <= 0:
-        logger.info(f"[{stream_id[:8]}] 队列已空，立即开始播放")
-        return
-    logger.info(
-        f"[{stream_id[:8]}] 排队中：等待 {wait:.2f}s 到起播时刻"
-        f"（预计 {finish_at - now:.2f}s 后结束）"
-    )
-    await asyncio.sleep(wait)
 
 
 async def _guard_background(
@@ -558,8 +480,8 @@ async def _guard_background(
 ) -> None:
     """包裹后台播放协程，统一处理取消与异常。
 
-    流水线模式下 Action 已经返回 Success，把错误反馈给 LLM 的成本远高于记日志，
-    因此这里只记录不抛出。
+    Action 已返回接收结果，后台错误记录日志。容量与顺序门由任务清理边界
+    回收，不在本层重复处理，也不重播已输出的内容。
 
     Args:
         coro: 待执行的后台协程。
@@ -572,5 +494,5 @@ async def _guard_background(
     except asyncio.CancelledError:
         logger.info(f"[{label} {stream_id[:8]}] 后台播放被取消")
         raise
-    except Exception as exc:  # noqa: BLE001 - 后台任务不能让异常逃逸到事件循环
-        logger.error(f"[{label} {stream_id[:8]}] 后台播放异常: {exc}", exc_info=True)
+    except Exception as exc:
+        logger.error(f"[{label} {stream_id[:8]}] 后台播放异常: {exc}", exc_info=True)  # noqa: G201

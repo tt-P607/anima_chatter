@@ -636,7 +636,9 @@ class VTSConnection:
             )
         )
 
-    async def _set_expression_in_worker(self, expression_file: str, active: bool) -> bool:
+    async def _set_expression_in_worker(
+        self, expression_file: str, active: bool
+    ) -> bool:
         """worker 循环内：设置表情激活状态实现。"""
         if not self.is_connected or self.vts is None or not expression_file:
             return False

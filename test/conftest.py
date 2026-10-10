@@ -25,12 +25,10 @@ async def _reset_runtime_state() -> AsyncIterator[None]:
         ``None``——只做状态清理，不产出值。
     """
 
-    from plugins.anima_chatter.runtime import call_state, pipeline_state, sung_history
+    from plugins.anima_chatter.runtime import pipeline_state, sung_history
 
-    await call_state.clear_active_call()
     await pipeline_state.clear_all()
     await sung_history.clear()
     yield
-    await call_state.clear_active_call()
     await pipeline_state.clear_all()
     await sung_history.clear()

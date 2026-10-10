@@ -156,7 +156,9 @@ class AutoAnimator(BaseAnimator):
         }
 
         # ── 安全平滑层 ────────────────────────────────
-        self.final_smooth_params: dict[str, float] = {k: 0.0 for k in self.macro_current_params}
+        self.final_smooth_params: dict[str, float] = {
+            k: 0.0 for k in self.macro_current_params
+        }
         self.performing_fade_weight: float = 1.0
 
         self.macro_duration_move: float = 2.0
@@ -232,7 +234,12 @@ class AutoAnimator(BaseAnimator):
             },
             {
                 "name": "分心远眺",
-                "params": {"v_head_x": 7.5, "v_head_y": 2.9, "v_eye_x": -0.34, "v_eye_y": 0.17},
+                "params": {
+                    "v_head_x": 7.5,
+                    "v_head_y": 2.9,
+                    "v_eye_x": -0.34,
+                    "v_eye_y": 0.17,
+                },
                 "weight": 20,
                 "hold": 4.0,
                 "trigger_blink_on_return": True,
@@ -288,7 +295,12 @@ class AutoAnimator(BaseAnimator):
             },
             {
                 "name": "深度思考",
-                "params": {"v_head_y": 4.5, "v_head_z": -2.3, "v_eye_y": 0.28, "v_eye_x": 0.0},
+                "params": {
+                    "v_head_y": 4.5,
+                    "v_head_z": -2.3,
+                    "v_eye_y": 0.28,
+                    "v_eye_x": 0.0,
+                },
                 "eye_oscillation": 0.15,
                 "osc_freq": 1.5,
                 "weight": 10,
@@ -364,7 +376,9 @@ class AutoAnimator(BaseAnimator):
         if self._macro_debug_loop:
             self.macro_demo_queue = self.macro_library.copy()
             self.next_macro_trigger_time = 0
-            logger.info(f"调试轮询模式已启用，将循环播放所有 {len(self.macro_library)} 个宏观动作（间隔 2s）")
+            logger.info(
+                f"调试轮询模式已启用，将循环播放所有 {len(self.macro_library)} 个宏观动作（间隔 2s）"
+            )
 
     # ── 工具 ─────────────────────────────────────────
 
@@ -427,17 +441,27 @@ class AutoAnimator(BaseAnimator):
 
         macro_eye_l = self.macro_current_params.get("v_eye_l", 0.0)
         macro_eye_r = self.macro_current_params.get("v_eye_r", 0.0)
-        output[self.param_eye_l] = max(0.0, min(1.0, self.current_eye_open + macro_eye_l))
-        output[self.param_eye_r] = max(0.0, min(1.0, self.current_eye_open + macro_eye_r))
+        output[self.param_eye_l] = max(
+            0.0, min(1.0, self.current_eye_open + macro_eye_l)
+        )
+        output[self.param_eye_r] = max(
+            0.0, min(1.0, self.current_eye_open + macro_eye_r)
+        )
 
         # 2) 呼吸
-        breath_z = math.sin(elapsed * self.breath_freq * 2 * math.pi) * self.breath_amplitude
+        breath_z = (
+            math.sin(elapsed * self.breath_freq * 2 * math.pi) * self.breath_amplitude
+        )
 
         # 3) 眼神漫游
         micro_jitter_x = math.sin(elapsed * math.pi * 6) * 0.01
         micro_jitter_y = math.cos(elapsed * math.pi * 5.5) * 0.01
-        self.eye_wander_x = math.sin(elapsed * 0.3) * 0.025 + math.sin(elapsed * 0.17) * 0.015
-        self.eye_wander_y = math.cos(elapsed * 0.25) * 0.02 + math.cos(elapsed * 0.13) * 0.01
+        self.eye_wander_x = (
+            math.sin(elapsed * 0.3) * 0.025 + math.sin(elapsed * 0.17) * 0.015
+        )
+        self.eye_wander_y = (
+            math.cos(elapsed * 0.25) * 0.02 + math.cos(elapsed * 0.13) * 0.01
+        )
 
         if elapsed >= self.next_saccade_time:
             if random.random() >= self._saccade_big_probability:
@@ -526,9 +550,13 @@ class AutoAnimator(BaseAnimator):
         target_fade = 0.0 if self.is_performing else 1.0
         fade_speed = logic_delta * 2.0
         if self.performing_fade_weight < target_fade:
-            self.performing_fade_weight = min(target_fade, self.performing_fade_weight + fade_speed)
+            self.performing_fade_weight = min(
+                target_fade, self.performing_fade_weight + fade_speed
+            )
         elif self.performing_fade_weight > target_fade:
-            self.performing_fade_weight = max(target_fade, self.performing_fade_weight - fade_speed)
+            self.performing_fade_weight = max(
+                target_fade, self.performing_fade_weight - fade_speed
+            )
 
         base_eye_x = self.eye_x + self.eye_wander_x + micro_jitter_x
         base_eye_y = self.eye_y + self.eye_wander_y + micro_jitter_y
@@ -544,11 +572,20 @@ class AutoAnimator(BaseAnimator):
         if self.macro_state == "HOLDING":
             t_ratio = min(1.0, self.macro_timer / self.macro_duration_hold)
             if self.macro_head_oscillation > 0:
-                head_osc_x = math.sin(t_ratio * self.macro_osc_freq * math.pi * 2) * self.macro_head_oscillation
+                head_osc_x = (
+                    math.sin(t_ratio * self.macro_osc_freq * math.pi * 2)
+                    * self.macro_head_oscillation
+                )
             if self.macro_head_oscillation_z > 0:
-                head_osc_z = math.sin(t_ratio * self.macro_osc_freq * math.pi * 2) * self.macro_head_oscillation_z
+                head_osc_z = (
+                    math.sin(t_ratio * self.macro_osc_freq * math.pi * 2)
+                    * self.macro_head_oscillation_z
+                )
             if self.macro_eye_oscillation > 0:
-                eye_osc_x = math.sin(t_ratio * self.macro_osc_freq * math.pi * 2) * self.macro_eye_oscillation
+                eye_osc_x = (
+                    math.sin(t_ratio * self.macro_osc_freq * math.pi * 2)
+                    * self.macro_eye_oscillation
+                )
 
         # 呼吸肩相位差：真实呼吸是胸腔扩张伴随耸肩、肩滞后约 lag 弧度。
         # 用独立相位给 v_body_z 一个滞后分量，替代"全身同相上下浮"的机械感。
@@ -603,14 +640,26 @@ class AutoAnimator(BaseAnimator):
             body_idle_z *= self._body_idle_scale
 
         raw_output: dict[str, float] = {}
-        raw_output[self.param_eye_x] = base_eye_x + self.macro_current_params.get("v_eye_x", 0.0) + eye_osc_x
-        raw_output[self.param_eye_y] = base_eye_y + self.macro_current_params.get("v_eye_y", 0.0)
-        raw_output[self.param_head_x] = (
-            head_micro_x + self.macro_current_params.get("v_head_x", 0.0) + head_osc_x + head_follow_eye
+        raw_output[self.param_eye_x] = (
+            base_eye_x + self.macro_current_params.get("v_eye_x", 0.0) + eye_osc_x
         )
-        raw_output[self.param_head_y] = head_micro_y + self.macro_current_params.get("v_head_y", 0.0)
+        raw_output[self.param_eye_y] = base_eye_y + self.macro_current_params.get(
+            "v_eye_y", 0.0
+        )
+        raw_output[self.param_head_x] = (
+            head_micro_x
+            + self.macro_current_params.get("v_head_x", 0.0)
+            + head_osc_x
+            + head_follow_eye
+        )
+        raw_output[self.param_head_y] = head_micro_y + self.macro_current_params.get(
+            "v_head_y", 0.0
+        )
         raw_output[self.param_head_z] = (
-            breath_z + self.macro_current_params.get("v_head_z", 0.0) + head_osc_z + self.passive_sway_val
+            breath_z
+            + self.macro_current_params.get("v_head_z", 0.0)
+            + head_osc_z
+            + self.passive_sway_val
         )
         raw_output["v_body_x"] = (
             self.macro_current_params.get("v_body_x", 0.0)
@@ -618,9 +667,7 @@ class AutoAnimator(BaseAnimator):
             + body_idle_x
         )
         raw_output["v_body_y"] = (
-            self.macro_current_params.get("v_body_y", 0.0)
-            + breath_body_y
-            + body_idle_y
+            self.macro_current_params.get("v_body_y", 0.0) + breath_body_y + body_idle_y
         )
         raw_output["v_body_z"] = (
             body_sway_z
@@ -681,9 +728,15 @@ class AutoAnimator(BaseAnimator):
             self.blink_state = 1
             self.blink_timer = 0.0
             if custom_durations:
-                self.current_close_duration = custom_durations.get("close", self.base_close_duration)
-                self.current_stay_duration = custom_durations.get("stay", self.base_stay_duration)
-                self.current_open_duration = custom_durations.get("open", self.base_open_duration)
+                self.current_close_duration = custom_durations.get(
+                    "close", self.base_close_duration
+                )
+                self.current_stay_duration = custom_durations.get(
+                    "stay", self.base_stay_duration
+                )
+                self.current_open_duration = custom_durations.get(
+                    "open", self.base_open_duration
+                )
             else:
                 self.current_close_duration = self.base_close_duration
                 self.current_stay_duration = self.base_stay_duration
@@ -767,12 +820,20 @@ class AutoAnimator(BaseAnimator):
             if action is None:
                 if self.macro_demo_queue:
                     action = self.macro_demo_queue.pop(0)
-                    logger.info(f"[演示] 播放: {action['name']} (剩余: {len(self.macro_demo_queue)})")
+                    logger.info(
+                        f"[演示] 播放: {action['name']} (剩余: {len(self.macro_demo_queue)})"
+                    )
                 else:
-                    available = [a for a in self.macro_library if a["name"] not in self.macro_history]
+                    available = [
+                        a
+                        for a in self.macro_library
+                        if a["name"] not in self.macro_history
+                    ]
                     if not available:
                         available = self.macro_library
-                    action = random.choices(available, weights=[a["weight"] for a in available])[0]
+                    action = random.choices(
+                        available, weights=[a["weight"] for a in available]
+                    )[0]
 
             # 记下当前动作的 chain_to 表，等 RETURNING 完成时按它抽签下个衔接动作
             self._current_chain_to = dict(action.get("chain_to", {}) or {})
@@ -875,7 +936,7 @@ class AutoAnimator(BaseAnimator):
         scale = max(0.1, self._motion_speed_scale)  # 防 0 / 负数
         # hold 时长按 sqrt(scale) 压缩，比 move 时长压缩得温和点：
         # 因为造型 hold 时间太短会显得"刚摆好就跑"，过度压缩反而违和。
-        self.macro_duration_hold = step.get("hold", 5.0) / (scale ** 0.5)
+        self.macro_duration_hold = step.get("hold", 5.0) / (scale**0.5)
         move_speed = step.get("move_speed", 2.0) / scale
         self.macro_duration_move = move_speed
         self.macro_duration_return = move_speed * 1.5

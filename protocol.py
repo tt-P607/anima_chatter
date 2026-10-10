@@ -24,7 +24,12 @@ __all__ = ["AnimaPlugin", "require_plugin"]
 
 
 # 插件实例必须具备的属性 / 方法，用于运行时校验。
-_REQUIRED_MEMBERS = ("audio_player", "song_library", "tts_capabilities", "get_active_performer")
+_REQUIRED_MEMBERS = (
+    "audio_player",
+    "song_library",
+    "tts_capabilities",
+    "get_active_performer",
+)
 
 
 class AnimaPlugin:

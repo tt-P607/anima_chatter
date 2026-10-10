@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, TYPE_CHECKING
 
@@ -35,6 +36,20 @@ if TYPE_CHECKING:
 
 
 logger = get_logger("anima_chatter.vts.performer")
+
+
+# 会话参数按 Task（asyncio 上下文）隔离——流水线模式下多个后台播放任务并发
+# 进入 speaking_session 时，各自的 emotion / intent 互不覆盖；锁只在真正驱动
+# VTS / 播放时短暂持有。旧实现把参数写在实例属性且锁外赋值，存在并发覆盖。
+_SESSION_PARAMS: contextvars.ContextVar[tuple[str, int, str] | None] = (
+    contextvars.ContextVar("anima_session_params", default=None)
+)
+"""当前 speaking_session 的 ``(emotion_type, emotion_level, intent)``。"""
+
+_SESSION_STARTED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "anima_session_started", default=False
+)
+"""当前会话的动作链是否已由 :meth:`VTSPerformer.start_speech_playback` 触发。"""
 
 
 class VTSPerformer:
@@ -103,11 +118,9 @@ class VTSPerformer:
         # 维护"切换 + 互斥"。
         self._active_expressions: set[str] = set()
 
-        # speaking_session 暂存的顶层 emotion / intent（首段播放前才激活）；
-        # session 进入时填充，start_speech_playback 时取用，session 退出清。
-        self._pending_session_emotion: tuple[str, int] | None = None
-        self._pending_session_intent: str | None = None
-        self._session_started: bool = False
+        # 活跃 speaking_session 计数：交错播放下会话 A 退出时若 B 仍在会话中，
+        # A 的收尾不能关掉 B 还在用的 speaking / performing 状态。
+        self._active_session_count = 0
 
     def get_expression_hints(self) -> dict[str, str]:
         """返回 ``{intent_or_emotion_key: 描述}`` 字典。
@@ -201,9 +214,6 @@ class VTSPerformer:
         logger.info("VTSPerformer 已关闭")
 
     # ── 解析 emotion / intent ────────────────────────
-    # 这两个方法保留作为 staticmethod 包装层，仅转发到 :mod:`..constants` 里
-    # 的统一实现。主要是为了兼容外部测试 / 历史调用方；新代码请直接 import
-    # constants.normalize_intent / split_emotion。
 
     @staticmethod
     def _normalize_intent(intent: str) -> str:
@@ -282,7 +292,9 @@ class VTSPerformer:
         """段间切换 intent（含表情）。在已经处于 speaking_session 时调用。
 
         用于行内 ``[motion:NAME]`` 标记：每段播放前调一次，让虚拟形象在
-        说话过程中根据当前句的语义切动作。
+        说话过程中根据当前句的语义切动作。写状态持 ``_perform_lock``——
+        交错播放下另一会话的音频可能正在播放，intent / 表情切换不能落在
+        锁外与其他会话的播放窗口交叠。
 
         与 :meth:`speaking_session` 的区别：
         - speaking_session 是**整段**会话级的 intent 默认值（顶层 say_and_perform
@@ -300,16 +312,18 @@ class VTSPerformer:
             return
 
         normalized = self._normalize_intent(intent)
-        self.speech_animator.set_intent(normalized)
+        expression_file = self._resolve_expression(
+            normalized, emotion_main_for_expression
+        )
 
-        if not self._expression_map:
-            return
-
-        expression_file = self._resolve_expression(normalized, emotion_main_for_expression)
-        try:
-            await self._sync_expressions(expression_file)
-        except Exception as exc:
-            logger.debug(f"段间切换表情失败（忽略）: {exc}")
+        async with self._perform_lock:
+            self.speech_animator.set_intent(normalized)
+            if not self._expression_map:
+                return
+            try:
+                await self._sync_expressions(expression_file)
+            except Exception as exc:
+                logger.debug(f"段间切换表情失败（忽略）: {exc}")
 
     # ── 主接口 ────────────────────────────────────────
 
@@ -320,107 +334,133 @@ class VTSPerformer:
         emotion: str = "neutral:1",
         intent: str = "NARRATING",
     ) -> AsyncIterator["VTSPerformer"]:
-        """整段对话级别的"说话作用域"。
+        """整段对话级别的"说话作用域"（**等合成不持锁**）。
 
-        进入 session **不**立即触发动作 / 表情——避免在 TTS 推理还没结束时
-        VTB 就开始做动作。真正的动作链由 :meth:`start_speech_playback` 在
-        首段音频要播放前触发。这样的时序是：
+        进入 session 只把 emotion / intent 写入**会话私有的 contextvar**——
+        不触发动作 / 表情，也不获取 ``_perform_lock``。contextvar 按 Task
+        隔离：并发的流水线后台任务各自持有自己的会话参数，彻底消除旧实现
+        "锁外写实例状态被并发会话覆盖"的竞态。
 
-        1. ``async with speaking_session(...)`` 进入 → 只持锁，不动 VTB
-        2. ``call await tts.synthesize(...)`` 等待 TTS 推理（数秒）
-        3. ``await performer.start_speech_playback(...)`` ← 此时才真正起动作
-        4. ``await performer.play(audio)`` 播音频
-        5. ...
-        6. session 退出 → 统一收尾（清 speaking / expression）
+        动作链与播放分别由 :meth:`start_speech_playback` / :meth:`play` 在
+        **各自短暂持锁**时执行（锁粒度 = 单段播放 / 一次动作链），等待 TTS
+        合成期间锁是空闲的——其他会话已合成的音频可插队物理播放，双时钟
+        漂移不再被合成等待放大。
+
+        时序：
+
+        1. ``async with speaking_session(...)`` 进入 → 仅写 contextvar
+        2. ``await TTS 合成``（数秒，不占锁）
+        3. ``await performer.start_speech_playback()`` ← 持锁触发动作链
+        4. ``await performer.play(audio)`` ← 持锁播单段，播完放锁
+        5. ... 后续段各自拿锁
+        6. session 退出 → 持锁收尾（清 speaking / expression）
         """
 
         emo_type, emo_level = self._split_emotion(emotion)
         normalized_intent = self._normalize_intent(intent)
-        # 暂存顶层 emotion / intent，等 start_speech_playback 时取用。
-        self._pending_session_emotion = (emo_type, emo_level)
-        self._pending_session_intent = normalized_intent
-        self._session_started: bool = False
+        params_token = _SESSION_PARAMS.set((emo_type, emo_level, normalized_intent))
+        started_token = _SESSION_STARTED.set(False)
+        self._active_session_count += 1
 
-        async with self._perform_lock:
-            try:
-                yield self
-            finally:
-                # 收尾：撤销 start_speech_playback 留下的状态。
-                if self._session_started and self.speech_animator and self.auto_animator:
+        try:
+            yield self
+        finally:
+            session_started = _SESSION_STARTED.get()
+            _SESSION_PARAMS.reset(params_token)
+            _SESSION_STARTED.reset(started_token)
+            self._active_session_count -= 1
+            async with self._perform_lock:
+                # 收尾：撤销 start_speech_playback 留下的状态。交错播放下
+                # 另一会话可能仍在播放——最后一个退出的会话才关 speaking /
+                # performing / 表情，避免 A 退出把 B 的嘴型关掉。
+                is_last_session = self._active_session_count == 0
+                if (
+                    session_started
+                    and is_last_session
+                    and self.speech_animator
+                    and self.auto_animator
+                ):
                     self.speech_animator.set_speaking(False)
                     self.auto_animator.set_performing(False)
                 # 退出 session 立即清空所有激活的 expression。这样模型说完
                 # 一段话、动作就回到默认（中性）状态，避免表情挂着不动。
-                if self._expression_map and self._active_expressions:
+                if (
+                    is_last_session
+                    and self._expression_map
+                    and self._active_expressions
+                ):
                     try:
                         await self._sync_expressions(None)
                     except Exception as exc:
                         logger.debug(f"退出 session 时停用表情失败（忽略）: {exc}")
-                self._pending_session_emotion = None
-                self._pending_session_intent = None
-                self._session_started = False
 
     async def start_speech_playback(self) -> None:
-        """在首段音频准备好播放时**真正**触发动作链。
+        """在首段音频准备好播放时**真正**触发动作链（单次短暂持锁）。
 
-        由 say_and_perform 的 ``consume_in_order`` 在首段播放前调用。
-        作用：
+        由 PCM 播放协调器在首块成功设备写入后调用。
+        读取当前 Task 的会话参数（contextvar），持 ``_perform_lock`` 触发：
 
         - ``set_speaking(True)`` / ``set_performing(True)``（嘴型 + 暂停待机动画）
         - 触发顶层 hotkey（如有映射）
         - 激活顶层 expression（如有映射）
 
-        幂等——第二次调用什么也不做（多段说话只首段触发一次）。
+        幂等——同一会话（Task）第二次调用什么也不做；动作链完成后即放锁，
+        播放由 :meth:`play` 各段自持锁。
         """
 
-        if self._session_started:
+        if _SESSION_STARTED.get():
             return
         if not self.is_ready or not self.speech_animator or not self.auto_animator:
             return
 
-        emotion_pair = self._pending_session_emotion
-        intent_value = self._pending_session_intent
-        if emotion_pair is None or intent_value is None:
+        params = _SESSION_PARAMS.get()
+        if params is None:
             return
-        emo_type, emo_level = emotion_pair
+        emo_type, emo_level, intent_value = params
 
-        self.speech_animator.set_emotion(emo_type, level=emo_level)
-        self.speech_animator.set_intent(intent_value)
-        self.speech_animator.set_speaking(True)
-        self.auto_animator.set_performing(True)
-        self._session_started = True
+        async with self._perform_lock:
+            self.speech_animator.set_emotion(emo_type, level=emo_level)
+            self.speech_animator.set_intent(intent_value)
+            self.speech_animator.set_speaking(True)
+            self.auto_animator.set_performing(True)
+            _SESSION_STARTED.set(True)
 
-        hotkey_id = self._resolve_hotkey(intent_value, emo_type)
-        if hotkey_id and self.connection is not None:
-            try:
-                ok = await self.connection.trigger_hotkey(hotkey_id)
-                logger.info(
-                    f"VTS 热键触发: emotion={emo_type}:{emo_level} "
-                    f"intent={intent_value} -> hotkey={hotkey_id} ok={ok}"
-                )
-            except Exception as exc:
-                logger.warning(f"触发 VTS 热键失败: {exc}")
-
-        expression_file = self._resolve_expression(intent_value, emo_type)
-        if self._expression_map:
-            try:
-                await self._sync_expressions(expression_file)
-                if expression_file:
+            hotkey_id = self._resolve_hotkey(intent_value, emo_type)
+            if hotkey_id and self.connection is not None:
+                try:
+                    ok = await self.connection.trigger_hotkey(hotkey_id)
                     logger.info(
-                        f"VTS 表情激活: emotion={emo_type}:{emo_level} "
-                        f"intent={intent_value} -> expr={expression_file}"
+                        f"VTS 热键触发: emotion={emo_type}:{emo_level} "
+                        f"intent={intent_value} -> hotkey={hotkey_id} ok={ok}"
                     )
-            except Exception as exc:
-                logger.warning(f"同步 VTS 表情失败: {exc}")
+                except Exception as exc:
+                    logger.warning(f"触发 VTS 热键失败: {exc}")
+
+            expression_file = self._resolve_expression(intent_value, emo_type)
+            if self._expression_map:
+                try:
+                    await self._sync_expressions(expression_file)
+                    if expression_file:
+                        logger.info(
+                            f"VTS 表情激活: emotion={emo_type}:{emo_level} "
+                            f"intent={intent_value} -> expr={expression_file}"
+                        )
+                except Exception as exc:
+                    logger.warning(f"同步 VTS 表情失败: {exc}")
 
     async def play(self, audio: bytes) -> bool:
-        """在一个 :meth:`speaking_session` 上下文里串行播放一段音频。"""
+        """串行播放一段音频（持锁范围 = 本段物理播放）。
+
+        播完即释放 ``_perform_lock``——同会话下一段重新拿锁，段间窗口允许
+        其他会话已合成的音频插队物理播放，缩短流水线双时钟漂移。
+        """
 
         if not audio:
             logger.warning("VTSPerformer.play 接收到空音频，跳过。")
             return False
-        await self.audio_player.play_audio(audio)
-        return True
+        async with self._perform_lock:
+            await self.audio_player.play_audio(audio)
+            return True
 
     async def perform(
         self,

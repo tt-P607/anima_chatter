@@ -1,6 +1,6 @@
 # 配置参考
 
-`anima_chatter` 用 6 个 section 表达完整配置。所有字段都有合理默认值，第一次跑
+`anima_chatter` 用 6 个 section 表达直播配置。所有字段均有默认值，第一次跑
 只需要按 [README 快速上手](../README.md) 那段填几项关键字段，剩下的等需要时再调。
 
 配置文件路径：``config/plugins/anima_chatter/config.toml``
@@ -9,12 +9,12 @@
 
 | Section | 适用模式 | 用途 |
 |---------|------|------|
-| [`[plugin]`](#plugin) | 三模式共享 | 通用 chatter 行为 |
-| [`[tts]`](#tts) | 三模式共享 | TTS HTTP 后端 |
-| [`[vts]`](#vts) | vtb / vtb_live | VTube Studio 长连 + 本地音频 + Hotkey 映射 |
-| [`[vtb_attention]`](#vtb_attention) | vtb / vtb_live | "是否回复"过滤器（注意力门）|
-| [`[audio_drive]`](#audio_drive) | vtb / vtb_live | 音频驱动头部 / 身体律动 |
-| [`[idle_animation]`](#idle_animation) | vtb / vtb_live | 待机动画频率 / 幅度 |
+| [`[plugin]`](#plugin) | 直播 | Chatter、模型与提示词 |
+| [`[vts]`](#vts) | 直播 | VTube Studio 长连 + 本地音频 + Hotkey 映射 |
+| [`[vtb_attention]`](#vtb_attention) | 直播 | 注意力门 |
+| [`[audio_drive]`](#audio_drive) | 直播 | 音频驱动头部 / 身体律动 |
+| [`[pipelining]`](#pipelining) | 直播 | 排播门、进度与背压 |
+| [`[idle_animation]`](#idle_animation) | 直播 | 待机动画频率 / 幅度 |
 
 类型定义都在 [`config.py`](../config.py)，下面按 section 列字段。
 
@@ -22,38 +22,50 @@
 
 ## [plugin]
 
-通用 chatter 行为（三模式共享）。
+直播 Chatter、模型和提示词配置。
 
 | 字段 | 类型 | 默认 | 说明 |
 |------|------|----|------|
 | `enabled` | bool | `true` | 是否启用本 chatter |
-| `tick_interval` | float | `1.0` | vtb / vtb_live 模式的 tick 间隔（秒）；**voice 模式强制 0.1** |
-| `allow_message_buffer` | bool | `true` | vtb / vtb_live 模式是否允许消息缓冲；**voice 模式强制 false** |
-| `plain_text_retry_limit` | int | `1` | 模型返回纯文本（未调用 say / say_and_perform）时的提醒重试次数 |
+| `tick_interval` | float | `1.0` | 直播 tick 间隔（秒） |
+| `allow_message_buffer` | bool | `true` | 是否允许消息缓冲 |
+| `plain_text_retry_limit` | int | `1` | 未调用 say_and_perform 时的提醒重试次数 |
 | `enable_action_suspend` | bool | `true` | 启用纯 Action 回合的挂起；关闭则纯 Action 结果继续 follow-up |
+| `enable_singing` | bool | `true` | 是否注册唱歌动作并初始化歌库 |
+| `custom_prompt` | str | `""` | 追加到直播 system prompt 的部署指令 |
+| `custom_prompt_enabled` | bool | `true` | 是否注入部署指令 |
+| `model_task` | str | `actor` | 模型任务名 |
+| `models` | list[str] | `[]` | 非空时指定模型列表 |
+| `temperature` | float | `0.7` | 指定模型时的温度 |
+| `max_tokens` | int | `8000` | 指定模型时的输出上限 |
+
+旧 `custom_prompt_modes` 在顶层加载入口转换为 `custom_prompt_enabled`，依据是否包含 `vtb_live`。自动写回前保留 `.anima_voice.bak` 原始备份，供通话配置迁移使用；不覆盖已有且不同内容的备份。
 
 ---
 
-## [tts]
+TTS 参数与动态 Action schema 由 `tts_voice_plugin-neo:service:speech` 提供。直播只调用该共享服务的 PCM 流接口，不配置 endpoint、provider、重试或 HTTP 超时；这些字段不属于本插件配置。
 
-TTS HTTP 后端配置（三模式共享）。
+GPT-SoVITS V5 的流式参数在 TTS 提供方配置中设置，不在直播插件复制音色、参考音频或推理配置：
 
-| 字段 | 类型 | 默认 | 说明 |
-|------|------|----|------|
-| `endpoint` | str | `http://127.0.0.1:8000/router/tts_http_server/api/tts/v1/synthesize` | TTS 合成接口 |
-| `timeout` | float | `30.0` | HTTP 请求超时（秒） |
-| `max_parallel_segments` | int | `4` | 最大并行合成句子数 |
-| `empty_audio_retry_count` | int | `1` | TTS 返回空音频时的重试次数 |
-| `sentence_split_enabled` | bool | `true` | 是否按句切分并并行合成 |
-| `mime_type` | str | `audio/wav` | TTS 音频 MIME 类型 |
-| `provider` | str | `qwen_tts` | TTS provider 名；留空使用服务端默认 |
-| `emit_text_on_tts_failure` | bool | `false` | TTS 失败时是否回退发送文本 |
+```toml
+[tts_streaming]
+enabled = true
+streaming_mode = 2
+streaming_chunk_seconds = 2.0
+chunk_size = 4096
+sample_steps = 32
+cfg_rate = 0.0
+```
+
+PCM 固定请求 `media_type = "raw"` 和 `batch_size = 1`，要求 48000 Hz 单声道 s16le。步数和 CFG 始终按流式配置中的数值发送，不继承普通合成的这两项参数，也不随模型自动选择。步数必须为正整数，CFG 必须为有限非负数，`0` 关闭 CFG。2 秒窗口不表示零首音等待：V5 仍先进行文本片段的语义准备。配置级效果器必须关闭，直播动作不暴露 `effects`。流式 TTS 保留原始电平，不使用整段 RMS 归一化；歌曲仍使用整轨响度处理。
+
+直播将一次 `say_and_perform` 的 `content` 列表按换行合并，inline 表演标记只剥离，顶层 emotion/intent 共享整条回复；motion/emotion 标记与列表项不会拆分 TTS 或触发表演切换。仅 wait 标记拆分请求。Provider 内部 `text_split_method` 与 `fragment_interval` 保持原配置和行为，不代表直播分句；声卡设置及 V5 的 32 步、0 CFG 参数不因该消费路径改变。PCM 接收没有块数或时长上限，当前回复可全量缓存。
 
 ---
 
 ## [vts]
 
-VTube Studio 长连 + 本地音频输出 + Hotkey 映射。仅 vtb / vtb_live 模式生效。
+VTube Studio 长连、本地直播音频输出与 Hotkey 映射。
 
 ```toml
 [vts]
@@ -67,7 +79,7 @@ hotkey_map = {}
 
 | 字段 | 类型 | 默认 | 说明 |
 |------|------|----|------|
-| `enabled` | bool | `false` | 是否启用 VTS；**关闭后 vtb 系仅播 TTS，不驱动虚拟形象** |
+| `enabled` | bool | `false` | 是否启用 VTS；关闭后只播放 TTS |
 | `host` | str | `127.0.0.1` | VTS 主机地址 |
 | `port` | int | `8001` | VTS WebSocket 端口（VTube Studio 默认） |
 | `auth_token` | str | `""` | 鉴权 token；首次留空，VTS 会弹授权窗，pyvts 自动写入 `data/anima_chatter/vts_token.txt` |
@@ -137,11 +149,11 @@ VB-Cable 的 Input 通常显示为 `CABLE Input (VB-Audio Virtual Cable)` ——
 
 ## [vtb_attention]
 
-注意力过滤器（旧 `[sub_agent]`，重命名后语义更直观）。仅 vtb / vtb_live 生效。
+直播弹幕注意力过滤器。
 
 | 字段 | 类型 | 默认 | 说明 |
 |------|------|----|------|
-| `enabled` | bool | `true` | 启用注意力过滤；关闭后每条未读直接触发 LLM。一对一私聊建议关，群聊 / 直播间建议开 |
+| `enabled` | bool | `true` | 启用注意力过滤；关闭后未读直接触发 LLM |
 | `enable_programmatic_controller` | bool | `true` | 启用程序化概率门；关闭后所有判定走 sub_actor LLM |
 
 权重数值（基础概率 0.1 / 名字命中 +0.7 / 别名命中 +0.4 / 每条未读 +0.05 /
@@ -152,7 +164,7 @@ VB-Cable 的 Input 通常显示为 `CABLE Input (VB-Audio Virtual Cable)` ——
 
 ## [audio_drive]
 
-音频驱动头部 / 身体律动。仅 vtb / vtb_live 生效。
+直播音频驱动头部与身体律动。
 
 实时计算 TTS 音频包络（RMS + 变化率），按下面增益叠加到 SpeechAnimator 的输出
 参数上。原理：声音大时头部微抬、激动；声音突变时身体一震；让程序化动画看起来
@@ -177,9 +189,24 @@ VB-Cable 的 Input 通常显示为 `CABLE Input (VB-Audio Virtual Cable)` ——
 
 ---
 
+## [pipelining]
+
+按实际起播与回复轮次限制预取，积压超过上限时拒排。所有直播语音均后台播放，Action 返回已接收而非已播完。
+
+| 字段 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `song_prepare_lead_seconds` | float | `25.0` | 歌曲实际起播后，距结束此秒数时允许准备下一回复轮；不包含开场停顿 |
+| `max_backlog_seconds` | float | `60.0` | 以估算语音时长限制积压；当前播放轮的歌曲不计入，排队歌曲仍受限 |
+
+当前回复实际起播后，有新弹幕且没有下一轮待播时，Actor 最多提前一轮。同轮多个情绪 Action 不分别占用轮次名额。取未读快照前等待容量开放，实际 NDFC 回复轮入口才推进轮次，follow-up 不额外推进。
+
+旧 `enabled`、`min_duration_seconds`、`trigger_percent` 及固定跨轮静默字段不再参与门控，自动配置同步时移除；不把旧百分比换算为新的歌曲尾段窗口。显式 `[wait:n]` 与 `pre_song_delay` 仍保留，当前回复的音频独立于播放和停顿尽快接收并缓存。字段范围以 [config.py](../config.py) 为准。
+
+---
+
 ## [idle_animation]
 
-待机自动化动画的频率与幅度。仅 vtb / vtb_live 生效。
+直播待机动画的频率与幅度。
 
 AutoAnimator 负责眨眼 / 呼吸 / 眼神扫视 / 被动摆动 / 宏观大动作。默认值已经
 比原版激进——让 VTB 待机时看起来"活"一些。所有数值都可以按你的模型调整：动得
@@ -269,49 +296,11 @@ AutoAnimator 负责眨眼 / 呼吸 / 眼神扫视 / 被动摆动 / 宏观大动�
 
 ---
 
-## 三种模式的最小配置
-
-### 仅 voice 模式（ASR 通话）
+## 直播最小配置
 
 ```toml
 [plugin]
 enabled = true
-
-[tts]
-endpoint = "http://127.0.0.1:8000/router/tts_http_server/api/tts/v1/synthesize"
-provider = "qwen_tts"
-
-# vts / vtb_attention / audio_drive / idle_animation 全部走默认即可——voice 模式不读它们
-```
-
-### 仅 vtb 模式（QQ 群手动接管）
-
-```toml
-[plugin]
-enabled = true
-
-[tts]
-endpoint = "http://127.0.0.1:8000/router/tts_http_server/api/tts/v1/synthesize"
-provider = "qwen_tts"
-
-[vts]
-enabled = true
-audio_output_device = "CABLE Input@WASAPI"
-
-[vtb_attention]
-enabled = true
-enable_programmatic_controller = true   # 群聊建议开
-```
-
-### 仅 vtb_live 模式（B 站直播间）
-
-```toml
-[plugin]
-enabled = true
-
-[tts]
-endpoint = "http://127.0.0.1:8000/router/tts_http_server/api/tts/v1/synthesize"
-provider = "qwen_tts"
 
 [vts]
 enabled = true

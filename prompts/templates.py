@@ -1,33 +1,8 @@
-"""anima_chatter 的提示词模板字符串。
-
-设计要点：
-
-- :data:`SYSTEM_PROMPT` —— 三种模式共享的 system prompt 主体（人设 + 行为
-  准则 + ``{scene_guide}`` 占位符）。``{scene_guide}`` 在运行时由
-  :mod:`.scenes` 按 mode 注入。
-- :data:`USER_PROMPT_TEMPLATE` —— **统一**的 user prompt 模板，三种模式都用
-  同一个；只通过 ``{mode_header}`` / ``{section_history}`` / ``{section_unreads}``
-  / ``{section_tail}`` 这几个占位符决定风格差异，避免维护三个内容几乎一样
-  的模板。
-- :data:`MODE_PROMPT_PROFILES` —— 每个模式对应的"标题 / 段头 / 尾部提示"配置。
-  :class:`.builder.AnimaChatterPromptBuilder` 用它把模板和模式衔接起来。
-
-模板字段命名约定：
-
-- ``{stream_name}`` / ``{current_time}`` / ``{platform}``：场景元信息。
-- ``{history}`` / ``{unreads}``：聊天上下文（由 prompt_manager 的 wrap policy
-  自动加段头）。
-- ``{extra}``：补充提醒文字（如负面行为约束）。
-- ``{mode_header}``：当前模式的段标题，如 "# 实时语音通话输入"。
-- ``{section_history}``：``history`` 段头文案，用于 wrap policy。
-- ``{section_unreads}``：``unreads`` 段头文案，用于 wrap policy。
-- ``{section_tail}``：模式专属的"末尾指令"。
-"""
+"""直播人格模板、弹幕模板和工具调用提醒。"""
 
 from __future__ import annotations
 
 from typing import TypedDict
-
 
 SYSTEM_PROMPT = """
 <personality>
@@ -94,6 +69,8 @@ SYSTEM_PROMPT = """
 {scene_guide}
 </scene_and_protocol>
 
+{speech_rules}
+
 <tool_usage>
 你的所有交互行为都是基于工具的。工具分为三类：Action、Tool、Agent。
 
@@ -147,12 +124,12 @@ USER_PROMPT_TEMPLATE = """{mode_header}
 {extra}{section_tail}"""
 
 
-class ModePromptProfile(TypedDict):
-    """单个运行模式的 user prompt 配置。
+class LivePromptProfile(TypedDict):
+    """直播 user prompt 的标题、段头及末尾指令。
 
     Attributes:
-        template_name: 在 prompt manager 注册时的模板名（与 mode 一一对应）。
-        mode_header: ``{mode_header}`` 占位的文案，如 "# 实时语音通话输入"。
+        template_name: 在 prompt manager 注册时的模板名。
+        mode_header: 直播输入标题。
         history_wrap_prefix: 历史段头文案，用于 wrap policy（前缀）。
         unreads_wrap_prefix: 未读段头文案，用于 wrap policy（前缀）。
         stream_name_default: ``stream_name`` 占位的兜底值（见 optional() policy）。
@@ -167,34 +144,7 @@ class ModePromptProfile(TypedDict):
     section_tail: str
 
 
-# voice / vtb / vtb_live 三种模式对应的 prompt 配置。
-# AnimaChatterPromptBuilder.build_user_prompt 会按 mode 取对应配置进而填充模板。
-MODE_PROMPT_PROFILES: dict[str, ModePromptProfile] = {
-    "voice": {
-        "template_name": "anima_chatter_user_prompt",
-        "mode_header": "# 实时语音通话输入",
-        "history_wrap_prefix": "# 历史通话内容\n",
-        "unreads_wrap_prefix": "# 新识别到的语音\n",
-        "stream_name_default": "未知通话",
-        "section_tail": (
-            "\n请基于以上 ASR 输入和通话上下文决定下一步。"
-            "需要说话时调用 say；说完等待用户时调用 pass_and_wait。\n"
-        ),
-    },
-    "vtb": {
-        "template_name": "anima_chatter_vtb_user_prompt",
-        "mode_header": "# VTube Studio 互动输入",
-        "history_wrap_prefix": "# 历史对话\n",
-        "unreads_wrap_prefix": "# 新收到的消息\n",
-        "stream_name_default": "未知聊天",
-        "section_tail": (
-            "\n请基于以上聊天上下文决定下一步。"
-            "需要说话/做动作时调用 say_and_perform；说完想等待用户继续时调用 pass_and_wait。\n"
-            "注意：你的输出会同时显示为文本、TTS 朗读和虚拟形象表演，"
-            "请按 <scene_and_protocol> 段的协议执行。\n"
-        ),
-    },
-    "vtb_live": {
+LIVE_USER_PROMPT_PROFILE: LivePromptProfile = {
         "template_name": "anima_chatter_vtb_live_user_prompt",
         "mode_header": "# VTube Studio 直播弹幕输入",
         "history_wrap_prefix": "# 直播历史弹幕\n",
@@ -209,7 +159,6 @@ MODE_PROMPT_PROFILES: dict[str, ModePromptProfile] = {
             "调用 pass_and_wait 让自己沉默几秒。\n"
             "- 严格遵循 <scene_and_protocol> 段里的直播间礼仪与禁忌。\n"
         ),
-    },
 }
 
 
@@ -217,11 +166,6 @@ MODE_PROMPT_PROFILES: dict[str, ModePromptProfile] = {
 # 当模型不调工具直接吐纯文本时，plugin.py 的 handle_plain_text_response
 # 会按当前模式注入这段提醒，给模型一次重发的机会。
 # 统一放在这里避免散落在 plugin.py 里。
-
-PLAIN_TEXT_REMINDER_VOICE: str = (
-    "系统提醒：当前是实时语音通话 Chatter。你必须调用 say action 输出"
-    "要说的话，纯文本不会被播放。说完等待用户时，请调用 pass_and_wait。"
-)
 
 PLAIN_TEXT_REMINDER_VTB: str = (
     "系统提醒：当前是 VTube Studio 虚拟形象互动 Chatter。你必须调用 "
@@ -231,10 +175,9 @@ PLAIN_TEXT_REMINDER_VTB: str = (
 
 
 __all__ = [
-    "MODE_PROMPT_PROFILES",
-    "ModePromptProfile",
-    "PLAIN_TEXT_REMINDER_VOICE",
+    "LIVE_USER_PROMPT_PROFILE",
     "PLAIN_TEXT_REMINDER_VTB",
     "SYSTEM_PROMPT",
     "USER_PROMPT_TEMPLATE",
+    "LivePromptProfile",
 ]

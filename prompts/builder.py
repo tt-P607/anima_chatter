@@ -1,29 +1,18 @@
-"""提示词构建器。
-
-把"模式判定 + 场景文案 + 模板字符串"组装成最终送给 LLM 的 system / user prompt。
-其它模块统一 ``from ..prompts import AnimaChatterPromptBuilder`` 即可。
-"""
+"""直播场景、人格和部署指令的提示词构建器。"""
 
 from __future__ import annotations
 
 import datetime
-import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from src.app.plugin_system.api import adapter_api
+from src.app.plugin_system.api import adapter_api, prompt_api
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.types import ChatStream, Message
 
 from .._internal_compat import get_personality, get_prompt_manager
-from ..modes import ChatterMode, resolve_mode
-from ..runtime import call_state
-from .scenes import (
-    VOICE_SCENE_GUIDE,
-    VTB_SCENE_GUIDE,
-    build_vtb_live_scene_guide,
-)
-from .templates import MODE_PROMPT_PROFILES
+from .scenes import build_vtb_live_scene_guide
+from .templates import LIVE_USER_PROMPT_PROFILE
 
 if TYPE_CHECKING:
     from ..config import AnimaChatterConfig
@@ -32,7 +21,9 @@ if TYPE_CHECKING:
 logger = get_logger("anima_chatter.prompts")
 
 
-__all__ = ["AnimaChatterPromptBuilder"]
+SPEECH_RULES_TEMPLATE_NAME: str = "tts_voice_plugin-neo.speech_rules"
+
+__all__ = ["SPEECH_RULES_TEMPLATE_NAME", "AnimaChatterPromptBuilder"]
 
 
 def _is_live_adapter_enabled(adapter: object) -> bool:
@@ -83,55 +74,28 @@ def _detect_active_live_sources() -> frozenset[str]:
     )
 
 
-def _format_duration(seconds: float) -> str:
-    """把秒数格式化为"N 分 M 秒"。
-
-    Args:
-        seconds: 时长秒数。
-
-    Returns:
-        中文时长描述；不足 1 分钟时只显示秒。
-    """
-
-    minutes, secs = divmod(int(max(0.0, seconds)), 60)
-    return f"{minutes} 分 {secs} 秒" if minutes > 0 else f"{secs} 秒"
-
-
 class AnimaChatterPromptBuilder:
     """anima_chatter 的提示词构建器。"""
 
     @staticmethod
-    def resolve_mode(chat_stream: ChatStream) -> ChatterMode:
-        """判定运行模式。
-
-        Args:
-            chat_stream: 当前聊天流。
-
-        Returns:
-            运行模式。
-        """
-
-        return resolve_mode(chat_stream)
-
-    @staticmethod
     def build_action_suspend_guidance(
         plugin_config: "AnimaChatterConfig | None",
-        mode: ChatterMode,
     ) -> str:
         """构建 Action-only 回合的行为说明。
 
         Args:
             plugin_config: 插件配置；``None`` 时按默认（启用挂起）处理。
-            mode: 当前运行模式，决定文案里举例用哪个 say 动作。
 
         Returns:
             说明文本。
         """
 
         enabled = (
-            True if plugin_config is None else plugin_config.plugin.enable_action_suspend
+            True
+            if plugin_config is None
+            else plugin_config.plugin.enable_action_suspend
         )
-        examples = "say、pass_and_wait" if mode == "voice" else "say_and_perform、pass_and_wait"
+        examples = "say_and_perform、pass_and_wait"
 
         if enabled:
             return (
@@ -149,78 +113,23 @@ class AnimaChatterPromptBuilder:
 
     @staticmethod
     def get_scene_guide(
-        mode: ChatterMode,
         expression_hints: dict[str, str] | None = None,
-        chat_stream: ChatStream | None = None,
     ) -> str:
-        """按模式返回场景与工具协议文案。
+        """构建直播场景与表演工具协议文案。
 
         Args:
-            mode: 运行模式。
             expression_hints: ``{intent/emotion: 描述}`` 映射，由 VTS 表演器提供。
-                有值时会在 vtb 系场景文案末尾追加"预设动作触发表"，让模型知道
-                选某些 intent 会触发哪些手部 / 道具表情。voice 模式忽略此参数。
-            chat_stream: 当前聊天流。voice 模式下用来检查是否处于通话中——通话中
-                会追加"开始时间 + 已持续时长"的状态片段，让模型直接看到通话语境。
+                有值时在场景末尾追加预设动作触发表。
 
         Returns:
             场景文案。
         """
 
-        if mode == "voice":
-            return AnimaChatterPromptBuilder._build_voice_scene(chat_stream)
-
-        base = (
-            build_vtb_live_scene_guide(_detect_active_live_sources())
-            if mode == "vtb_live"
-            else VTB_SCENE_GUIDE
-        )
+        base = build_vtb_live_scene_guide(_detect_active_live_sources())
         hints_block = AnimaChatterPromptBuilder._build_expression_hints_block(
             expression_hints
         )
         return base + hints_block
-
-    @staticmethod
-    def _build_voice_scene(chat_stream: ChatStream | None) -> str:
-        """构建 voice 场景文案，通话中追加动态状态块。
-
-        Args:
-            chat_stream: 当前聊天流；``None`` 时只返回基础文案。
-
-        Returns:
-            场景文案。
-        """
-
-        if chat_stream is None:
-            return VOICE_SCENE_GUIDE
-
-        active = call_state.snapshot_active_call_unlocked()
-        if active is None or active.caller_stream_id != (chat_stream.stream_id or ""):
-            return VOICE_SCENE_GUIDE
-
-        now = time.time()
-        started_human = datetime.datetime.fromtimestamp(active.started_at).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-        elapsed = _format_duration(now - active.started_at)
-        idle_for = max(0.0, now - active.last_activity_at)
-        remaining = _format_duration(max(0.0, active.timeout_seconds - idle_for))
-        timeout_str = _format_duration(active.timeout_seconds)
-
-        return VOICE_SCENE_GUIDE + (
-            "\n\n<call_status>\n"
-            "**【你正在通话中】** 当前 stream 正处于一通本地语音通话——\n"
-            f"- 通话开始于：{started_human}\n"
-            f"- 已持续：{elapsed}\n"
-            f"- 距自动挂断还剩：{remaining}\n"
-            f"- 挂断规则：双方都安静超过 {timeout_str} 才会自动挂；"
-            "只要持续在聊，通话不会因总时长被中断。\n"
-            "- 通话从原私聊升级而来：你的回复经 TTS 通过本机扬声器播放，"
-            "对方的话来自麦克风 ASR（可能有错字），双方都看不到文字。\n"
-            "- 任何时候认为该挂断，调 ``end_voice_call`` 并附一句自然告别即可，"
-            "不必等用户开口提议。\n"
-            "</call_status>"
-        )
 
     @staticmethod
     def _build_expression_hints_block(hints: dict[str, str] | None) -> str:
@@ -262,7 +171,6 @@ class AnimaChatterPromptBuilder:
     async def build_system_prompt(
         plugin_config: "AnimaChatterConfig | None",
         chat_stream: ChatStream,
-        mode: ChatterMode | None = None,
         expression_hints: dict[str, str] | None = None,
     ) -> str:
         """构建系统提示词。
@@ -270,40 +178,45 @@ class AnimaChatterPromptBuilder:
         Args:
             plugin_config: 插件配置。
             chat_stream: 当前聊天流。
-            mode: 显式指定模式；``None`` 时自动判定。
             expression_hints: 预设动作提示映射。
 
         Returns:
             渲染好的 system prompt；模板未注册时返回空串。
         """
 
-        actual_mode = mode or resolve_mode(chat_stream)
         template = get_prompt_manager().get_template("anima_chatter_system_prompt")
         if template is None:
             logger.error("system prompt 模板未注册")
             return ""
 
+        speech_template = prompt_api.get_template(SPEECH_RULES_TEMPLATE_NAME)
+        if speech_template is None:
+            raise RuntimeError(f"公共语音模板未注册：{SPEECH_RULES_TEMPLATE_NAME}")
+        speech_rules = await speech_template.build(strict=True)
+
         # ``<personality>`` 里的 ``{nickname}`` 是「角色人设名」，取全局人设配置，
         # 而非 ``chat_stream.bot_nickname``（那是平台账号显示名，职责不同）。
         return await (
             template.set("nickname", get_personality().nickname)
+            .set("speech_rules", speech_rules)
+            .set("stream_id", chat_stream.stream_id)
             .set(
                 "action_suspend_guidance",
                 AnimaChatterPromptBuilder.build_action_suspend_guidance(
-                    plugin_config, actual_mode
+                    plugin_config
                 ),
             )
             .set("sub_agent_collaboration_extra", "")
             .set(
                 "scene_guide",
                 AnimaChatterPromptBuilder.get_scene_guide(
-                    actual_mode, expression_hints, chat_stream=chat_stream
+                    expression_hints
                 ),
             )
             .set(
                 "custom_instructions_block",
                 AnimaChatterPromptBuilder.build_custom_instructions_block(
-                    plugin_config, actual_mode
+                    plugin_config
                 ),
             )
             .build()
@@ -312,16 +225,13 @@ class AnimaChatterPromptBuilder:
     @staticmethod
     def build_custom_instructions_block(
         plugin_config: "AnimaChatterConfig | None",
-        mode: ChatterMode,
     ) -> str:
-        """按当前模式构建部署级自定义指令块。
+        """构建对直播生效的部署级自定义指令块。
 
-        以下任一条件成立时不注入：配置缺失、``custom_prompt`` 为空、
-        ``custom_prompt_modes`` 为空列表、当前模式不在该列表内。
+        配置缺失、提示词为空或部署指令未启用时不注入。
 
         Args:
             plugin_config: 插件配置。
-            mode: 当前运行模式。
 
         Returns:
             指令块文本；不注入时返回空串。
@@ -334,12 +244,7 @@ class AnimaChatterPromptBuilder:
         if not custom_text:
             return ""
 
-        allowed = {
-            str(item).strip().lower()
-            for item in plugin_config.plugin.custom_prompt_modes
-            if item
-        }
-        if mode not in allowed:
+        if not plugin_config.plugin.custom_prompt_enabled:
             return ""
 
         return (
@@ -358,33 +263,32 @@ class AnimaChatterPromptBuilder:
         history_text: str,
         unread_lines: str,
         extra: str = "",
-        mode: ChatterMode | None = None,
     ) -> str:
-        """构建用户提示词，按模式选择对应模板。
+        """构建直播弹幕用户提示词。
 
         Args:
             chat_stream: 当前聊天流。
             history_text: 已格式化的历史消息文本。
             unread_lines: 已格式化的未读消息文本。
             extra: 额外提醒文本。
-            mode: 显式指定模式；``None`` 时自动判定。
 
         Returns:
             渲染好的 user prompt。
 
         Raises:
-            RuntimeError: 对应模式的模板未注册（装配期错误）。
+            RuntimeError: 直播模板未注册。
         """
 
-        actual_mode = mode or resolve_mode(chat_stream)
-        profile = MODE_PROMPT_PROFILES[actual_mode]
+        profile = LIVE_USER_PROMPT_PROFILE
 
         template = get_prompt_manager().get_template(profile["template_name"])
         if template is None:
             raise RuntimeError(f"user prompt 模板未注册: {profile['template_name']}")
 
         return await (
-            template.set("stream_name", chat_stream.stream_name or chat_stream.stream_id)
+            template.set(
+                "stream_name", chat_stream.stream_name or chat_stream.stream_id
+            )
             .set("current_time", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             .set("platform", chat_stream.platform)
             .set("history", history_text)

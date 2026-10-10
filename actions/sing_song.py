@@ -28,15 +28,10 @@ from src.app.plugin_system.base import BaseAction
 from .._internal_compat import get_anima_chatter_plugin
 from ..audio import read_duration_from_path
 from ..constants import normalize_intent, split_emotion
-from ..modes import resolve_mode
 from ..protocol import require_plugin
-from ..runtime import call_state, sung_history
+from ..runtime import sung_history
 from ..song_library import SongInfo, SongLibrary, format_duration
-from ..speech import (
-    dispatch_track_pipelined,
-    play_track_blocking,
-    should_use_pipeline,
-)
+from ..speech import dispatch_track_pipelined
 
 if TYPE_CHECKING:
     from ..vts import VTSPerformer
@@ -48,9 +43,6 @@ logger = get_logger("anima_chatter.action.sing_song")
 # 唱歌默认走轻表现——比通话 / 普通说话更收敛。
 _SING_DEFAULT_EMOTION_TYPE = "happy"
 _SING_DEFAULT_EMOTION_LEVEL = 1
-
-# 歌曲时长读取失败时的兜底值（秒），仅影响流水线 reserve 占位。
-_FALLBACK_SONG_DURATION = 60.0
 
 # 时间轴首个 cue 的"视为开头"阈值（秒）。
 _TIMELINE_HEAD_THRESHOLD = 0.5
@@ -71,7 +63,7 @@ _MOTION_TIMELINE_DESC = (
     "可选的动作时间轴：让虚拟形象在歌曲不同段落切换动作 / 情绪，避免整首一个姿势。"
     "留空（``[]``）则全程默认 NARRATING + happy:1。\n"
     "\n"
-    "格式：``[{\"at\": 秒数, \"intent\": \"动作名\", \"emotion\": \"类型:强度\"}, ...]``\n"
+    '格式：``[{"at": 秒数, "intent": "动作名", "emotion": "类型:强度"}, ...]``\n'
     "- ``at``：从歌曲开始算起的秒数（0 = 开头，75 = 1 分 15 秒）\n"
     "- ``intent``：动作意图（NARRATING / EXCITED / PROUD_LIFT / SHY_DOWN / "
     "PLAYFUL_TILT 等，完整列表见 say_and_perform）\n"
@@ -80,17 +72,16 @@ _MOTION_TIMELINE_DESC = (
     "动作保持时长 = 相邻两个 cue 的 ``at`` 时间差。段数自定、别太频繁；跟着歌曲"
     "段落（前奏 / 主歌 / 副歌 / 尾奏）或情绪起伏切换最自然。\n"
     "\n"
-    "示例：``[{\"at\": 0, \"intent\": \"EXCITED\", \"emotion\": \"happy:2\"}, "
-    "{\"at\": 8, \"intent\": \"NARRATING\", \"emotion\": \"happy:1\"}, "
-    "{\"at\": 75, \"intent\": \"SHY_DOWN\", \"emotion\": \"happy:1\"}]``"
+    '示例：``[{"at": 0, "intent": "EXCITED", "emotion": "happy:2"}, '
+    '{"at": 8, "intent": "NARRATING", "emotion": "happy:1"}, '
+    '{"at": 75, "intent": "SHY_DOWN", "emotion": "happy:1"}]``'
 )
 
 _PRE_SONG_DELAY_DESC = (
-    "开场白发完后、歌曲开始前的停顿秒数（默认 4 秒）。\n"
-    "给观众听完文字开场、调整心情的缓冲。想更隆重传 ``5`` ~ ``8``，"
+    "歌曲开始前的停顿秒数（默认 4 秒）。\n"
+    "给观众调整心情的缓冲。想更隆重传 ``5`` ~ ``8``，"
     "想立刻开唱传 ``0`` ~ ``2``。\n"
-    "停顿期间虚拟形象会显示 motion_timeline 第一个 cue 的动作，"
-    "可用来做『准备开口』的姿态。"
+    "文字开场白和动作时间轴都从歌曲实际开始输出时启动；停顿期间不会提前执行。"
 )
 
 
@@ -237,7 +228,11 @@ def _build_song_keyword_desc(library: SongLibrary | None) -> str:
 
     history_block = sung_history.format_recent_block()
     if library is None:
-        return _SONG_KEYWORD_BASE_DESC + "\n\n【可用歌单】（暂未加载，请稍后重试）" + history_block
+        return (
+            _SONG_KEYWORD_BASE_DESC
+            + "\n\n【可用歌单】（暂未加载，请稍后重试）"
+            + history_block
+        )
 
     songs = library.get_songs()
     if not songs:
@@ -303,16 +298,13 @@ class SingSongAction(BaseAction):
     async def go_activate(self) -> bool:
         """唱歌动作的可见性。
 
-        三个条件同时满足：非 local_asr 平台、当前 stream 不在通话中（语音通话
-        场景放歌会打断纯耳朵交互体验）、歌库已就绪且非空。
+        只在直播流上且歌库已就绪时开放。
 
         Returns:
             是否对模型可见。
         """
 
-        if self.chat_stream.platform == "local_asr":
-            return False
-        if await call_state.is_call_active_for_stream(self.chat_stream.stream_id):
+        if self.chat_stream.platform != "live":
             return False
 
         library = require_plugin(self.plugin).song_library
@@ -320,7 +312,9 @@ class SingSongAction(BaseAction):
 
     async def execute(
         self,
-        song_keyword: Annotated[str, "要唱的歌曲名称（动态歌单见 to_schema 注入）。"] = "",
+        song_keyword: Annotated[
+            str, "要唱的歌曲名称（动态歌单见 to_schema 注入）。"
+        ] = "",
         announce: Annotated[
             str,
             "唱歌前发到聊天的开场白文本（可选）。例：``那我给大家唱一首《XX》吧♪``。\n"
@@ -367,8 +361,6 @@ class SingSongAction(BaseAction):
             yield False, self._build_not_found_message(library, song_keyword)
             return
 
-        await self._announce(announce, song_info.name)
-
         audio_player = plugin.audio_player
         if audio_player is None:
             yield False, "音频播放器未初始化（可能 audio 配置缺失），无法播放"
@@ -377,7 +369,9 @@ class SingSongAction(BaseAction):
         try:
             audio_bytes = song_info.path.read_bytes()
         except OSError as exc:
-            logger.error(f"读取歌曲文件失败 path={song_info.path}: {exc}", exc_info=True)
+            logger.error(
+                f"读取歌曲文件失败 path={song_info.path}: {exc}", exc_info=True
+            )
             yield False, f"读取歌曲文件失败: {exc}"
             return
         if not audio_bytes:
@@ -392,47 +386,29 @@ class SingSongAction(BaseAction):
         pre_delay = max(0.0, pre_song_delay)
         song_duration = read_duration_from_path(song_info.path)
         if song_duration is None or song_duration <= 0:
-            logger.warning(
-                f"无法读取歌曲时长 path={song_info.path}，"
-                f"流水线模式下按 {_FALLBACK_SONG_DURATION:.0f}s 兜底"
-            )
-            song_duration = _FALLBACK_SONG_DURATION
+            logger.error(f"无法读取歌曲时长 path={song_info.path}")
+            yield False, f"无法读取歌曲时长，未播放歌曲《{song_info.name}》"
+            return
 
         logger.info(
             f"准备播放《{song_info.name}》（{len(audio_bytes)} bytes，"
             f"时长 {song_duration:.1f}s，开场停顿 {pre_delay:.1f}s）"
         )
 
-        use_pipeline = should_use_pipeline(
-            is_live_mode=resolve_mode(self.chat_stream) == "vtb_live",
-            section=config.pipelining,
-            estimated_duration=pre_delay + song_duration,
-        )
         performer = plugin.get_active_performer()
-        timeline = MotionTimelineRunner(cues) if cues and performer is not None else None
+        timeline = (
+            MotionTimelineRunner(cues) if cues and performer is not None else None
+        )
 
         # 顺序门：准备工作已完成，在占用播放资源前让出。
         yield None
 
-        # 此刻歌已确定要播，统一在这里记录历史（三条播放路径都会经过）。
-        await sung_history.record(song_info.name)
+        async def on_started() -> None:
+            await self._announce(announce, song_info.name)
+            await sung_history.record(song_info.name)
 
         stream_id = self.chat_stream.stream_id
-        if use_pipeline:
-            yield await dispatch_track_pipelined(
-                stream_id=stream_id,
-                audio_bytes=audio_bytes,
-                inst_bytes=inst_bytes,
-                audio_player=audio_player,
-                performer=performer,
-                timeline=timeline,
-                pre_delay=pre_delay,
-                song_duration=song_duration,
-                song_name=song_info.name,
-            )
-            return
-
-        yield await play_track_blocking(
+        yield await dispatch_track_pipelined(
             stream_id=stream_id,
             audio_bytes=audio_bytes,
             inst_bytes=inst_bytes,
@@ -440,7 +416,9 @@ class SingSongAction(BaseAction):
             performer=performer,
             timeline=timeline,
             pre_delay=pre_delay,
+            song_duration=song_duration,
             song_name=song_info.name,
+            on_started=on_started,
         )
 
     @staticmethod
@@ -499,7 +477,9 @@ class SingSongAction(BaseAction):
         try:
             inst_bytes = song_info.inst_path.read_bytes() or None
         except OSError as exc:
-            logger.warning(f"读取伴奏失败 path={song_info.inst_path}: {exc}，退化为单轨")
+            logger.warning(
+                f"读取伴奏失败 path={song_info.inst_path}: {exc}，退化为单轨"
+            )
             return None
         if inst_bytes:
             logger.info(f"《{song_info.name}》双轨：人声→VB-Cable，伴奏→独立设备")
@@ -523,4 +503,9 @@ class SingSongAction(BaseAction):
             logger.warning(f"发送唱歌开场白失败: {text[:30]}")
 
 
-__all__ = ["MotionCue", "MotionTimelineRunner", "SingSongAction", "parse_motion_timeline"]
+__all__ = [
+    "MotionCue",
+    "MotionTimelineRunner",
+    "SingSongAction",
+    "parse_motion_timeline",
+]

@@ -125,7 +125,10 @@ def create_request(
     return LLMRequest(
         model_set=resolve_model_set(section, task),
         request_name=request_name,
-        meta_data={"stream_id": stream_id},
+        meta_data={
+            "stream_id": stream_id,
+            **({"_ndfc": True} if task != "sub_actor" else {}),
+        },
         context_manager=LLMContextManager(
             context_compression_handler=default_context_compression_handler(),
             reminder_sources=build_reminder_sources(with_reminder, stream_id),

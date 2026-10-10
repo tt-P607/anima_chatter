@@ -1,8 +1,8 @@
 {
   "name": "anima_chatter",
-  "display_name": "Anima 语音通话与虚拟形象聊天器",
+  "display_name": "Anima 直播",
   "version": "1.2.2",
-  "description": "统一编排实时语音通话、VTube Studio 表演和直播弹幕互动的三模式 Chatter。",
+  "description": "Neo-MoFox 直播互动插件，接收观众弹幕，生成语音回复，并支持 VTube Studio 虚拟形象表演和本地歌曲播放。",
   "author": "言柒",
   "entry_point": "plugin.py",
   "min_core_version": "1.2.0-alpha",
@@ -13,20 +13,19 @@
     "llm_api": "1.0.0",
     "log_api": "1.0.0",
     "plugin_api": "1.0.0",
+    "prompt_api": "1.0.0",
     "send_api": "1.0.0",
     "service_api": "1.0.0",
     "stream_api": "2.0.0"
   },
   "dependencies": {
     "plugins": [
-      "asr_adapter_anima",
-      "tts_http_server",
+      "tts_voice_plugin-neo",
       "neo_default_chatter"
     ],
     "components": [
       "neo_default_chatter:service:chat_core",
-      "asr_adapter_anima:service:asr_redirect",
-      "tts_http_server:service:tts_provider_registry"
+      "tts_voice_plugin-neo:service:speech"
     ]
   },
   "python_dependencies": [
@@ -47,11 +46,6 @@
     },
     {
       "component_type": "action",
-      "component_name": "say",
-      "dependencies": []
-    },
-    {
-      "component_type": "action",
       "component_name": "say_and_perform",
       "dependencies": []
     },
@@ -63,30 +57,6 @@
     {
       "component_type": "action",
       "component_name": "pass_and_wait",
-      "dependencies": []
-    },
-    {
-      "component_type": "action",
-      "component_name": "start_voice_call",
-      "dependencies": [
-        "asr_adapter_anima:service:asr_redirect"
-      ]
-    },
-    {
-      "component_type": "action",
-      "component_name": "end_voice_call",
-      "dependencies": [
-        "asr_adapter_anima:service:asr_redirect"
-      ]
-    },
-    {
-      "component_type": "command",
-      "component_name": "voice",
-      "dependencies": []
-    },
-    {
-      "component_type": "command",
-      "component_name": "vtb",
       "dependencies": []
     },
     {
@@ -129,11 +99,9 @@
     "chat"
   ],
   "tags": [
-    "voice",
-    "chatter",
-    "real-time",
+    "live",
+    "chatbot",
     "tts",
-    "vtube-studio",
-    "live"
+    "vtube-studio"
   ]
 }
