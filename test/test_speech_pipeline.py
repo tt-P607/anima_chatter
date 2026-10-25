@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextvars import ContextVar
 from types import SimpleNamespace
-from typing import Any, Self
+from typing import Any, Self, cast
 from unittest.mock import AsyncMock
 
 import numpy as np
@@ -1362,6 +1362,94 @@ async def test_speech_action_opens_stream_only_after_tool_order_gate(
 
 
 @pytest.mark.asyncio
+async def test_speech_body_control_applies_once_at_first_pcm_start(
+    isolated_playback: list[asyncio.Task[Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """say 的 body 只在真实起播应用一次，且不进入 TTS markers。"""
+
+    from plugins.anima_chatter.actions import say_and_perform
+    from plugins.anima_chatter.config import AnimaChatterConfig
+    from plugins.anima_chatter.plugin import AnimaChatterPlugin
+    from plugins.anima_chatter.vts.animation.body import BodyControl
+
+    allow_start = asyncio.Event()
+    player_ready = asyncio.Event()
+    applied: list[BodyControl] = []
+    playback_task: asyncio.Task[Any] | None = None
+    apply_tasks: list[asyncio.Task[Any] | None] = []
+    provider = FakePCMProvider(
+        lambda _: _stream_context(_single_chunk(b"\x01\x00" * 100))
+    )
+
+    class Performer:
+        is_ready = True
+        revision = 0
+
+        def reserve_body_control(self) -> int:
+            self.revision += 1
+            return self.revision
+
+        @contextlib.asynccontextmanager
+        async def speaking_session(self, **_kwargs: Any) -> AsyncGenerator[None]:
+            yield
+
+        async def apply_body_control(
+            self, control: BodyControl, *, revision: int | None = None
+        ) -> bool:
+            apply_tasks.append(asyncio.current_task())
+            applied.append(control)
+            return True
+
+        async def start_speech_playback(self) -> None:
+            return None
+
+        async def switch_segment_intent(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    class GatedPlayer:
+        async def play_pcm_stream(
+            self, chunks: AsyncIterator[bytes], **kwargs: Any
+        ) -> int:
+            nonlocal playback_task
+            playback_task = asyncio.current_task()
+            first = await anext(chunks)
+            player_ready.set()
+            await allow_start.wait()
+            await kwargs["on_started"]()
+            return len(first) // 2
+
+    monkeypatch.setattr(say_and_perform, "get_tts_service", lambda: provider)
+    plugin: Any = AnimaChatterPlugin(AnimaChatterConfig())
+    plugin.audio_player = GatedPlayer()
+    plugin.vts_performer = Performer()
+    action: Any = SimpleNamespace(
+        plugin=plugin,
+        chat_stream=SimpleNamespace(stream_id="body-say", platform="live"),
+        _parse_all=say_and_perform.SayAndPerformAction._parse_all,
+        _send_texts=AsyncMock(),
+    )
+    body = {"left_eye": {"openness": 0.25}}
+    generator = say_and_perform.SayAndPerformAction.execute(
+        action, ["message"], body=body, speed=1.1
+    )
+
+    assert await anext(generator) is None
+    result = await anext(generator)
+    assert result is not None and result[0] is True
+    assert "已接收" in result[1]
+    assert "尚未确认起播或平台文字发送" in result[1]
+    await asyncio.wait_for(player_ready.wait(), timeout=2)
+    assert applied == []
+    assert provider.requests[0].markers == {"speed": 1.1}
+    allow_start.set()
+    await _wait_playback_tasks(isolated_playback)
+    assert applied == [BodyControl.model_validate(body)]
+    assert apply_tasks == [playback_task]
+    action._send_texts.assert_awaited_once_with(["message"])
+
+
+@pytest.mark.asyncio
 async def test_speech_action_rejection_does_not_send_text(
     pcm_player: AudioPlayer,
     isolated_playback: list[asyncio.Task[Any]],
@@ -1397,6 +1485,53 @@ async def test_speech_action_rejection_does_not_send_text(
     action._send_texts.assert_not_awaited()
     assert provider.open_count == 0
     assert isolated_playback == []
+
+
+@pytest.mark.asyncio
+async def test_started_speech_text_uses_detailed_send_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """起播附文使用详细平台回执，UNKNOWN 不标记回复成功。"""
+
+    from plugins.anima_chatter.actions import say_and_perform
+    from plugins.anima_chatter.chatter import attention
+    from src.app.plugin_system.api import send_api
+    from src.app.plugin_system.base import PlatformSendResult, PlatformSendStatus
+
+    results = iter(
+        [
+            PlatformSendResult(
+                status=PlatformSendStatus.UNKNOWN,
+                success=False,
+                error="timeout",
+            ),
+            PlatformSendResult(
+                status=PlatformSendStatus.SENT,
+                success=False,
+                error="local bookkeeping failed",
+            ),
+        ]
+    )
+    calls: list[str] = []
+    successes: list[bool] = []
+
+    async def send_text_result(**kwargs: Any) -> PlatformSendResult:
+        calls.append(kwargs["content"])
+        return next(results)
+
+    monkeypatch.setattr(send_api, "send_text_result", send_text_result)
+    monkeypatch.setattr(send_api, "send_text", pytest.fail)
+    monkeypatch.setattr(
+        attention, "mark_reply_success", lambda *_: successes.append(True)
+    )
+    action = SimpleNamespace(
+        chat_stream=SimpleNamespace(stream_id="stream", platform="live")
+    )
+
+    await say_and_perform.SayAndPerformAction._send_texts(action, ["first", "second"])
+
+    assert calls == ["first", "second"]
+    assert successes == [True]
 
 
 @pytest.mark.asyncio
@@ -1470,6 +1605,197 @@ async def test_queued_speech_cancelled_before_start_does_not_open_provider(
         estimated_duration=1.0,
     )
     assert third[0] is True
+
+
+@pytest.mark.asyncio
+async def test_cancelled_queued_body_control_is_not_applied(
+    isolated_playback: list[asyncio.Task[Any]],
+) -> None:
+    """尚未取得播放轮次的 body 控制不会因排队或取消而提前应用。"""
+
+    from plugins.anima_chatter.speech.backend import TTSService
+    from plugins.anima_chatter.speech.streaming import play_streaming_segments
+    from plugins.anima_chatter.vts.animation.body import BodyControl
+    from plugins.anima_chatter.vts.performer import VTSPerformer
+
+    active_started = asyncio.Event()
+    release_active = asyncio.Event()
+    applied: list[BodyControl] = []
+
+    class Performer:
+        revision = 0
+
+        def reserve_body_control(self) -> int:
+            self.revision += 1
+            return self.revision
+
+        @contextlib.asynccontextmanager
+        async def speaking_session(self, **_kwargs: Any) -> AsyncGenerator[None]:
+            yield
+
+        async def apply_body_control(
+            self, control: BodyControl, *, revision: int | None = None
+        ) -> bool:
+            applied.append(control)
+            return True
+
+        async def start_speech_playback(self) -> None:
+            return None
+
+        async def switch_segment_intent(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    class HeldPlayer:
+        async def play_pcm_stream(
+            self, chunks: AsyncIterator[bytes], **kwargs: Any
+        ) -> int:
+            first = await anext(chunks)
+            await kwargs["on_started"]()
+            active_started.set()
+            await release_active.wait()
+            return len(first) // 2
+
+    provider = cast(
+        TTSService,
+        FakePCMProvider(lambda _: _stream_context(_single_chunk(b"\x01\x00" * 100))),
+    )
+    performer = cast(VTSPerformer, Performer())
+    player = cast(AudioPlayer, HeldPlayer())
+    active = await play_streaming_segments(
+        stream_id="body-cancel-active",
+        provider=provider,
+        segments=[SpeechSegment("活动")],
+        tts_params={},
+        performer=performer,
+        audio_player=player,
+        style=PerformanceStyle.create("neutral", "NARRATING"),
+        estimated_duration=1.0,
+    )
+    assert active[0] is True
+    await asyncio.wait_for(active_started.wait(), timeout=2)
+    control = BodyControl.model_validate({"left_eye": {"openness": 0.3}})
+    task_count = len(isolated_playback)
+    queued = await play_streaming_segments(
+        stream_id="body-cancel-queued",
+        provider=provider,
+        segments=[SpeechSegment("排队")],
+        tts_params={},
+        performer=performer,
+        audio_player=player,
+        style=PerformanceStyle.create("neutral", "NARRATING"),
+        estimated_duration=1.0,
+        body_control=control,
+    )
+    assert queued[0] is True
+    assert applied == []
+    queued_root = next(
+        task
+        for task in isolated_playback[task_count:]
+        if ".pcm_play." in task.get_name()
+    )
+    queued_root.cancel()
+    await asyncio.gather(queued_root, return_exceptions=True)
+    assert applied == []
+    release_active.set()
+    await _wait_playback_tasks(isolated_playback)
+
+
+@pytest.mark.asyncio
+async def test_queued_speech_body_control_does_not_overwrite_new_control(
+    isolated_playback: list[asyncio.Task[Any]],
+) -> None:
+    """排队语音起播时只应用未被独立控制更新的字段。"""
+    from plugins.anima_chatter.config import AnimaChatterConfig
+    from plugins.anima_chatter.speech.backend import TTSService
+    from plugins.anima_chatter.speech.streaming import play_streaming_segments
+    from plugins.anima_chatter.vts.animation.auto import AutoAnimator
+    from plugins.anima_chatter.vts.animation.body import BodyControl
+    from plugins.anima_chatter.vts.animation.speech import SpeechAnimator
+    from plugins.anima_chatter.vts.connection import VTSConnection
+    from plugins.anima_chatter.vts.performer import VTSPerformer
+
+    connection = VTSConnection()
+    animator = AutoAnimator()
+    connection.animators = [animator]
+    connection._ensure_worker_loop()
+    connection.is_connected = True
+    performer = VTSPerformer(
+        plugin_config=AnimaChatterConfig(), audio_player=cast(AudioPlayer, object())
+    )
+    performer.connection = connection
+    performer.auto_animator = animator
+    performer.speech_animator = SpeechAnimator()
+    performer._initialized = True
+
+    active_started = asyncio.Event()
+    release_active = asyncio.Event()
+    queued_started = asyncio.Event()
+    calls = 0
+
+    class HeldPlayer:
+        async def play_pcm_stream(
+            self, chunks: AsyncIterator[bytes], **kwargs: Any
+        ) -> int:
+            nonlocal calls
+            first = await anext(chunks)
+            await kwargs["on_started"]()
+            calls += 1
+            if calls == 1:
+                active_started.set()
+                await release_active.wait()
+            else:
+                queued_started.set()
+            return len(first) // 2
+
+    provider = cast(
+        TTSService,
+        FakePCMProvider(lambda _: _stream_context(_single_chunk(b"\x01\x00" * 100))),
+    )
+    try:
+        active = await play_streaming_segments(
+            stream_id="body-revision-active",
+            provider=provider,
+            segments=[SpeechSegment("活动")],
+            tts_params={},
+            performer=performer,
+            audio_player=cast(AudioPlayer, HeldPlayer()),
+            style=PerformanceStyle.create("neutral", "NARRATING"),
+            estimated_duration=1.0,
+        )
+        assert active[0] is True
+        await asyncio.wait_for(active_started.wait(), timeout=2)
+        queued = await play_streaming_segments(
+            stream_id="body-revision-queued",
+            provider=provider,
+            segments=[SpeechSegment("排队")],
+            tts_params={},
+            performer=performer,
+            audio_player=cast(AudioPlayer, HeldPlayer()),
+            style=PerformanceStyle.create("neutral", "NARRATING"),
+            estimated_duration=1.0,
+            body_control=BodyControl.model_validate(
+                {
+                    "breath": {"frequency_hz": 0.2},
+                    "right_eye": {"openness": 0.35},
+                }
+            ),
+        )
+        assert queued[0] is True
+        assert await performer.apply_body_control(
+            BodyControl.model_validate({"breath": {"frequency_hz": 0.5}})
+        )
+        assert animator.breathing.target_frequency == pytest.approx(0.5)
+
+        release_active.set()
+        await asyncio.wait_for(queued_started.wait(), timeout=2)
+        await _wait_playback_tasks(isolated_playback)
+        assert animator.breathing.target_frequency == pytest.approx(0.5)
+        assert animator.eyelids.right.mode == "manual"
+        assert animator.eyelids.right.motion.target == pytest.approx(0.35)
+    finally:
+        release_active.set()
+        await _wait_playback_tasks(isolated_playback)
+        await connection.close()
 
 
 @pytest.mark.asyncio

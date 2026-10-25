@@ -9,12 +9,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
 import soundfile as sf  # type: ignore[import-untyped]
 
+from plugins.anima_chatter.actions.sing_song import SingSongAction
 from plugins.anima_chatter.song_library import SongLibrary, format_duration
+
+from src.app.plugin_system.api import send_api
+from src.app.plugin_system.base import PlatformSendResult, PlatformSendStatus
 
 
 _SAMPLE_RATE = 8000
@@ -86,6 +92,35 @@ def test_scans_dual_track_folder(library: SongLibrary) -> None:
     assert info.path.name == "song_vocal.wav"
     assert info.inst_path is not None
     assert info.inst_path.name == "song_inst.wav"
+
+
+@pytest.mark.asyncio
+async def test_song_announcement_uses_detailed_send_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """唱歌开场白发送使用结构化回执。"""
+
+    calls: list[dict[str, Any]] = []
+
+    async def send_text_result(**kwargs: Any) -> PlatformSendResult:
+        calls.append(kwargs)
+        return PlatformSendResult(
+            status=PlatformSendStatus.UNKNOWN,
+            success=False,
+            error="timeout",
+        )
+
+    monkeypatch.setattr(send_api, "send_text_result", send_text_result)
+    monkeypatch.setattr(send_api, "send_text", pytest.fail)
+    action = SimpleNamespace(
+        chat_stream=SimpleNamespace(stream_id="stream", platform="live")
+    )
+
+    await SingSongAction._announce(action, "开场白", "歌曲")
+
+    assert calls == [
+        {"content": "开场白", "stream_id": "stream", "platform": "live"}
+    ]
 
 
 def test_folder_without_vocal_marker_falls_back(tmp_path: Path) -> None:

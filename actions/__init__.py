@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from .control_body import ControlBodyAction
 from .pass_and_wait import AnimaPassAndWaitAction
 from .say_and_perform import SayAndPerformAction
 from .sing_song import SingSongAction
 
 __all__ = [
     "AnimaPassAndWaitAction",
+    "ControlBodyAction",
     "SayAndPerformAction",
     "SingSongAction",
 ]

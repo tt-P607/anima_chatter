@@ -25,6 +25,7 @@ from ._internal_compat import (
 )
 from .actions import (
     AnimaPassAndWaitAction,
+    ControlBodyAction,
     SayAndPerformAction,
     SingSongAction,
 )
@@ -136,6 +137,7 @@ class AnimaChatterPlugin(BasePlugin):
         components: list[type] = [
             AnimaChatter,
             SayAndPerformAction,
+            ControlBodyAction,
             AnimaPassAndWaitAction,
             # NDFC 事件 seam 转发 handler：把 neo_default_chatter:* 事件转发到
             # AnimaChatter 的 adapter 方法（prompt / 注意力 / 工具 / 未读等）。

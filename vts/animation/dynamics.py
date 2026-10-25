@@ -73,4 +73,74 @@ class SecondOrderDynamics:
         return self.y
 
 
-__all__ = ["SecondOrderDynamics"]
+class EyelidMotion:
+    """在指定时长内到达眼睑开度，改令时继承当前位置和速度。"""
+
+    def __init__(self, value: float = 1.0) -> None:
+        """以静止开度初始化眼睑轨迹。"""
+        self.value = value
+        self.velocity = 0.0
+        self.target = value
+        self.duration = 0.0
+        self.elapsed = 0.0
+        self._start = value
+        self._start_velocity = 0.0
+        self._brake_duration = 0.0
+        self._brake_target = value
+
+    @property
+    def arrived(self) -> bool:
+        """轨迹是否已到达目标并停止。"""
+        return self.elapsed >= self.duration
+
+    def retarget(self, target: float, duration: float) -> None:
+        """从当前运动状态接续到新的绝对开度，不预先睁眼或重置速度。"""
+        self._start = self.value
+        self._start_velocity = self.velocity
+        self.target = target
+        self.duration = duration
+        self.elapsed = 0.0
+        self._brake_duration = 0.0
+        self._brake_target = self.value
+        control_point = self.value + self.velocity * duration / 3.0
+        if not 0.0 <= control_point <= 1.0:
+            margin = self.value if self.velocity < 0.0 else 1.0 - self.value
+            self._brake_duration = min(
+                duration * 0.5, 1.5 * margin / abs(self.velocity)
+            )
+            self._brake_target += self.velocity * self._brake_duration / 3.0
+
+    def update(self, delta_time: float) -> float:
+        """越界风险存在时先在边界内制动，再接续到目标，不硬截断轨迹。"""
+        if delta_time <= 0.0 or self.arrived:
+            return self.value
+        self.elapsed = min(self.duration, self.elapsed + delta_time)
+        if self.duration - self.elapsed <= 1e-9:
+            self.elapsed = self.duration
+            self.value, self.velocity = self.target, 0.0
+            return self.value
+        if self.elapsed < self._brake_duration:
+            progress = self.elapsed / self._brake_duration
+            self.value = self._start + self._start_velocity * self._brake_duration * (
+                progress - progress**2 + progress**3 / 3.0
+            )
+            self.velocity = self._start_velocity * (1.0 - progress) ** 2
+            return self.value
+        duration = self.duration - self._brake_duration
+        progress = (self.elapsed - self._brake_duration) / duration
+        start = self._brake_target if self._brake_duration else self._start
+        displacement = self.target - start
+        tangent = 0.0 if self._brake_duration else self._start_velocity * duration
+        self.value = (
+            start
+            + displacement * progress**2 * (3.0 - 2.0 * progress)
+            + tangent * progress * (1.0 - progress) ** 2
+        )
+        self.velocity = (
+            6.0 * displacement * progress * (1.0 - progress)
+            + tangent * (1.0 - progress) * (1.0 - 3.0 * progress)
+        ) / duration
+        return self.value
+
+
+__all__ = ["EyelidMotion", "SecondOrderDynamics"]

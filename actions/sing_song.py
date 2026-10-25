@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 from src.app.plugin_system.api import send_api
 from src.app.plugin_system.api.log_api import get_logger
-from src.app.plugin_system.base import BaseAction
+from src.app.plugin_system.base import BaseAction, PlatformSendStatus
 
 from .._internal_compat import get_anima_chatter_plugin
 from ..audio import read_duration_from_path
@@ -494,13 +494,16 @@ class SingSongAction(BaseAction):
         """
 
         text = announce.strip() or f"♪ 我来唱一首《{song_name}》"
-        sent = await send_api.send_text(
+        result = await send_api.send_text_result(
             content=text,
             stream_id=self.chat_stream.stream_id,
             platform=self.chat_stream.platform,
         )
+        sent, receipt = send_api.format_send_result(result, "唱歌开场白已发送")
         if not sent:
-            logger.warning(f"发送唱歌开场白失败: {text[:30]}")
+            logger.warning(f"唱歌开场白发送状态：{receipt}")
+        elif result.status is PlatformSendStatus.SENT and not result.success:
+            logger.warning(f"唱歌开场白本地处理状态：{receipt}")
 
 
 __all__ = [

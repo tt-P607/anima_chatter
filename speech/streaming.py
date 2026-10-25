@@ -28,6 +28,7 @@ from .synthesis import build_segment_markers
 if TYPE_CHECKING:
     from ..audio import AudioPlayer
     from ..vts import VTSPerformer
+    from ..vts.animation.body import BodyControl
     from .markers import SpeechSegment
 
 logger = get_logger("anima_chatter.speech.streaming")
@@ -66,10 +67,16 @@ async def play_streaming_segments(
     style: PerformanceStyle,
     estimated_duration: float,
     on_segment_started: Callable[[int], Awaitable[None]] | None = None,
+    body_control: BodyControl | None = None,
 ) -> tuple[bool, str]:
     """提前合成停顿分隔的片段，通过同一输出流连续播放。"""
 
     track_id = f"pcm_{uuid.uuid4().hex[:12]}"
+    body_revision = (
+        performer.reserve_body_control()
+        if performer is not None and body_control is not None
+        else None
+    )
     reserved = await pipeline_state.reserve(
         stream_id, estimated_duration, track_id=track_id
     )
@@ -187,6 +194,17 @@ async def play_streaming_segments(
                         f"elapsed={time.monotonic() - submitted_at:.3f}s"
                     )
                     if performer is not None:
+                        if body_control is not None:
+                            try:
+                                if not await performer.apply_body_control(
+                                    body_control, revision=body_revision
+                                ):
+                                    logger.error("PCM 起播时表演器拒绝应用 body 控制")
+                            except Exception as error:  # noqa: BLE001 - 不得中断已起播语音
+                                logger.error(
+                                    "PCM 起播时应用 body 控制失败："
+                                    f"{type(error).__name__}"
+                                )
                         await performer.start_speech_playback()
                         await performer.switch_segment_intent(
                             style.intent,
@@ -221,4 +239,7 @@ async def play_streaming_segments(
         cleanup=finalize,
     )
     logger.info(f"PCM 已接收：item={track_id}, segments={len(segments)}")
-    return True, f"已接收 {len(segments)} 段语音，按队列流式播放"
+    return True, (
+        f"已接收 {len(segments)} 段语音并排入播放队列；"
+        "当前仅确认入队，尚未确认起播或平台文字发送"
+    )

@@ -28,6 +28,7 @@ from src.app.plugin_system.api.log_api import get_logger
 
 from ..constants import normalize_intent, split_emotion
 from .animation import AutoAnimator, SpeechAnimator
+from .animation.body import BodyControl
 from .connection import VTSConnection, build_default_token_path
 
 if TYPE_CHECKING:
@@ -83,6 +84,7 @@ class VTSPerformer:
         self.speech_animator: SpeechAnimator | None = None
         self._initialized: bool = False
         self._perform_lock = asyncio.Lock()
+        self._body_control_revision = 0
 
         # 可选 hotkey_map：把 emotion 主类型或 intent 名字映射到 VTS Hotkey ID。
         # 例如 {"happy": "SmileHotkey", "THINKING": "ThinkHotkey"}。
@@ -326,6 +328,21 @@ class VTSPerformer:
                 logger.debug(f"段间切换表情失败（忽略）: {exc}")
 
     # ── 主接口 ────────────────────────────────────────
+
+    def reserve_body_control(self) -> int:
+        """为按主事件循环顺序提交的身体控制分配版本号。"""
+        self._body_control_revision += 1
+        return self._body_control_revision
+
+    async def apply_body_control(
+        self, control: BodyControl, *, revision: int | None = None
+    ) -> bool:
+        """立即提交独立身体控制，不等语音队列，语音收尾也不释放它。"""
+        if not self.is_ready or self.connection is None:
+            return False
+        if revision is None:
+            revision = self.reserve_body_control()
+        return await self.connection.apply_body_control(control, revision=revision)
 
     @asynccontextmanager
     async def speaking_session(

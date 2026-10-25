@@ -14,7 +14,7 @@
     "log_api": "1.0.0",
     "plugin_api": "1.0.0",
     "prompt_api": "1.0.0",
-    "send_api": "1.0.0",
+    "send_api": "1.3.0",
     "service_api": "1.0.0",
     "stream_api": "2.0.0"
   },
@@ -47,6 +47,11 @@
     {
       "component_type": "action",
       "component_name": "say_and_perform",
+      "dependencies": []
+    },
+    {
+      "component_type": "action",
+      "component_name": "control_body",
       "dependencies": []
     },
     {

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from plugins.anima_chatter.actions import SingSongAction
+from plugins.anima_chatter.actions import ControlBodyAction, SingSongAction
 from plugins.anima_chatter.chatter.attention import (
     compute_bypass_probability,
     mark_reply_success,
@@ -62,9 +62,118 @@ def test_live_plugin_registers_only_live_components() -> None:
     components = AnimaChatterPlugin(AnimaChatterConfig()).get_components()
     names = {component.name for component in components}
 
-    assert {"anima_chatter", "say_and_perform", "sing_song", "pass_and_wait"} <= names
+    assert {
+        "anima_chatter",
+        "say_and_perform",
+        "control_body",
+        "sing_song",
+        "pass_and_wait",
+    } <= names
     assert not {"say", "start_voice_call", "end_voice_call", "vtb", "voice"} & names
     assert cast(Any, AnimaChatterPlugin).dependent_components == []
+
+
+async def test_control_body_is_visible_through_chatter_tool_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """身体控制 Action 经 chatter 生产过滤路径进入真实 ToolRegistry。"""
+
+    from plugins.anima_chatter.chatter.core import AnimaChatter
+    from src.app.plugin_system.api import action_api, agent_api, tool_api
+    from src.core import managers
+    from src.kernel.llm.payload.tooling import ToolRegistry
+
+    chatter = AnimaChatter(
+        "body-tool-registry", AnimaChatterPlugin(AnimaChatterConfig())
+    )
+    monkeypatch.setattr(AnimaChatter, "_usables_cache", None)
+    monkeypatch.setattr(
+        chatter, "get_llm_usables", AsyncMock(return_value=[ControlBodyAction])
+    )
+
+    async def filter_actions(actions: list[type], **kwargs: Any) -> list[type]:
+        """隔离动作公共 API，同时校验 chatter 上下文。"""
+
+        assert actions == [ControlBodyAction]
+        assert kwargs["chatter_name"] == "anima_chatter"
+        return actions
+
+    async def filter_empty(components: list[type], **kwargs: Any) -> list[type]:
+        """隔离没有候选项的 Agent 与 Tool API。"""
+
+        assert components == []
+        return []
+
+    stream_manager = SimpleNamespace(
+        get_or_create_stream=AsyncMock(return_value=SimpleNamespace(chat_type="all"))
+    )
+    monkeypatch.setattr(managers, "get_stream_manager", lambda: stream_manager)
+    monkeypatch.setattr(action_api, "filter_actions", filter_actions)
+    monkeypatch.setattr(agent_api, "filter_agents", filter_empty)
+    monkeypatch.setattr(tool_api, "filter_tools", filter_empty)
+    payloads: list[Any] = []
+    request = SimpleNamespace(add_payload=payloads.append)
+
+    registry = await chatter.inject_usables(request)
+
+    assert isinstance(registry, ToolRegistry)
+    stream_manager.get_or_create_stream.assert_awaited_once_with(
+        stream_id="body-tool-registry"
+    )
+    tool_name = ControlBodyAction.to_schema()["function"]["name"]
+    assert tool_name.endswith("control_body")
+    assert registry.get(tool_name) is ControlBodyAction
+    assert registry.get_all_names() == [tool_name]
+    assert "body" in registry.list_all()[0]["function"]["parameters"]["properties"]
+    assert len(payloads) == 1
+
+
+def test_body_action_schema_keeps_definitions_at_parameters_root() -> None:
+    """ControlBodyAction 的嵌套引用可从 parameters 根解析。"""
+
+    parameters = ControlBodyAction.to_schema()["function"]["parameters"]
+    assert "body" in parameters["properties"]
+    assert parameters["required"] == ["body"]
+    definitions = parameters["$defs"]
+    references: list[str] = []
+
+    def collect_references(value: Any) -> None:
+        """收集参数 schema 中的 JSON Schema 引用。"""
+
+        if isinstance(value, dict):
+            reference = value.get("$ref")
+            if reference is not None:
+                references.append(reference)
+            for child in value.values():
+                collect_references(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect_references(child)
+
+    collect_references(parameters)
+    assert references
+    assert all(
+        reference.startswith("#/$defs/")
+        and reference.removeprefix("#/$defs/").split("/")[0] in definitions
+        for reference in references
+    )
+
+
+async def test_control_body_rejects_unready_performer() -> None:
+    """VTS 未连接时身体控制返回明确失败且不调用 performer。"""
+
+    performer = SimpleNamespace(is_ready=False, apply_body_control=AsyncMock())
+    plugin = AnimaChatterPlugin(AnimaChatterConfig())
+    plugin.vts_performer = performer
+    action: Any = SimpleNamespace(plugin=plugin)
+
+    success, message = await ControlBodyAction.execute(
+        action, body={"left_eye": {"openness": 0.5}}
+    )
+
+    assert success is False
+    assert "未就绪" in message
+    performer.apply_body_control.assert_not_awaited()
 
 
 def test_live_scene_exports_have_no_removed_mode_templates() -> None:

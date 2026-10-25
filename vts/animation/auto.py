@@ -1,17 +1,7 @@
-"""生命感自动化动画器：自动眨眼/呼吸/眼神漫游/宏观动作。
+"""生命感自动动画：独立眼睑、连续相位呼吸、眼神漫游和身体跟随。
 
-完整移植自旧版 ``soul_chatter_plugin`` 的 ``blink_animator.AutoAnimator``，
-仅做以下调整：
-
-- ``logger`` 改为 ``src.kernel.logger.get_logger("anima_chatter.vts.auto_animator")``。
-- 移除 ``from src.common.logger import get_logger`` 的旧导入路径。
-
-行为完全保持不变：
-- Ease-in-out 曲线眨眼 + 随机间隔。
-- 模拟生物呼吸（headZ）。
-- 眼神微颤 / 慢速漫游 / 随机扫视。
-- 被动慢速摆动 + 宏观动作库（重心斜、扫视、好奇歪头、深呼吸等）。
-- 安全平滑层（阻尼追赶 + 速率限制）防止瞬移。
+头部微动、被动摆动与宏观动作通过安全平滑层输出；呼吸和眼睑独立于
+说话状态持续推进，身体控制补丁只改变明确指定的目标与节奏。
 """
 
 from __future__ import annotations
@@ -25,6 +15,7 @@ from src.app.plugin_system.api.log_api import get_logger
 
 from ...config import IdleAnimationSection
 from .base import BaseAnimator
+from .body import BodyControl, Breathing, Eyelids
 from .dynamics import SecondOrderDynamics
 from .noise import fbm
 
@@ -55,29 +46,10 @@ class AutoAnimator(BaseAnimator):
 
         cfg = idle_animation_config or IdleAnimationSection()
 
-        # ── 眨眼状态 ────────────────────────────────────
-        self.blink_state: int = 0  # 0 睁, 1 闭中, 2 闭停, 3 开中
-        self.blink_timer: float = 0.0
-        # 眨眼间隔（秒）。真人平均 4 秒一次，但 VTB 看起来活泼一点更好。
-        self._blink_min_interval = cfg.blink_min_interval
-        self._blink_max_interval = cfg.blink_max_interval
-        self.next_blink_time: float = random.uniform(
-            self._blink_min_interval, self._blink_max_interval
-        )
-
-        self.base_close_duration: float = 0.12
-        self.base_stay_duration: float = 0.05
-        self.base_open_duration: float = 0.35
-
-        self.current_close_duration: float = self.base_close_duration
-        self.current_stay_duration: float = self.base_stay_duration
-        self.current_open_duration: float = self.base_open_duration
-
-        self.current_eye_open: float = 1.0
-
-        # ── 呼吸 ──────────────────────────────────────
+        self.eyelids = Eyelids(cfg.blink_min_interval, cfg.blink_max_interval)
         self.breath_freq = cfg.breath_freq
         self.breath_amplitude = cfg.breath_amplitude
+        self.breathing = Breathing(self.breath_freq)
 
         # ── 眼神漫游 ──────────────────────────────────
         self.eye_x: float = 0.0
@@ -391,67 +363,31 @@ class AutoAnimator(BaseAnimator):
     # ── 主循环 ───────────────────────────────────────
 
     async def update(self, delta_time: float) -> dict[str, float]:
-        """每帧产出全套自动化参数（含眨眼、呼吸、眼神、宏观动作）。"""
+        """完整消耗实际帧时间，以小步推进眨眼、呼吸和身体动力学。"""
 
         if not self.is_active:
             return {self.param_eye_l: 1.0, self.param_eye_r: 1.0}
 
-        logic_delta = min(0.06, delta_time)
+        remaining = max(0.0, delta_time)
+        if remaining <= 0.06:
+            return self._update_step(remaining)
+        output: dict[str, float] = {}
+        while remaining > 1e-9:
+            step = min(0.01, remaining)
+            remaining -= step
+            output = self._update_step(step)
+        return output
+
+    def _update_step(self, logic_delta: float) -> dict[str, float]:
+        """在稳定积分步长内计算自动动作和相互独立的控制输出。"""
         elapsed = time.time() - self.start_time
         output: dict[str, float] = {}
 
-        # 1) 眨眼
-        self.blink_timer += logic_delta
-        if self.blink_state == 0:
-            self.current_eye_open = 1.0
-            if self.blink_timer >= self.next_blink_time:
-                self.blink_state = 1
-                self.blink_timer = 0
-                self.current_close_duration = self.base_close_duration
-                self.current_stay_duration = self.base_stay_duration
-                self.current_open_duration = self.base_open_duration
-        elif self.blink_state == 1:
-            t = min(1.0, self.blink_timer / self.current_close_duration)
-            self.current_eye_open = 1.0 - self._ease_in_out(t)
-            if t >= 1.0:
-                self.blink_state = 2
-                self.blink_timer = 0
-        elif self.blink_state == 2:
-            self.current_eye_open = 0.0
-            if self.macro_state == "RETURNING":
-                self.eye_x = 0.0
-                self.eye_y = 0.0
-            if self.blink_timer >= self.current_stay_duration:
-                self.blink_state = 3
-                self.blink_timer = 0
-        elif self.blink_state == 3:
-            t = min(1.0, self.blink_timer / self.current_open_duration)
-            self.current_eye_open = self._ease_in_out(t)
-            if t >= 1.0:
-                self.current_eye_open = 1.0
-                self.blink_state = 0
-                self.blink_timer = 0
-                # 10% 概率短间隔双连眨（人类常有的"再眨一下"），其余按主区间。
-                if random.random() < 0.10:
-                    self.next_blink_time = random.uniform(0.4, 0.6)
-                else:
-                    self.next_blink_time = random.uniform(
-                        self._blink_min_interval, self._blink_max_interval
-                    )
-
-        macro_eye_l = self.macro_current_params.get("v_eye_l", 0.0)
-        macro_eye_r = self.macro_current_params.get("v_eye_r", 0.0)
-        output[self.param_eye_l] = max(
-            0.0, min(1.0, self.current_eye_open + macro_eye_l)
+        output[self.param_eye_l], output[self.param_eye_r] = self.eyelids.update(
+            logic_delta
         )
-        output[self.param_eye_r] = max(
-            0.0, min(1.0, self.current_eye_open + macro_eye_r)
-        )
-
-        # 2) 呼吸
-        breath_z = (
-            math.sin(elapsed * self.breath_freq * 2 * math.pi) * self.breath_amplitude
-        )
+        self.breathing.update(logic_delta)
+        breath_z = self.breathing.sample() * self.breath_amplitude
 
         # 3) 眼神漫游
         micro_jitter_x = math.sin(elapsed * math.pi * 6) * 0.01
@@ -541,10 +477,7 @@ class AutoAnimator(BaseAnimator):
             )
 
         # 呼吸带动身体上下起伏：与头部呼吸 breath_z 同相，注入 v_body_y。
-        breath_body_y = (
-            math.sin(elapsed * self.breath_freq * 2 * math.pi)
-            * self._breath_body_amplitude
-        )
+        breath_body_y = self.breathing.sample() * self._breath_body_amplitude
 
         # 7) 状态过渡：is_performing 时让自动化淡出
         target_fade = 0.0 if self.is_performing else 1.0
@@ -592,9 +525,7 @@ class AutoAnimator(BaseAnimator):
         breath_shoulder_z = 0.0
         if self._breath_shoulder_enabled and self._breath_shoulder_amplitude > 0.0:
             breath_shoulder_z = (
-                math.sin(
-                    elapsed * self.breath_freq * 2 * math.pi - self._breath_shoulder_lag
-                )
+                self.breathing.sample(self._breath_shoulder_lag)
                 * self._breath_shoulder_amplitude
             )
 
@@ -656,8 +587,7 @@ class AutoAnimator(BaseAnimator):
             "v_head_y", 0.0
         )
         raw_output[self.param_head_z] = (
-            breath_z
-            + self.macro_current_params.get("v_head_z", 0.0)
+            self.macro_current_params.get("v_head_z", 0.0)
             + head_osc_z
             + self.passive_sway_val
         )
@@ -667,7 +597,7 @@ class AutoAnimator(BaseAnimator):
             + body_idle_x
         )
         raw_output["v_body_y"] = (
-            self.macro_current_params.get("v_body_y", 0.0) + breath_body_y + body_idle_y
+            self.macro_current_params.get("v_body_y", 0.0) + body_idle_y
         )
         raw_output["v_body_z"] = (
             body_sway_z
@@ -675,7 +605,6 @@ class AutoAnimator(BaseAnimator):
             + head_osc_z
             + (self.passive_sway_val * 0.4)
             + body_coupling_z
-            + breath_shoulder_z
             + body_idle_z
         )
         raw_output["v_blush"] = self.macro_current_params.get("v_blush", 0.0)
@@ -712,6 +641,9 @@ class AutoAnimator(BaseAnimator):
             self.final_smooth_params[key] = smoothed_val
             output[key] = smoothed_val
 
+        output[self.param_head_z] += breath_z
+        output["v_body_y"] += breath_body_y
+        output["v_body_z"] += breath_shoulder_z
         return output
 
     # ── 外部接口 ──────────────────────────────────────
@@ -722,25 +654,14 @@ class AutoAnimator(BaseAnimator):
         self.is_performing = performing
 
     def force_blink(self, custom_durations: dict[str, float] | None = None) -> None:
-        """立即触发一次眨眼，可选自定义时长。"""
+        """触发自动控制下的眼睑眨眼，不打断现有运动或积压补眨。"""
+        self.eyelids.blink(custom_durations)
 
-        if self.blink_state == 0:
-            self.blink_state = 1
-            self.blink_timer = 0.0
-            if custom_durations:
-                self.current_close_duration = custom_durations.get(
-                    "close", self.base_close_duration
-                )
-                self.current_stay_duration = custom_durations.get(
-                    "stay", self.base_stay_duration
-                )
-                self.current_open_duration = custom_durations.get(
-                    "open", self.base_open_duration
-                )
-            else:
-                self.current_close_duration = self.base_close_duration
-                self.current_stay_duration = self.base_stay_duration
-                self.current_open_duration = self.base_open_duration
+    def apply_body_control(self, control: BodyControl) -> None:
+        """在动画工作线程接收部分控制，不更改未指定的通道。"""
+        if control.breath is not None:
+            self.breathing.apply(control.breath)
+        self.eyelids.apply(control)
 
     def _maybe_pick_chain_action(self) -> str | None:
         """根据 _current_chain_to 表抽签决定下一个衔接动作。

@@ -5,9 +5,11 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from typing import Annotated, Any, ClassVar
 
+from pydantic import ValidationError
+
 from src.app.plugin_system.api import send_api
 from src.app.plugin_system.api.log_api import get_logger
-from src.app.plugin_system.base import BaseAction
+from src.app.plugin_system.base import BaseAction, PlatformSendStatus
 
 from ..prompts.scenes import EMOTION_SCHEMA_DESC, INTENT_SCHEMA_DESC
 from ..protocol import require_plugin
@@ -20,6 +22,7 @@ from ..speech import (
 from ..speech.backend import get_tts_service
 from ..speech.markers import parse_pause_segments
 from ..speech.streaming import play_streaming_segments
+from ..vts.animation.body import BodyControl, inject_body_schema
 from ._tts_schema import inject_tts_params
 
 logger = get_logger("anima_chatter.action.say_and_perform")
@@ -66,7 +69,7 @@ class SayAndPerformAction(BaseAction):
             注入 TTS 参数后的 action schema。
         """
 
-        return inject_tts_params(super().to_schema())
+        return inject_body_schema(inject_tts_params(super().to_schema()))
 
     async def go_activate(self) -> bool:
         """只向直播流开放虚拟形象说话动作。"""
@@ -78,6 +81,7 @@ class SayAndPerformAction(BaseAction):
         content: Annotated[list[str], _CONTENT_DESC],
         emotion: Annotated[str, EMOTION_SCHEMA_DESC] = "neutral:1",
         intent: Annotated[str, INTENT_SCHEMA_DESC] = "NARRATING",
+        body: dict[str, Any] | None = None,
         **tts_params: Any,
     ) -> AsyncGenerator[tuple[bool, str] | None, None]:
         """提交流式说话项，实际起播时同步文本与虚拟形象。
@@ -89,6 +93,7 @@ class SayAndPerformAction(BaseAction):
             content: 要说的内容列表。
             emotion: ``"类型:强度"`` 格式的情绪标记。
             intent: 顶层动作意图。
+            body: 可选的身体控制命令，在语音实际起播时应用。
             **tts_params: TTS 参数，由 Provider capabilities 定义。
 
         Yields:
@@ -104,6 +109,14 @@ class SayAndPerformAction(BaseAction):
             yield False, "content 不能为空"
             return
 
+        body_control: BodyControl | None = None
+        if body is not None:
+            try:
+                body_control = BodyControl.model_validate(body)
+            except ValidationError as error:
+                yield False, f"body 参数无效：{error.errors()[0]['msg']}"
+                return
+
         plugin = require_plugin(self.plugin)
         config = plugin.config
         if config is None:
@@ -118,6 +131,11 @@ class SayAndPerformAction(BaseAction):
             return
 
         performer = plugin.get_active_performer()
+        if body_control is not None and (
+            performer is None or not performer.is_ready
+        ):
+            yield False, "VTube Studio 表演器未就绪，无法应用 body 控制"
+            return
         audio_player = plugin.audio_player
         if audio_player is None:
             logger.warning("音频播放器未初始化，无法提交语音")
@@ -153,6 +171,7 @@ class SayAndPerformAction(BaseAction):
             style=style,
             estimated_duration=estimated,
             on_segment_started=on_segment_started,
+            body_control=body_control,
         )
 
     @staticmethod
@@ -180,14 +199,19 @@ class SayAndPerformAction(BaseAction):
             clean = strip_markers(raw)
             if not clean:
                 continue
-            sent = await send_api.send_text(
+            send_result = await send_api.send_text_result(
                 content=clean,
                 stream_id=self.chat_stream.stream_id,
                 platform=self.chat_stream.platform,
             )
+            sent, receipt = send_api.format_send_result(
+                send_result, "起播文本已发送"
+            )
             any_sent = any_sent or sent
             if not sent:
-                logger.warning("实际起播片段的文本发送失败")
+                logger.warning(f"实际起播文本发送状态：{receipt}")
+            elif send_result.status is PlatformSendStatus.SENT and not send_result.success:
+                logger.warning(f"实际起播文本本地处理状态：{receipt}")
 
         # 局部导入避免循环依赖（chatter 包会引用本模块所在的 actions 包）。
         from ..chatter.attention import mark_reply_success

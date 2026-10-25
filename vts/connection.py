@@ -24,6 +24,9 @@ from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.log_api import get_logger
 
+from .animation.auto import AutoAnimator
+from .animation.body import BodyControl
+
 if TYPE_CHECKING:
     from .animation.base import BaseAnimator
 
@@ -136,6 +139,7 @@ class VTSConnection:
         self._request_lock = asyncio.Lock()
         self._buffer_lock = asyncio.Lock()
         self._param_buffer: dict[str, float] = {}
+        self._body_control_revisions: dict[tuple[str, str], int] = {}
 
         # 独立事件循环线程的句柄与状态。
         self._worker_thread: threading.Thread | None = None
@@ -482,26 +486,14 @@ class VTSConnection:
             try:
                 if not self.is_connected or self.vts is None:
                     await asyncio.sleep(2)
+                    last_time = asyncio.get_event_loop().time()
                     continue
 
                 now = asyncio.get_event_loop().time()
-                delta = min(0.1, now - last_time)
+                delta = max(0.0, now - last_time)
                 last_time = now
 
-                aggregated: dict[str, float] = {}
-                for animator in self.animators:
-                    try:
-                        if not animator.is_active:
-                            continue
-                        params = await animator.update(delta)
-                        if not params:
-                            continue
-                        for key, value in params.items():
-                            aggregated[key] = aggregated.get(key, 0.0) + value
-                    except Exception as exc:  # noqa: BLE001
-                        logger.error(
-                            f"animator {animator.__class__.__name__} update 出错: {exc}"
-                        )
+                aggregated = await self._animate_frame(delta)
 
                 if aggregated:
                     async with self._buffer_lock:
@@ -514,6 +506,26 @@ class VTSConnection:
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"VTS 动画循环异常: {exc}")
                 await asyncio.sleep(1)
+
+    async def _animate_frame(self, delta: float) -> dict[str, float]:
+        """叠加姿态偏移；眼睑绝对开度只由自动动画器提供。"""
+        aggregated: dict[str, float] = {}
+        for animator in self.animators:
+            if not animator.is_active:
+                continue
+            try:
+                params = await animator.update(delta)
+                for key, value in params.items():
+                    if key in {"v_eye_left", "v_eye_right"}:
+                        if isinstance(animator, AutoAnimator):
+                            aggregated[key] = value
+                    else:
+                        aggregated[key] = aggregated.get(key, 0.0) + value
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    f"animator {animator.__class__.__name__} update 出错: {exc}"
+                )
+        return aggregated
 
     # ── 参数发送循环（消费 buffer） ──────────────────
 
@@ -572,6 +584,84 @@ class VTSConnection:
                 await asyncio.sleep(0.5)
 
     # ── 直接控制接口 ─────────────────────────────────
+
+    async def apply_body_control(
+        self, control: BodyControl, *, revision: int | None = None
+    ) -> bool:
+        """将控制提交到既有 VTS 工作线程，不占用音频锁或等待动作结束。"""
+        if (
+            not self.is_connected
+            or self._worker_loop is None
+            or self._worker_loop.is_closed()
+        ):
+            return False
+        return bool(
+            await asyncio.wrap_future(
+                self._submit(self._apply_body_in_worker(control, revision))
+            )
+        )
+
+    async def _apply_body_in_worker(
+        self, control: BodyControl, revision: int | None
+    ) -> bool:
+        """在逐帧状态所属的工作循环应用本次指定字段。"""
+        if not self.is_connected:
+            return False
+        if revision is not None:
+            patch = control.model_dump(exclude_unset=True)
+            accepted_fields: dict[tuple[str, str], int] = {}
+            for section, values in tuple(patch.items()):
+                if not isinstance(values, dict):
+                    continue
+                newer_eye_target = (
+                    section in {"left_eye", "right_eye"}
+                    and self._body_control_revisions.get((section, "target"), 0)
+                    > revision
+                )
+                for field in tuple(values):
+                    if newer_eye_target and field in {"hold_seconds", "transition_seconds"}:
+                        del values[field]
+                        continue
+                    if values[field] is None and not (
+                        section in {"left_eye", "right_eye"} and field == "hold_seconds"
+                    ):
+                        del values[field]
+                        continue
+                    key = (
+                        section,
+                        "target"
+                        if section in {"left_eye", "right_eye"}
+                        and field in {"openness", "release"}
+                        else field,
+                    )
+                    if self._body_control_revisions.get(key, 0) > revision:
+                        del values[field]
+                    else:
+                        accepted_fields[key] = revision
+                if not values:
+                    del patch[section]
+        for animator in self.animators:
+            if isinstance(animator, AutoAnimator) and animator.is_active:
+                if revision is not None:
+                    filtered_control = BodyControl.model_construct(
+                        _fields_set=set(patch),
+                        **{
+                            section: (
+                                type(getattr(control, section)).model_construct(
+                                    _fields_set=set(values), **values
+                                )
+                                if isinstance(values, dict)
+                                else values
+                            )
+                            for section, values in patch.items()
+                        },
+                    )
+                    animator.apply_body_control(filtered_control)
+                    self._body_control_revisions.update(accepted_fields)
+                else:
+                    animator.apply_body_control(control)
+                return True
+        return False
 
     async def trigger_hotkey(self, hotkey_id: str) -> bool:
         """触发 VTube Studio 中已配置的热键（动作/表情按钮）。

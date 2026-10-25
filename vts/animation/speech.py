@@ -322,11 +322,13 @@ class SpeechAnimator(BaseAnimator):
             "v_head_z": 80.0,
             "v_mouth_form": 10.0,
         }
+        smoothing_delta = max(0.0, delta_time)
+        lerp_weight = -math.expm1(-current_lerp * smoothing_delta)
         for key, target in self.target_params.items():
             prev_val = self.current_params[key]
-            step = (target - prev_val) * current_lerp * delta_time
+            step = (target - prev_val) * lerp_weight
             max_speed = max_speeds.get(key, 100.0)
-            max_step = max_speed * delta_time
+            max_step = max_speed * smoothing_delta
             if abs(step) > max_step:
                 step = max_step if step > 0 else -max_step
             self.current_params[key] += step
