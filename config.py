@@ -6,12 +6,13 @@
 
 本配置仅用于直播模式 ``vtb_live``。
 
-配置区段（共 6 个）：
+配置区段：
 
 ============================ ===================================================
 section                       适用模式 / 用途
 ============================ ===================================================
 ``[plugin]``                  通用 chatter 行为（tick / buffer / 重试 / 挂起开关）
+``[tts]``                     直播使用的语音引擎
 ``[vts]``                     VTube Studio 连接 + 本地音频输出 + Hotkey 映射
                               （直播表演）
 ``[vtb_attention]``           直播弹幕"是否回复"过滤器
@@ -27,7 +28,7 @@ import os
 import tempfile
 import tomllib
 from pathlib import Path
-from typing import ClassVar, Self
+from typing import ClassVar, Literal, Self
 
 from src.app.plugin_system.base import BaseConfig, Field, SectionBase, config_section
 
@@ -39,9 +40,23 @@ __all__ = [
     "IdleAnimationSection",
     "PipeliningSection",
     "PluginSection",
+    "TTSEngine",
+    "TTSSection",
     "VTBAttentionSection",
     "VTSSection",
 ]
+
+TTSEngine = Literal["gsv", "breeze"]
+
+
+@config_section("tts", title="直播语音引擎")
+class TTSSection(SectionBase):
+    """选择共享的 TTS 服务与语音规则。"""
+
+    engine: TTSEngine = Field(
+        default="gsv",
+        description="直播语音引擎：gsv 或 breeze；模型、参考音色和服务地址由对应插件配置",
+    )
 
 
 @config_section("plugin", title="插件设置", tag="plugin")
@@ -437,6 +452,7 @@ class AnimaChatterConfig(BaseConfig):
     description: ClassVar[str] = "anima_chatter 直播、VTube Studio 与歌曲排播配置"
 
     plugin: PluginSection = Field(default_factory=PluginSection)
+    tts: TTSSection = Field(default_factory=TTSSection)
     vts: VTSSection = Field(default_factory=VTSSection)
     vtb_attention: VTBAttentionSection = Field(default_factory=VTBAttentionSection)
     audio_drive: AudioDriveSection = Field(default_factory=AudioDriveSection)

@@ -1,6 +1,6 @@
 # 配置参考
 
-`anima_chatter` 用 6 个 section 表达直播配置。所有字段均有默认值，第一次跑
+`anima_chatter` 用 7 个 section 表达直播配置。所有字段均有默认值，第一次跑
 只需要按 [README 快速上手](../README.md) 那段填几项关键字段，剩下的等需要时再调。
 
 配置文件路径：``config/plugins/anima_chatter/config.toml``
@@ -10,6 +10,7 @@
 | Section | 适用模式 | 用途 |
 |---------|------|------|
 | [`[plugin]`](#plugin) | 直播 | Chatter、模型与提示词 |
+| [`[tts]`](#tts) | 直播 | 选择 GSV 或 Breeze 服务与语音规则 |
 | [`[vts]`](#vts) | 直播 | VTube Studio 长连 + 本地音频 + Hotkey 映射 |
 | [`[vtb_attention]`](#vtb_attention) | 直播 | 注意力门 |
 | [`[audio_drive]`](#audio_drive) | 直播 | 音频驱动头部 / 身体律动 |
@@ -43,7 +44,17 @@
 
 ---
 
-TTS 参数与动态 Action schema 由 `tts_voice_plugin-neo:service:speech` 提供。直播只调用该共享服务的 PCM 流接口，不配置 endpoint、provider、重试或 HTTP 超时；这些字段不属于本插件配置。
+## `[tts]`
+
+| 字段 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `engine` | `"gsv"` 或 `"breeze"` | `"gsv"` | 选择本次直播使用的 TTS 服务和公共语音模板 |
+
+GSV 使用 `tts_voice_plugin-neo:service:speech` 和 `tts_voice_plugin-neo.speech_rules`；Breeze 使用 `breeze_tts_plugin:service:speech` 和 `breeze_tts_plugin.speech_rules`。其他名称和路径不被接受，所选服务缺失时不会自动换引擎。
+
+动态 Action schema 从所选服务重新读取能力。选择 GSV 时展示其风格、语言、启用的语速等参数；选择 Breeze 时展示 `model_id`、`instruction`，开启 `plugin.llm_audio_effects` 后再展示允许的流式 `audio_effects`。GSV 的完整音频音效不会误展示为直播 PCM 参数。
+
+公共语音规则通过 Prompt API 构建；TTS 配置中的自定义说明由对应插件写入模板。直播不复制服务地址、参考音频、HTTP 超时或推理设置；这些仍由提供方管理。修改 TTS 配置后重载对应插件，下一次提示词构建会读取更新的模板和能力。
 
 GPT-SoVITS V5 的流式参数在 TTS 提供方配置中设置，不在直播插件复制音色、参考音频或推理配置：
 

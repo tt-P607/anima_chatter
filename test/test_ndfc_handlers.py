@@ -30,12 +30,14 @@ from plugins.anima_chatter.chatter.ndfc_handlers import (
     _get_anima_chatter,
 )
 from plugins.anima_chatter.prompts import (
-    SPEECH_RULES_TEMPLATE_NAME,
     SYSTEM_PROMPT,
     AnimaChatterPromptBuilder,
 )
 from plugins.anima_chatter.prompts import builder as prompt_builder
 from plugins.anima_chatter.runtime import pipeline_state
+from plugins.anima_chatter.config import AnimaChatterConfig, TTSEngine
+from plugins.anima_chatter.plugin import AnimaChatterPlugin
+from plugins.anima_chatter.speech.backend import get_speech_rules_template_name
 from src.app.plugin_system.api import prompt_api
 from src.app.plugin_system.types import PromptTemplate
 from src.core import prompt as core_prompt
@@ -92,39 +94,65 @@ def _message(text: str = "hi") -> SimpleNamespace:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["gsv", "breeze"])
 async def test_live_system_prompt_reuses_shared_template_and_preserves_protocol(
+    engine: TTSEngine,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """直播按公共名称渲染规则，每轮读取更新且不混入原 TTS 动作协议。"""
 
     monkeypatch.setattr(core_prompt.get_prompt_manager(), "_templates", {})
-    monkeypatch.setattr(prompt_builder, "get_personality", lambda: SimpleNamespace(nickname="actor"))
-    monkeypatch.setattr(prompt_builder, "_detect_active_live_sources", lambda: frozenset())
-    template = PromptTemplate(name="anima_chatter_system_prompt", template=SYSTEM_PROMPT)
+    monkeypatch.setattr(
+        prompt_builder, "get_personality", lambda: SimpleNamespace(nickname="actor")
+    )
+    monkeypatch.setattr(
+        prompt_builder, "_detect_active_live_sources", lambda: frozenset()
+    )
+    template = PromptTemplate(
+        name="anima_chatter_system_prompt", template=SYSTEM_PROMPT
+    )
     for key in (
-        "alias_names", "personality_core", "personality_side", "identity", "reply_style",
-        "background_story", "safety_guidelines",
+        "alias_names",
+        "personality_core",
+        "personality_side",
+        "identity",
+        "reply_style",
+        "background_story",
+        "safety_guidelines",
     ):
         template.set(key, "")
     prompt_api.register_template(template)
+    config = AnimaChatterConfig()
+    config.tts.engine = engine
+    speech_template_name = get_speech_rules_template_name(engine)
     stream = SimpleNamespace(stream_id="live-stream")
     for word in ("shared speech guidance", "updated speech guidance"):
-        prompt_api.register_template(PromptTemplate(
-            name=SPEECH_RULES_TEMPLATE_NAME,
-            template="<speech_rules>{word}</speech_rules>",
-        ).set("word", word))
-        rendered = await AnimaChatterPromptBuilder.build_system_prompt(None, stream)
+        prompt_api.register_template(
+            PromptTemplate(
+                name=speech_template_name,
+                template="<speech_rules>{word}</speech_rules>",
+            ).set("word", word)
+        )
+        rendered = await AnimaChatterPromptBuilder.build_system_prompt(config, stream)
         assert rendered.count("<speech_rules>") == 1
         assert word in rendered
         assert "say_and_perform action" in rendered
         assert "[wait:0.5]" in rendered
-        assert not any(name in rendered for name in (
-            "tts_segments", "merge_voice", "voice_style", "# 标点规范", "# 多语言准则",
-        ))
-    assert AnimaChatter.speech_rules_template_name == SPEECH_RULES_TEMPLATE_NAME
-    prompt_api.unregister_template(SPEECH_RULES_TEMPLATE_NAME)
+        assert not any(
+            name in rendered
+            for name in (
+                "tts_segments",
+                "merge_voice",
+                "voice_style",
+                "# 标点规范",
+                "# 多语言准则",
+            )
+        )
+    chatter = AnimaChatter("live-stream", AnimaChatterPlugin(config))
+    assert chatter.speech_rules_template_name == speech_template_name
+    prompt_api.unregister_template(speech_template_name)
     with pytest.raises(RuntimeError, match="公共语音模板未注册"):
-        await AnimaChatterPromptBuilder.build_system_prompt(None, stream)
+        await AnimaChatterPromptBuilder.build_system_prompt(config, stream)
 
 
 def test_get_anima_chatter_returns_none_when_stream_absent() -> None:

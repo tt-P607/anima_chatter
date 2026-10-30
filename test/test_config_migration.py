@@ -102,9 +102,28 @@ def test_load_migrates_legacy_prompt_scope_and_preserves_config(
 
     normalized = tomllib.loads(config_path.read_text(encoding="utf-8"))
     assert "custom_prompt_modes" not in normalized["plugin"]
-    assert "tts" not in normalized
+    assert normalized["tts"] == {"engine": "gsv"}
     assert normalized["plugin"]["custom_prompt_enabled"] is expected_enabled
     assert normalized["pipelining"] == config.pipelining.model_dump()
+
+
+@pytest.mark.parametrize("auto_update", [False, True])
+def test_legacy_migration_keeps_selected_tts_engine(
+    tmp_path: Path, auto_update: bool
+) -> None:
+    """旧配置迁移保留明确选择的引擎，回写时只保留新的 TTS 字段。"""
+    path = tmp_path / "config.toml"
+    original = _write_legacy_config(path, '["vtb_live"]')
+    selected = original.replace(b"[tts]\n", b'[tts]\nengine = "breeze"\n')
+    path.write_bytes(selected)
+    config = AnimaChatterConfig.load(path, auto_update=auto_update)
+    assert config.tts.engine == "breeze"
+    if auto_update:
+        normalized = tomllib.loads(path.read_text(encoding="utf-8"))
+        assert normalized["tts"] == {"engine": "breeze"}
+        assert path.with_name("config.toml.anima_voice.bak").read_bytes() == selected
+    else:
+        assert path.read_bytes() == selected
 
 
 def test_load_without_legacy_modes_does_not_rewrite_new_config(tmp_path: Path) -> None:

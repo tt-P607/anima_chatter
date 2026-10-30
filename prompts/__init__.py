@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .builder import SPEECH_RULES_TEMPLATE_NAME, AnimaChatterPromptBuilder
+from .builder import AnimaChatterPromptBuilder
 from .scenes import (
     EMOTION_SCHEMA_DESC,
     INTENT_SCHEMA_DESC,
@@ -21,7 +21,6 @@ __all__ = [
     "INTENT_SCHEMA_DESC",
     "LIVE_USER_PROMPT_PROFILE",
     "PLAIN_TEXT_REMINDER_VTB",
-    "SPEECH_RULES_TEMPLATE_NAME",
     "SYSTEM_PROMPT",
     "USER_PROMPT_TEMPLATE",
     "AnimaChatterPromptBuilder",

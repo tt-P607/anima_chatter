@@ -208,11 +208,16 @@ def test_plugin_declares_required_metadata() -> None:
         component.name
         for component in AnimaChatterPlugin(AnimaChatterConfig()).get_components()
     }
-    assert {entry["component_name"] for entry in manifest["include"]} == registered_names
+    assert {
+        entry["component_name"] for entry in manifest["include"]
+    } == registered_names
     assert "asr_adapter_anima" not in manifest["dependencies"]["plugins"]
     assert "tts_http_server" not in manifest["dependencies"]["plugins"]
-    assert "tts_voice_plugin-neo" in manifest["dependencies"]["plugins"]
-    assert "tts_voice_plugin-neo:service:speech" in manifest["dependencies"]["components"]
+    assert "tts_voice_plugin-neo" not in manifest["dependencies"]["plugins"]
+    assert "breeze_tts_plugin" not in manifest["dependencies"]["plugins"]
+    assert manifest["dependencies"]["components"] == [
+        "neo_default_chatter:service:chat_core"
+    ]
 
 
 async def test_unload_releases_runtime_resources(

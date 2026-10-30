@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from src.app.plugin_system.api.log_api import get_logger
-from src.app.plugin_system.api.service_api import get_service
 from src.app.plugin_system.base import BasePlugin, register_plugin
 
 from ._internal_compat import (
@@ -50,6 +49,7 @@ from .prompts.sub_agent import SUB_AGENT_PROMPT_LIVE
 from .runtime import pipeline_state, sung_history
 from .song_library import SongLibrary
 from .speech.playback import activate_playback, close_playback
+from .speech.backend import get_tts_service
 from .vts import VTSPerformer
 
 logger = get_logger("anima_chatter.plugin")
@@ -57,8 +57,6 @@ logger = get_logger("anima_chatter.plugin")
 
 __all__ = ["AnimaChatterPlugin"]
 
-
-_TTS_SERVICE = "tts_voice_plugin-neo:service:speech"
 
 # 歌库目录（相对项目根）。放在全局 data 目录下，避免污染插件代码目录。
 _SONGS_RELATIVE_PATH = ("data", "anima_chatter", "songs")
@@ -76,8 +74,7 @@ class AnimaChatterPlugin(BasePlugin):
     audio_player: AudioPlayer | None = None
     vts_performer: VTSPerformer | None = None
     song_library: SongLibrary | None = None
-    # TTS Provider 能力元数据缓存。为 None 表示未获取到（TTS 服务未启动 / 老
-    # provider 不支持），Action 的 to_schema 会懒加载兜底。
+    # 最近读取到的能力；Action 构建 schema 时会按当前引擎刷新。
     tts_capabilities: Any | None = None
 
     # ── 生命周期 ────────────────────────────────────────
@@ -304,11 +301,17 @@ class AnimaChatterPlugin(BasePlugin):
         ``tts_capabilities`` 保持 ``None``，Action 的 ``to_schema`` 会懒加载兜底。
         """
 
-        service = get_service(_TTS_SERVICE)
-        if service is None:
-            logger.debug("TTS speech service 未注册，跳过 capabilities 查询")
+        config = self.config
+        if not isinstance(config, AnimaChatterConfig):
+            return
+        try:
+            service = get_tts_service(config.tts.engine)
+        except (RuntimeError, TypeError) as error:
+            self.tts_capabilities = None
+            logger.debug(f"TTS 能力暂不可用：{error}")
             return
 
+        # 不同提供方的 Service 遵循动态能力协议。
         get_capabilities = getattr(service, "get_capabilities", None)
         caps = get_capabilities() if callable(get_capabilities) else None
 
@@ -321,6 +324,5 @@ class AnimaChatterPlugin(BasePlugin):
 
         self.tts_capabilities = caps
         logger.info(
-            "已从 TTS speech service 获取能力元数据，"
-            "Action schema 将动态注入参数说明"
+            "已从 TTS speech service 获取能力元数据，Action schema 将动态注入参数说明"
         )

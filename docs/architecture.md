@@ -51,13 +51,13 @@ chat_stream 串行决策），真实来源由 envelope 的 ``source_platform`` �
 
 ## 语音提示词
 
-SYSTEM 构建器通过公开 `prompt_api.get_template("tts_voice_plugin-neo.speech_rules")`
-取得副本并异步渲染公共语音规则，每次构建重新获取，不在直播插件中复制读音、标点和语言切换文案。
+SYSTEM 构建器按 `[tts].engine` 通过公开 `prompt_api.get_template()`
+读取 `tts_voice_plugin-neo.speech_rules` 或 `breeze_tts_plugin.speech_rules`，取得副本并异步渲染公共语音规则。每次构建重新获取，不在直播插件中复制读音、标点和语言切换文案。
 TTS 插件必须已启用并加载；模板缺失会明确报错，不使用备用文案。
 直播的 `say_and_perform`、停顿、表情与动作协议仍由本插件提供。
 
-`AnimaChatter.speech_rules_template_name` 声明 SYSTEM 中使用的公共模板。
-TTS 根据当前绑定 Chatter 跳过自己的同名规则提醒，后续 USER 模板构建也不会重复注入；
+`AnimaChatter.speech_rules_template_name` 按当前配置声明 SYSTEM 中使用的公共模板。
+GSV 根据该非空声明跳过自己的规则提醒，两个 TTS 同时启用时也不会向 Breeze 流重复追加 GSV 文案；
 其他全局及流私有提醒仍沿原请求路径保留。
 
 ## 直播流水线
@@ -91,9 +91,9 @@ Action 返回已接收，物理播放按 FIFO 串行。实际起播、结束与�
 
 ### 4. 直接消费 TTS service PCM 流
 
-- [`streaming.py`](../speech/streaming.py) 通过串行 Receiver FIFO 调用 `tts_voice_plugin-neo:service:speech` 的 `open_pcm_stream()`。当前回复可完整缓存，不设 20 块、2 秒或其他接收上限；回复数量、轮次容量和 FIFO 顺序维持现有规则。
+- [`streaming.py`](../speech/streaming.py) 通过串行 Receiver FIFO 调用当前配置所选 speech service 的 `open_pcm_stream()`。两个提供方都交付 48000 Hz 单声道 s16le PCM。当前回复可完整缓存，不设 20 块、2 秒或其他接收上限；回复数量、轮次容量和 FIFO 顺序维持现有规则。
 - 收到首块后立即开始该段接收与缓存，不等待短段边界或下一段预生成。每段 EOF 后关闭 Provider 上下文并释放锁，随即请求下一段，不等待设备起播、播放或 wait 停顿。
-- 提供方持有 GPT-SoVITS HTTP 会话和权重锁；直播不创建第二套客户端。各段 PCM 与 wait 静音合并为整条回复的一次 `AudioPlayer.play_pcm_stream` 输入，由单个连续声卡输出流播放；任意块边界保留完整采样帧，空流、截断、格式或设备错误明确失败，不重试已部分输出的段。
+- 提供方持有自己的 HTTP 或 WebSocket 会话和合成锁；直播不创建第二套客户端。各段 PCM 与 wait 静音合并为整条回复的一次 `AudioPlayer.play_pcm_stream` 输入，由单个连续声卡输出流播放；任意块边界保留完整采样帧，空流、截断、格式或设备错误明确失败，不重试已部分输出的段。
 - 首块成功设备写入后反馈整条清洗后的回复文本并开始 VTS 会话；控制反馈不阻塞 PCM feeder。长文本不按普通 WAV 的 `max_text_length` 静默截断，后端长度限制通过请求错误报告。普通 WAV 和通话路径保持不变。
 - 增量包络仅处理已写出的 PCM；流式不做整段响度归一化，歌曲整轨处理保持独立。
 

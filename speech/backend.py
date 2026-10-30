@@ -9,6 +9,18 @@ from typing import Any, Protocol, cast
 
 from src.app.plugin_system.api import service_api
 
+from ..config import TTSEngine
+
+_TTS_PLUGINS: dict[TTSEngine, str] = {
+    "gsv": "tts_voice_plugin-neo",
+    "breeze": "breeze_tts_plugin",
+}
+
+
+def get_speech_rules_template_name(engine: TTSEngine) -> str:
+    """返回所选引擎通过 Prompt API 提供的公共语音模板名。"""
+    return f"{_TTS_PLUGINS[engine]}.speech_rules"
+
 
 @dataclass(slots=True)
 class TTSRequest:
@@ -65,12 +77,13 @@ class TTSService(Protocol):
         ...
 
 
-def get_tts_service() -> TTSService:
+def get_tts_service(engine: TTSEngine) -> TTSService:
     """通过公开 Service API 获取 TTS 插件提供的语音合成服务。"""
 
-    service = service_api.get_service("tts_voice_plugin-neo:service:speech")
+    signature = f"{_TTS_PLUGINS[engine]}:service:speech"
+    service = service_api.get_service(signature)
     if service is None:
-        raise RuntimeError("TTS 语音合成服务未加载")
+        raise RuntimeError(f"所选 TTS 引擎 {engine} 的语音合成服务未加载：{signature}")
     if not callable(getattr(service, "open_pcm_stream", None)):
         raise TypeError("TTS 语音合成服务不支持 PCM 流式合成")
     return cast(TTSService, service)

@@ -39,11 +39,12 @@ _CONTENT_DESC = (
     "- 善用标点传递情绪：感叹号惊讶兴奋、问号疑问好奇、省略号犹豫思考\n"
     "- 灵活使用语气词：诶咦哇呀啊（惊讶）、嗯唔额（思考）、嘛呐嘻（撒娇）\n"
     "【回复级参数】：\n"
-    "- 同一次调用共享同一个 emotion / intent / language / style，包括显式停顿两侧。\n"
+    "- 同一次调用共享同一个 emotion / intent 和语音参数，包括显式停顿两侧。\n"
     "- 表演使用顶层 emotion / intent，不使用行内 motion / emotion 标记切换；"
     "这些行内标记会剥离，但不会切分音频或改变表演。\n"
-    "- 需要不同语言或合成风格时使用不同 Action 调用。"
-    "避免在一次调用中通过 auto 模式混合多语种，以维持音色稳定。\n"
+    "- 只填写当前 Action schema 提供的语音参数；Breeze 用 instruction 描述语气，"
+    "GSV 使用它实际提供的 style、language 等字段，不混用两种引擎的参数。\n"
+    "- 需要切换语言、合成风格或模型时使用不同 Action 调用。\n"
 )
 
 
@@ -131,9 +132,7 @@ class SayAndPerformAction(BaseAction):
             return
 
         performer = plugin.get_active_performer()
-        if body_control is not None and (
-            performer is None or not performer.is_ready
-        ):
+        if body_control is not None and (performer is None or not performer.is_ready):
             yield False, "VTube Studio 表演器未就绪，无法应用 body 控制"
             return
         audio_player = plugin.audio_player
@@ -144,7 +143,7 @@ class SayAndPerformAction(BaseAction):
 
         stream_id = self.chat_stream.stream_id
         try:
-            service = get_tts_service()
+            service = get_tts_service(config.tts.engine)
         except (RuntimeError, TypeError) as error:
             yield False, str(error)
             return
@@ -155,7 +154,9 @@ class SayAndPerformAction(BaseAction):
         async def on_segment_started(_index: int) -> None:
             """整条回复首次起播时发送其完整文本。"""
 
-            await self._send_texts([segment.text for segment in segments if segment.text])
+            await self._send_texts(
+                [segment.text for segment in segments if segment.text]
+            )
 
         # 顺序门：在占用播放资源（reserve / performer 锁）前让出，调度器会按
         # tool call 顺序放行。

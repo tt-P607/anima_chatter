@@ -1279,7 +1279,7 @@ def test_pcm_service_uses_registered_service(monkeypatch: pytest.MonkeyPatch) ->
         return service
 
     monkeypatch.setattr(backend.service_api, "get_service", get_service)
-    assert backend.get_tts_service() is service
+    assert backend.get_tts_service("gsv") is service
     assert service.open_count == 0
 
 
@@ -1306,17 +1306,15 @@ def test_tts_schema_uses_service_capabilities_without_effects(
         )
     )
 
-    def get_service(signature: str) -> SimpleNamespace:
+    def get_service(engine: str) -> SimpleNamespace:
         """仅允许读取 TTS speech service。"""
 
-        assert signature == "tts_voice_plugin-neo:service:speech"
+        assert engine == "gsv"
         return service
 
     monkeypatch.setattr(_tts_schema, "get_anima_chatter_plugin", lambda: None)
-    monkeypatch.setattr(_tts_schema, "get_service", get_service)
-    schema = {
-        "function": {"parameters": {"properties": {}, "required": []}}
-    }
+    monkeypatch.setattr(_tts_schema, "get_tts_service", get_service)
+    schema = {"function": {"parameters": {"properties": {}, "required": []}}}
 
     assert _tts_schema.inject_tts_params(schema) is schema
     properties = schema["function"]["parameters"]["properties"]
@@ -1334,10 +1332,11 @@ async def test_speech_action_opens_stream_only_after_tool_order_gate(
     from plugins.anima_chatter.actions import say_and_perform
     from plugins.anima_chatter.config import AnimaChatterConfig
     from plugins.anima_chatter.plugin import AnimaChatterPlugin
+
     provider = FakePCMProvider(
         lambda _: _stream_context(_single_chunk(b"\x01\x00" * 300))
     )
-    monkeypatch.setattr(say_and_perform, "get_tts_service", lambda: provider)
+    monkeypatch.setattr(say_and_perform, "get_tts_service", lambda engine: provider)
     config = AnimaChatterConfig()
     plugin: Any = AnimaChatterPlugin(config)
     plugin.audio_player = pcm_player
@@ -1419,7 +1418,7 @@ async def test_speech_body_control_applies_once_at_first_pcm_start(
             await kwargs["on_started"]()
             return len(first) // 2
 
-    monkeypatch.setattr(say_and_perform, "get_tts_service", lambda: provider)
+    monkeypatch.setattr(say_and_perform, "get_tts_service", lambda engine: provider)
     plugin: Any = AnimaChatterPlugin(AnimaChatterConfig())
     plugin.audio_player = GatedPlayer()
     plugin.vts_performer = Performer()
@@ -1467,7 +1466,7 @@ async def test_speech_action_rejection_does_not_send_text(
 
     monkeypatch.setattr(pipeline_state, "reserve", refuse)
     provider = FakePCMProvider(lambda _: _stream_context(_single_chunk(b"\x00\x00")))
-    monkeypatch.setattr(say_and_perform, "get_tts_service", lambda: provider)
+    monkeypatch.setattr(say_and_perform, "get_tts_service", lambda engine: provider)
     plugin: Any = AnimaChatterPlugin(AnimaChatterConfig())
     plugin.audio_player = pcm_player
     action: Any = SimpleNamespace(
@@ -1894,7 +1893,7 @@ async def test_action_merges_content_and_sends_only_after_start(
     provider = FakePCMProvider(
         lambda _: _stream_context(_single_chunk(b"\x01\x00" * 100))
     )
-    monkeypatch.setattr(say_and_perform, "get_tts_service", lambda: provider)
+    monkeypatch.setattr(say_and_perform, "get_tts_service", lambda engine: provider)
     plugin: Any = AnimaChatterPlugin(AnimaChatterConfig())
     plugin.audio_player = DelayedPlayer()
     action: Any = SimpleNamespace(
@@ -1911,7 +1910,9 @@ async def test_action_merges_content_and_sends_only_after_start(
     await generator.aclose()
     await asyncio.wait_for(device_ready.wait(), timeout=2)
     action._send_texts.assert_not_awaited()
-    assert [request.text for request in provider.requests] == ["第一句。第二句！\n第三句。"]
+    assert [request.text for request in provider.requests] == [
+        "第一句。第二句！\n第三句。"
+    ]
     release_device.set()
     await _wait_playback_tasks(isolated_playback)
     action._send_texts.assert_awaited_once_with(["第一句。第二句！\n第三句。"])

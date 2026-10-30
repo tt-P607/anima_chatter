@@ -9,9 +9,10 @@ from __future__ import annotations
 from typing import Any
 
 from src.app.plugin_system.api.log_api import get_logger
-from src.app.plugin_system.api.service_api import get_service
 
 from .._internal_compat import get_anima_chatter_plugin
+from ..config import AnimaChatterConfig, TTSSection
+from ..speech.backend import get_tts_service
 
 logger = get_logger("anima_chatter.action.tts_schema")
 
@@ -19,30 +20,41 @@ logger = get_logger("anima_chatter.action.tts_schema")
 __all__ = ["get_tts_capabilities", "inject_tts_params"]
 
 
-_TTS_SERVICE = "tts_voice_plugin-neo:service:speech"
-
 # 注入顺序固定，保证模型每次看到的参数排列一致。
-_PARAM_ORDER = ("style", "language", "speed", "aux_refer_wav_paths")
+_PARAM_GUIDES = (
+    ("model_id", "model_guide"),
+    ("instruction", "instruction_guide"),
+    ("style", "style_guide"),
+    ("language", "language_guide"),
+    ("speed", "speed_guide"),
+    ("aux_refer_wav_paths", "aux_refer_wav_paths_guide"),
+    ("audio_effects", "streaming_effects_guide"),
+)
 
 
 def get_tts_capabilities() -> Any | None:
-    """获取 TTS Provider 能力元数据（带懒加载兜底）。
-
-    优先读插件缓存；缓存为空时走 service API 现查并回写。``to_schema`` 在 LLM
-    请求时被调用，此时 Provider 必然已注册完毕，懒加载一定能拿到。
+    """按当前选择重新读取能力，避免引擎或提供方配置变化后沿用旧参数。
 
     Returns:
         能力元数据对象；Provider 未注册或不提供 capabilities 时返回 ``None``。
     """
 
     plugin = get_anima_chatter_plugin()
-    if plugin is not None and plugin.tts_capabilities is not None:
-        return plugin.tts_capabilities
-
-    service = get_service(_TTS_SERVICE)
-    if service is None:
+    if plugin is None:
+        engine = TTSSection().engine
+    else:
+        config = plugin.config
+        if not isinstance(config, AnimaChatterConfig):
+            raise TypeError("直播插件的 TTS 配置类型无效")
+        engine = config.tts.engine
+    try:
+        service = get_tts_service(engine)
+    except (RuntimeError, TypeError):
+        if plugin is not None:
+            plugin.tts_capabilities = None
         return None
 
+    # Service 返回对象遵循动态能力协议，旧提供方可以缺少可选指南。
     get_capabilities = getattr(service, "get_capabilities", None)
     caps = get_capabilities() if callable(get_capabilities) else None
     if caps is not None and plugin is not None:
@@ -95,11 +107,16 @@ def inject_tts_params(schema: dict[str, Any]) -> dict[str, Any]:
     properties = parameters.setdefault("properties", {})
     required = parameters.setdefault("required", [])
 
-    for param_name in _PARAM_ORDER:
-        guide = getattr(caps, f"{param_name}_guide", None)
+    for param_name, guide_name in _PARAM_GUIDES:
+        # 两个提供方返回不同形状的能力对象，只公开实际存在的指南。
+        guide = getattr(caps, guide_name, None)
         if guide is None:
             continue
         properties[param_name] = _guide_to_schema(guide)
+        if guide.param_type == "array":
+            properties[param_name]["items"] = {
+                "type": "object" if param_name == "audio_effects" else "string"
+            }
         if guide.required and param_name not in required:
             required.append(param_name)
 

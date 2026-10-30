@@ -30,10 +30,11 @@ from src.app.plugin_system.types import (
 
 from ..prompts import (
     PLAIN_TEXT_REMINDER_VTB,
-    SPEECH_RULES_TEMPLATE_NAME,
     AnimaChatterPromptBuilder,
 )
+from ..config import TTSSection
 from ..runtime import pipeline_state
+from ..speech.backend import get_speech_rules_template_name
 from . import attention, request_factory
 from .attention import SubAgentDecision
 from .session_bridge import ChatCoreServiceLike, PlainTextResponseHandling
@@ -63,6 +64,8 @@ _BLOCKED_USABLE_NAMES = frozenset(
         "kill_agent",
         "action-sing_a_song",
         "action-say",
+        "action-tts_voice_action",
+        "action-breeze_tts",
         "action-start_voice_call",
         "action-end_voice_call",
     }
@@ -75,14 +78,12 @@ class AnimaChatter(BaseChatter):
     name = "anima_chatter"
     description = "直播弹幕互动、VTube Studio 表演与唱歌 Chatter。"
     associated_platforms: ClassVar[list[str]] = ["live"]
-    speech_rules_template_name: ClassVar[str] = SPEECH_RULES_TEMPLATE_NAME
     chat_type = ChatType.ALL
 
     stream_tick_interval = 1.0
     allow_message_buffer = True
 
-    # 工具注入缓存：(usable 签名指纹, registry, tools)。类级共享——同一轮
-    # 高压弹幕下多个实例注入的工具集一致；集合变化时指纹失配自动重建。
+    # 工具注入缓存保存组件类及注册表；参数 schema 在模型请求时从类重新读取。
     _usables_cache: tuple[tuple[str, ...], ToolRegistry, list] | None = None
 
     def __init__(self, stream_id: str, plugin: Any) -> None:
@@ -116,6 +117,13 @@ class AnimaChatter(BaseChatter):
         """返回插件配置；加载失败时为 ``None``。"""
 
         return self._plugin.config
+
+    @property
+    def speech_rules_template_name(self) -> str:
+        """声明当前 SYSTEM 已使用的语音规则模板，避免提供方重复注入。"""
+        config = self._config
+        engine = TTSSection().engine if config is None else config.tts.engine
+        return get_speech_rules_template_name(engine)
 
     def apply_stream_runtime_options(self, chat_stream: ChatStream) -> None:
         """应用直播配置的 tick 间隔与消息缓冲策略。
@@ -301,9 +309,8 @@ class AnimaChatter(BaseChatter):
     async def inject_usables(self, request: LLMRequest) -> ToolRegistry:
         """注入可用工具，屏蔽与本插件冲突的动作。
 
-        schema 按"usable 集合指纹"缓存：集合未变时直接复用上次的
-        ``(registry, tools)``，避免高压下每轮 LLM 调用都全量重建 schema 与
-        ToolRegistry（schema 是纯静态 classmethod 产物，重建是纯浪费）。
+        按 usable 集合指纹缓存注册表和组件类。集合未变时复用
+        ``(registry, tools)``，动态语音参数仍由组件的 to_schema 按当前配置提供。
         集合变化（组件启用 / 禁用 / 其他插件注册变动）时指纹失配自动重建。
 
         Args:

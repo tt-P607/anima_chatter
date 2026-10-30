@@ -5,7 +5,7 @@ Anima 直播是 Neo-MoFox 的直播互动插件。它接收观众弹幕，生成
 ## 功能
 
 - 根据弹幕内容和直播节奏选择回应，不要求逐条回复。
-- 使用 GPT-SoVITS 流式合成语音，在生成过程中开始播放。
+- 可选择 GSV 或 Breeze 流式合成语音，在生成过程中开始播放。
 - 根据回复的情绪和表达方式触发 VTube Studio 表情、动作及身体律动。
 - 可通过 `control_body` 设置呼吸、眨眼和左右眼睑控制；控制持续生效，直到再次设置或释放眼睑。
 - 支持说话时的音频驱动动画和待机动画；不开启 VTube Studio 时仍可播放语音。
@@ -15,9 +15,9 @@ Anima 直播是 Neo-MoFox 的直播互动插件。它接收观众弹幕，生成
 ## 使用条件
 
 - Neo-MoFox 1.2.0-alpha 或更新版本，以及 Python 3.11 或更新版本。
-- 启用 `neo_default_chatter` 和 `tts_voice_plugin-neo`，并配置好对话模型。
-- TTS 插件须提供语音服务 `tts_voice_plugin-neo:service:speech` 和公共语音规则模板；仅有旧版完整音频接口的版本不能使用。
-- 配置支持 V5 PCM 流的 GPT-SoVITS 服务，并在 TTS 插件中开启 `[tts_streaming].enabled`，设置 `streaming_mode = 2`。
+- 启用 `neo_default_chatter`，配置好对话模型，并启用所选 TTS 插件。
+- GSV 提供 `tts_voice_plugin-neo:service:speech`，Breeze 提供 `breeze_tts_plugin:service:speech`；所选插件还须注册对应的公共语音规则模板。
+- 使用 GSV 时，配置支持 V5 PCM 流的 GPT-SoVITS 服务，并在 GSV 插件开启 `[tts_streaming].enabled`、设置 `streaming_mode = 2`。使用 Breeze 时，配置其已经运行的本机服务和各模型自己的参考音色。
 - 安装与直播平台对应的弹幕适配器，例如 `bilibili_live_adapter`。适配器需要将聊天流标记为 `live`。
 - 使用虚拟形象时，需要运行 VTube Studio、加载模型并开启插件 API。
 
@@ -30,6 +30,17 @@ git clone https://github.com/tt-P607/anima_chatter.git plugins/anima_chatter
 ```
 
 首次加载后，配置位于 `config/plugins/anima_chatter/config.toml`。主要设置如下：
+
+直播语音通过一个选项切换，省略时沿用 GSV：
+
+```toml
+[tts]
+engine = "breeze" # 可选 gsv 或 breeze
+```
+
+该选择同时决定合成服务、公共语音模板和说话动作的参数说明。模型、参考音频和服务地址仍配置在对应 TTS 插件里。所选服务或模板缺失时明确报错，不自动改用另一引擎；修改配置后重新加载对应插件或重启 Bot。
+
+Breeze 的 `[prompt].custom_instructions` 会进入公共语音模板，`breeze.model_id` 和 `plugin.llm_audio_effects` 决定默认模型及是否开放流式音效参数。GSV 沿用自身的可用风格、语言和语速开关。直播只展示当前引擎的参数；GSV 当前不支持 PCM 音效，Breeze 按开关开放其流式支持范围。
 
 | 设置 | 用途 |
 | --- | --- |

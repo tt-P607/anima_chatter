@@ -11,6 +11,8 @@ from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.types import ChatStream, Message
 
 from .._internal_compat import get_personality, get_prompt_manager
+from ..config import TTSSection
+from ..speech.backend import get_speech_rules_template_name
 from .scenes import build_vtb_live_scene_guide
 from .templates import LIVE_USER_PROMPT_PROFILE
 
@@ -21,9 +23,7 @@ if TYPE_CHECKING:
 logger = get_logger("anima_chatter.prompts")
 
 
-SPEECH_RULES_TEMPLATE_NAME: str = "tts_voice_plugin-neo.speech_rules"
-
-__all__ = ["SPEECH_RULES_TEMPLATE_NAME", "AnimaChatterPromptBuilder"]
+__all__ = ["AnimaChatterPromptBuilder"]
 
 
 def _is_live_adapter_enabled(adapter: object) -> bool:
@@ -189,9 +189,13 @@ class AnimaChatterPromptBuilder:
             logger.error("system prompt 模板未注册")
             return ""
 
-        speech_template = prompt_api.get_template(SPEECH_RULES_TEMPLATE_NAME)
+        engine = (
+            TTSSection().engine if plugin_config is None else plugin_config.tts.engine
+        )
+        speech_template_name = get_speech_rules_template_name(engine)
+        speech_template = prompt_api.get_template(speech_template_name)
         if speech_template is None:
-            raise RuntimeError(f"公共语音模板未注册：{SPEECH_RULES_TEMPLATE_NAME}")
+            raise RuntimeError(f"公共语音模板未注册：{speech_template_name}")
         speech_rules = await speech_template.build(strict=True)
 
         # ``<personality>`` 里的 ``{nickname}`` 是「角色人设名」，取全局人设配置，
@@ -202,16 +206,12 @@ class AnimaChatterPromptBuilder:
             .set("stream_id", chat_stream.stream_id)
             .set(
                 "action_suspend_guidance",
-                AnimaChatterPromptBuilder.build_action_suspend_guidance(
-                    plugin_config
-                ),
+                AnimaChatterPromptBuilder.build_action_suspend_guidance(plugin_config),
             )
             .set("sub_agent_collaboration_extra", "")
             .set(
                 "scene_guide",
-                AnimaChatterPromptBuilder.get_scene_guide(
-                    expression_hints
-                ),
+                AnimaChatterPromptBuilder.get_scene_guide(expression_hints),
             )
             .set(
                 "custom_instructions_block",
