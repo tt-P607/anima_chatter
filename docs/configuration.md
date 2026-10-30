@@ -52,6 +52,8 @@
 
 GSV 使用 `tts_voice_plugin-neo:service:speech` 和 `tts_voice_plugin-neo.speech_rules`；Breeze 使用 `breeze_tts_plugin:service:speech` 和 `breeze_tts_plugin.speech_rules`。其他名称和路径不被接受，所选服务缺失时不会自动换引擎。
 
+直播 SYSTEM 会明确包含当前引擎名称和配置标识：`GSV（GPT-SoVITS）` / `gsv`，或 `Breeze（Breeze TTS 2.cpp）` / `breeze`。该说明与本轮语音模板读取同一份 `tts.engine`，模型无需从风格参数或旧对话推断引擎。
+
 动态 Action schema 从所选服务重新读取能力。选择 GSV 时展示其风格、语言、启用的语速等参数；选择 Breeze 时展示 `model_id`、`instruction`，开启 `plugin.llm_audio_effects` 后再展示允许的流式 `audio_effects`。GSV 的完整音频音效不会误展示为直播 PCM 参数。
 
 公共语音规则通过 Prompt API 构建；TTS 配置中的自定义说明由对应插件写入模板。直播不复制服务地址、参考音频、HTTP 超时或推理设置；这些仍由提供方管理。修改 TTS 配置后重载对应插件，下一次提示词构建会读取更新的模板和能力。

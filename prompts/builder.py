@@ -12,7 +12,7 @@ from src.app.plugin_system.types import ChatStream, Message
 
 from .._internal_compat import get_personality, get_prompt_manager
 from ..config import TTSSection
-from ..speech.backend import get_speech_rules_template_name
+from ..speech.backend import get_speech_rules_template_name, get_tts_engine_name
 from .scenes import build_vtb_live_scene_guide
 from .templates import LIVE_USER_PROMPT_PROFILE
 
@@ -197,12 +197,19 @@ class AnimaChatterPromptBuilder:
         if speech_template is None:
             raise RuntimeError(f"公共语音模板未注册：{speech_template_name}")
         speech_rules = await speech_template.build(strict=True)
+        engine_context = (
+            "<tts_engine>\n"
+            f"当前语音引擎：{get_tts_engine_name(engine)}\n"
+            f"配置标识：{engine}\n"
+            "本轮朗读使用此引擎，具体参数以当前说话动作的说明为准。\n"
+            "</tts_engine>"
+        )
 
         # ``<personality>`` 里的 ``{nickname}`` 是「角色人设名」，取全局人设配置，
         # 而非 ``chat_stream.bot_nickname``（那是平台账号显示名，职责不同）。
         return await (
             template.set("nickname", get_personality().nickname)
-            .set("speech_rules", speech_rules)
+            .set("speech_rules", f"{engine_context}\n\n{speech_rules}")
             .set("stream_id", chat_stream.stream_id)
             .set(
                 "action_suspend_guidance",

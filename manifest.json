@@ -1,7 +1,7 @@
 {
   "name": "anima_chatter",
   "display_name": "Anima 直播",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Neo-MoFox 直播互动插件，接收观众弹幕，生成语音回复，并支持 VTube Studio 虚拟形象表演和本地歌曲播放。",
   "author": "言柒",
   "entry_point": "plugin.py",

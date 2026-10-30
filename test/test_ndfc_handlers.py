@@ -99,7 +99,7 @@ async def test_live_system_prompt_reuses_shared_template_and_preserves_protocol(
     engine: TTSEngine,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """直播按公共名称渲染规则，每轮读取更新且不混入原 TTS 动作协议。"""
+    """直播模型收到明确引擎名称，切换配置时模板和标识共同更新。"""
 
     monkeypatch.setattr(core_prompt.get_prompt_manager(), "_templates", {})
     monkeypatch.setattr(
@@ -124,9 +124,14 @@ async def test_live_system_prompt_reuses_shared_template_and_preserves_protocol(
     prompt_api.register_template(template)
     config = AnimaChatterConfig()
     config.tts.engine = engine
-    speech_template_name = get_speech_rules_template_name(engine)
     stream = SimpleNamespace(stream_id="live-stream")
-    for word in ("shared speech guidance", "updated speech guidance"):
+    other_engine: TTSEngine = "breeze" if engine == "gsv" else "gsv"
+    for selected_engine, word in (
+        (engine, "shared speech guidance"),
+        (other_engine, "updated speech guidance"),
+    ):
+        config.tts.engine = selected_engine
+        speech_template_name = get_speech_rules_template_name(selected_engine)
         prompt_api.register_template(
             PromptTemplate(
                 name=speech_template_name,
@@ -135,6 +140,16 @@ async def test_live_system_prompt_reuses_shared_template_and_preserves_protocol(
         )
         rendered = await AnimaChatterPromptBuilder.build_system_prompt(config, stream)
         assert rendered.count("<speech_rules>") == 1
+        assert rendered.count("<tts_engine>") == 1
+        engine_context = rendered.split("<tts_engine>", 1)[1].split("</tts_engine>", 1)[0]
+        expected_name = (
+            "GSV（GPT-SoVITS）"
+            if selected_engine == "gsv"
+            else "Breeze（Breeze TTS 2.cpp）"
+        )
+        assert f"当前语音引擎：{expected_name}" in engine_context
+        assert f"配置标识：{selected_engine}" in engine_context
+        assert ("Breeze" in engine_context) is (selected_engine == "breeze")
         assert word in rendered
         assert "say_and_perform action" in rendered
         assert "[wait:0.5]" in rendered

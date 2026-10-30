@@ -16,6 +16,16 @@ _TTS_PLUGINS: dict[TTSEngine, str] = {
     "breeze": "breeze_tts_plugin",
 }
 
+_TTS_DISPLAY_NAMES: dict[TTSEngine, str] = {
+    "gsv": "GSV（GPT-SoVITS）",
+    "breeze": "Breeze（Breeze TTS 2.cpp）",
+}
+
+
+def get_tts_engine_name(engine: TTSEngine) -> str:
+    """返回配置所选语音引擎的统一显示名称。"""
+    return _TTS_DISPLAY_NAMES[engine]
+
 
 def get_speech_rules_template_name(engine: TTSEngine) -> str:
     """返回所选引擎通过 Prompt API 提供的公共语音模板名。"""
